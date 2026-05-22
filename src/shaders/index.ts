@@ -107,7 +107,7 @@ struct Uniforms {
     clipMin: vec3f,
     _pad3: f32,
     clipMax: vec3f,
-    _pad4: f32,
+    densityScale: f32,
 }
 
 ${sharedCode}
@@ -173,7 +173,7 @@ struct Uniforms {
     clipMin: vec3f,
     _pad5: f32,
     clipMax: vec3f,
-    _pad6: f32,
+    densityScale: f32,
 }
 
 ${sharedCode}

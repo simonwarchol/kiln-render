@@ -54,6 +54,7 @@ export class VolumeUI {
     // Windowing/Leveling for 16-bit data
     windowCenter: 0.5,
     windowWidth: 1.0,
+    densityScale: 1.0,
     // Render scale
     renderScale: 0.5,
     // Clipping planes (0-1 range for each axis)
@@ -284,6 +285,16 @@ export class VolumeUI {
       this.renderer.windowWidth = ev.value as number;
       this.renderer.resetAccumulation();
       this.updateTFPreview();
+    });
+
+    this.windowFolder.addBinding(this.params, 'densityScale', {
+      label: 'Density',
+      min: 0.1,
+      max: 10.0,
+      step: 0.1,
+    }).on('change', (ev: { value: unknown }) => {
+      this.renderer.densityScale = ev.value as number;
+      this.renderer.resetAccumulation();
     });
 
     // Clipping Planes folder

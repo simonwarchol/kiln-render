@@ -34,7 +34,7 @@ fn rayMarchDVR(
             let voxel = normalizedToVoxel(pos, normalizedSize, datasetSize);
             let density = sampleAtlas(voxel, brick.indirection, brick.lodScale);
 
-            composeSampleWindowed(density, brick.stepSize, maxDim, windowCenter, windowWidth, &color, &alpha);
+            composeSampleWindowed(density, brick.stepSize * uniforms.densityScale, maxDim, windowCenter, windowWidth, &color, &alpha);
             if (alpha > EARLY_EXIT_ALPHA) { break; }
 
             tSample += brick.stepSize;

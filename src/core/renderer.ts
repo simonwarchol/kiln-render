@@ -35,6 +35,7 @@ export class Renderer {
 
   // Show wireframe box
   showWireframe = false;
+  densityScale = 1.0;
 
   // Show axis helper
   showAxis = false;
@@ -630,7 +631,8 @@ export class Renderer {
     // 48-49: _pad2 (vec2f for alignment)
     d.set(this.clipMin, 50);                   // 50-52: clipMin
     // 53: _pad3
-    d.set(this.clipMax, 54);                   // 54-56: clipMax (actually only uses 54-55, implicit padding after)
+    d.set(this.clipMax, 54);                   // 54-56: clipMax
+    d[57] = this.densityScale;                 // 57: densityScale
     this.device.queue.writeBuffer(this.uniformBuffer, 0, d as Float32Array<ArrayBuffer>);
 
     // Update wireframe uniforms
@@ -738,7 +740,7 @@ export class Renderer {
     d.set(this.clipMin, 36);                   // 36-38: clipMin
     // 39: _pad5
     d.set(this.clipMax, 40);                   // 40-42: clipMax
-    // 43: _pad6
+    d[43] = this.densityScale;                 // 43: densityScale
     this.device.queue.writeBuffer(this.computeUniformBuffer, 0, d as Float32Array<ArrayBuffer>);
 
     const encoder = this.device.createCommandEncoder();
