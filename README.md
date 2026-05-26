@@ -90,7 +90,7 @@ From the [Open SciVis Datasets](https://github.com/sci-visus/open-scivis-dataset
 - **[Stag Beetle](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets#stag_beetle)** - Industrial CT scan. Meister Eduard Gröller, Georg Glaeser, Johannes Kastner, 2005.
 
 From the [CryoET Data Portal](https://cryoetdataportal.czscience.com/):
-- **Vibrio cholerae** - Cryo-ET tomogram, competence pilus study (*V. cholerae* PilQ GFP / PilT deletion). [Tomogram sma2022-08-05-1](https://cryoetdataportal.czscience.com/runs/33757?table-tab=Tomograms).
+- **[Vibrio cholerae](https://cryoetdataportal.czscience.com/runs/33757?table-tab=Tomograms)** - Cryo-ET tomogram, competence pilus study (*V. cholerae* PilQ GFP / PilT deletion). 
 
 ## License
 
