@@ -24,7 +24,7 @@ Kiln streams multi-gigabyte volumes over HTTP, rendering them at interactive fra
 #### 1123.9 MB - 1023 × 1440 × 400 @ 16-bit · CryoET Data Portal · sma2022-08-05-1
 <a href="https://mpanknin.github.io/kiln-render/?dataset=https%3A%2F%2Fd39zu0xtgv0613.cloudfront.net%2Fsma2022-07-13-10.zarr&mode=dvr&wc=0.50&ww=1.00&iso=0.20&tf=grayscale-inverted&tfpts=0.00%2C1.00%2C1.00%2C1.00&up=-z&scale=0.50&cam=0.550%2C12.050%2C1.203%2C0.046%2C0.017%2C0.146&clipMin=0.00%2C0.00%2C0.37&wireframe=1" target="_blank">Live Demo</a>
 
-<img width="1722" height="905" alt="Vibrio cholerae cryo-ET tomogram" src="https://github.com/user-attachments/assets/02cffc17-bf44-422b-8752-9bf4edc96d89" />
+<img width="1722" height="902" alt="Vibrio cholerae cryo-ET tomogram" src="https://github.com/user-attachments/assets/8e661338-ed45-4024-b818-c3162c11aa04" />
 
 ## Install
 
