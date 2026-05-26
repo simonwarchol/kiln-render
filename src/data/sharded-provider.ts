@@ -133,6 +133,7 @@ export class ShardedDataProvider implements DataProvider {
       maxLod: raw.maxLod,
       levels,
       bitDepth: raw.format === 'uint16' ? 16 : 8,
+      numChannels: 1,
     };
   }
 
