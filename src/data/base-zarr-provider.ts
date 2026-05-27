@@ -220,7 +220,8 @@ export abstract class BaseZarrProvider implements DataProvider {
       for (let i = 0; i < data.length; i++) {
         const v = Number(data[i]);
         if (isFinite(v)) {
-          histogram[Math.min(BINS - 1, Math.floor(((v - globalMin) / range) * BINS))]++;
+          const bin = Math.min(BINS - 1, Math.floor(((v - globalMin) / range) * BINS));
+          histogram[bin] = (histogram[bin] ?? 0) + 1;
           totalCount++;
         }
       }
