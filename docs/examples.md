@@ -35,7 +35,7 @@ MicroCT scan of a dried beechnut loaded directly from an OME-Zarr v0.5 store on 
 ## Cryo-Electron Tomography
 
 ### Vibrio cholerae Cryo-ET (OME-Zarr 0.4)
-**1123.9 MB — 1023 × 1440 × 400 @ 16-bit**
+**1123.9 MB — 1023 × 1440 × 400 @ 32-bit**
 
 <a href="https://mpanknin.github.io/kiln-render/?dataset=https%3A%2F%2Fd39zu0xtgv0613.cloudfront.net%2Fsma2022-07-13-10.zarr&mode=dvr&wc=0.50&ww=1.00&iso=0.20&tf=grayscale-inverted&tfpts=0.00%2C1.00%2C1.00%2C1.00&up=-z&scale=0.50&cam=0.550%2C12.050%2C1.203%2C0.046%2C0.017%2C0.146&clipMin=0.00%2C0.00%2C0.37&wireframe=1" target="_blank">Live Demo</a>
 
@@ -54,9 +54,9 @@ All multichannel examples use the dedicated multichannel viewer with per-channel
 ### Zebrafish Lateral Line — Cellular Architecture (IDR0079)
 **~354 MB — 1584 × 788 × 142 @ 8-bit · 2 channels · OME-Zarr 0.4**
 
-<a href="https://mpanknin.github.io/kiln-render/multichannel/?dataset=https%3A%2F%2Flivingobjects.ebi.ac.uk%2Fidr%2Fzarr%2Fv0.4%2Fidr0079A%2Fidr0079_images.zarr" target="_blank">Live Demo</a>
+<a href="https://mpanknin.github.io/kiln-render/multichannel/?dataset=https%3A%2F%2Flivingobjects.ebi.ac.uk%2Fidr%2Fzarr%2Fv0.4%2Fidr0079A%2Fidr0079_images.zarr&up=-z&mode=mip&scale=0.50&cam=0.450%2C0.770%2C1.144%2C0.031%2C-0.021%2C0.070&channels=0%2C0%2C255%2C1.00%2C1%2C0.02%2C0.46%3B255%2C255%2C0%2C1.00%2C1%2C0.01%2C0.38&slice=792%2C394%2C71%2C1%2C1%2C1" target="_blank">Live Demo</a>
 
-<img width="1725" height="907" alt="Zebrafish lateral line — 2 channels" src="https://github.com/user-attachments/assets/f5da8ea1-a924-4ba6-9f29-6f6c18369405" />
+<img width="1723" height="900" alt="Zebrafish lateral line — 2 channels" src="https://github.com/user-attachments/assets/c22fa6f5-22e4-4d85-85e8-3d2a190085b4" />
 
 AiryScan confocal fluorescence microscopy of the zebrafish (*Danio rerio*) posterior lateral line primordium. Two channels: lynEGFP (membrane, green) and NLStdTomato (nuclear, red). 142 z-slices at 0.102 µm xy / 0.225 µm z spacing.
 
