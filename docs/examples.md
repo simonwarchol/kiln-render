@@ -51,6 +51,17 @@ Cryo-ET tomogram from the CryoET Data Portal. Uses an inverted grayscale transfe
 
 All multichannel examples use the dedicated multichannel viewer with per-channel colour, window/level, and visibility controls. Compositing uses additive blending. See the [Multichannel documentation](multichannel.md) for API details and known limitations.
 
+### Zebrafish Lateral Line — Cellular Architecture (IDR0079)
+**~354 MB — 1584 × 788 × 142 @ 8-bit · 2 channels · OME-Zarr 0.4**
+
+<a href="https://mpanknin.github.io/kiln-render/multichannel/?dataset=https%3A%2F%2Flivingobjects.ebi.ac.uk%2Fidr%2Fzarr%2Fv0.4%2Fidr0079A%2Fidr0079_images.zarr" target="_blank">Live Demo</a>
+
+<img width="1725" height="907" alt="Zebrafish lateral line — 2 channels" src="https://github.com/user-attachments/assets/f5da8ea1-a924-4ba6-9f29-6f6c18369405" />
+
+AiryScan confocal fluorescence microscopy of the zebrafish (*Danio rerio*) posterior lateral line primordium. Two channels: lynEGFP (membrane, green) and NLStdTomato (nuclear, red). 142 z-slices at 0.102 µm xy / 0.225 µm z spacing.
+
+**Dataset:** [IDR0079 — Hartmann et al., 2020](https://doi.org/10.7554/eLife.55913) · *An image-based data-driven analysis of cellular architecture in a developing tissue*
+
 ### In Situ Genome Sequencing — Human Fibroblast (IDR0101)
 **~1.1 GB — 2048 × 2048 × 35 @ 16-bit · 4 channels · OME-Zarr 0.4**
 
@@ -140,5 +151,8 @@ See the [Usage Guide](usage-guide.md) for the full API reference.
 - **Beechnut** — MicroCT scan. Computer-Assisted Paleoanthropology group, University of Zurich.
 - **Stag Beetle** — Industrial CT scan. Meister Eduard Gröller, Georg Glaeser, Johannes Kastner, 2005.
 - **Vibrio cholerae** — Cryo-ET tomogram. [CryoET Data Portal](https://cryoetdataportal.czscience.com/).
+- **IDR0079** — Zebrafish lateral line cellular architecture. [Hartmann et al., 2020](https://doi.org/10.7554/eLife.55913). [Image Data Resource](https://idr.openmicroscopy.org/).
+- **IDR0101** — In situ genome sequencing. [Payne et al., 2021](https://doi.org/10.1126/science.aay3446). [Image Data Resource](https://idr.openmicroscopy.org/).
+- **IDR0047** — Yeast smFISH mRNA expression. [Li & Neuert, 2019](https://doi.org/10.1038/s41597-019-0106-6). [Image Data Resource](https://idr.openmicroscopy.org/).
 
-All from the [Open SciVis Datasets](https://github.com/sci-visus/open-scivis-datasets) collection and [CryoET Data Portal](https://cryoetdataportal.czscience.com/).
+Single-channel datasets from the [Open SciVis Datasets](https://github.com/sci-visus/open-scivis-datasets) collection and [CryoET Data Portal](https://cryoetdataportal.czscience.com/). Multichannel datasets from the [Image Data Resource](https://idr.openmicroscopy.org/).
