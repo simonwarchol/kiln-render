@@ -2,17 +2,11 @@
 
 How to embed Kiln in your own application, load datasets, and use the demo viewer's URL parameters.
 
-See also: [Architecture](architecture.md) | [Rendering Pipeline](rendering.md) | [Data Guide](data-guide.md) | [WebGPU Notes](webgpu.md)
+See also: [Architecture](architecture.md) | [Rendering Pipeline](rendering.md) | [Multichannel](multichannel.md) | [Data Guide](data-guide.md) | [WebGPU Notes](webgpu.md)
 
 ---
 
 ## Library API
-
-### Installation
-
-```bash
-npm install kiln-render
-```
 
 ### Basic usage
 
@@ -140,6 +134,29 @@ if (handle && await requestPermission(handle)) {
 }
 ```
 
+### Multichannel
+
+Multichannel OME-Zarr datasets (up to 4 channels) are detected automatically. Per-channel colour, window/level, and visibility can be controlled via the renderer:
+
+```typescript
+// Check channel count
+const numChannels = viewer.renderer.numChannels; // 1–4
+
+// Set channel colour (RGBA, 0–1)
+viewer.renderer.setChannelColor(0, 0.0, 1.0, 0.0);     // channel 0 → green
+viewer.renderer.setChannelColor(1, 1.0, 0.0, 0.0, 0.5); // channel 1 → red, half intensity
+
+// Set channel window/level (normalised 0–1)
+viewer.renderer.setChannelWindow(0, 0.3, 0.4); // centre=0.3, width=0.4
+
+// React to auto-leveling from OMERO metadata
+viewer.onChannelWindowsChanged = () => {
+  // Update your UI with new window values
+};
+```
+
+See the [Multichannel documentation](multichannel.md) for compositing details, the multichannel demo, and known limitations.
+
 ### Pre-validating remote datasets
 
 Check a remote URL for compatibility before starting a load:
@@ -149,7 +166,7 @@ import { preValidateRemoteZarr } from 'kiln-render';
 
 const issues = await preValidateRemoteZarr('https://example.com/scan.ome.zarr');
 if (issues.length > 0) {
-  // e.g. 'Multi-channel datasets are not supported'
+  // e.g. unsupported dtype, missing multiscales metadata, etc.
 }
 ```
 
@@ -174,8 +191,8 @@ OME-Zarr requires no preprocessing — just point to a URL.
 
 **Supported formats:**
 - OME-NGFF v0.4 and v0.5
-- Single-channel and multi-channel datasets (multi-channel loads channel 0)
-- `uint8` and `uint16` data types only (no signed integers or floats)
+- Single-channel and multichannel datasets (up to 4 channels — see [Multichannel](multichannel.md))
+- `uint8`, `uint16`, and `float32` data types (no signed integers or `float64`)
 
 See the [Data Guide](data-guide.md) for full format requirements.
 

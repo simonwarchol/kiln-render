@@ -2,7 +2,7 @@
 
 Supported formats, data preparation, and hosting for streaming.
 
-See also: [Architecture](architecture.md) | [Rendering Pipeline](rendering.md) | [WebGPU Notes](webgpu.md)
+See also: [Architecture](architecture.md) | [Rendering Pipeline](rendering.md) | [Multichannel](multichannel.md) | [WebGPU Notes](webgpu.md)
 
 Kiln supports two input formats:
 
@@ -19,14 +19,15 @@ Kiln can load [OME-Zarr](https://ngff.openmicroscopy.org/) volumes directly over
 
 ### Requirements
 
-- **OME-NGFF v0.5** with `multiscales` metadata in group attributes (v0.4 not supported)
-- **Single-channel datasets only** (multi-channel/RGB not supported)
-- **3D arrays** with dimensions ordered `[z, y, x]` (standard C-order)
+- **OME-NGFF v0.4 and v0.5** with `multiscales` metadata in group attributes
+- **Single-channel or multichannel** — up to 4 channels (see [Multichannel](multichannel.md))
+- **3D arrays** with dimensions ordered `[z, y, x]` (standard C-order); multichannel datasets use a `c` axis
 - **Supported dtypes:** `uint8`, `uint16`, `float32` (signed integers and `float64` not supported)
 - Multiple resolution levels (datasets within `multiscales`) are used as LODs
 - Voxel spacing is read from `coordinateTransformations` if present
+- OMERO metadata is used for per-channel window auto-leveling when available
 
-> **Note:** Currently unsupported: OME-Zarr v0.4, multi-channel datasets, signed integer types (`int8`, `int16`), and `float64`. `float32` volumes are stored internally as `r16float` (WebGPU filterable-float32 is not universally available); min/max range is read from metadata and used to normalise values in the shader.
+> **Note:** Currently unsupported: more than 4 channels, signed integer types (`int8`, `int16`), and `float64`. `float32` volumes are stored internally as `r16float` (WebGPU filterable-float32 is not universally available); min/max range is read from metadata and used to normalise values in the shader.
 
 ### Usage
 

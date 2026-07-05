@@ -2,7 +2,7 @@
 
 Technical deep-dive into Kiln's virtual texturing system for volumetric data.
 
-See also: [Rendering Pipeline](rendering.md) | [WebGPU Notes](webgpu.md) | [Data Guide](data-guide.md)
+See also: [Rendering Pipeline](rendering.md) | [Multichannel](multichannel.md) | [WebGPU Notes](webgpu.md) | [Data Guide](data-guide.md)
 
 ## System Overview
 
@@ -108,6 +108,10 @@ Atlas Layout (660³ total)
 Each slot stores 66³ voxels. Atlas size:
 - **8-bit**: 287,496 bytes per slot × 1,000 slots = **~274 MiB** VRAM
 - **16-bit**: 574,992 bytes per slot × 1,000 slots = **~548 MiB** VRAM
+
+#### Multichannel Atlas
+
+For multichannel datasets (up to 4 channels), each channel gets its own atlas texture. A 4-channel 16-bit dataset uses 4 × ~548 MiB = ~2.2 GiB of VRAM. The indirection table is shared across all channels — all channels of a given brick use the same atlas slot indices. See [Multichannel](multichannel.md) for details.
 
 The 1-voxel **ghost border** duplicates neighboring brick data to enable hardware trilinear filtering without seams:
 

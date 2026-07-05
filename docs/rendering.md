@@ -2,11 +2,11 @@
 
 Kiln's compute shader raymarching pipeline, compositing modes, and post-processing.
 
-See also: [Architecture](architecture.md) | [WebGPU Notes](webgpu.md) | [Data Guide](data-guide.md)
+See also: [Architecture](architecture.md) | [Multichannel](multichannel.md) | [WebGPU Notes](webgpu.md) | [Data Guide](data-guide.md)
 
 ## Raymarching Overview
 
-Kiln implements a **compute shader** raymarcher (`src/shaders/`) that generates one thread per pixel. The core loop is functionally equivalent to fragment shader raymarching — the compute pipeline was chosen for cleaner post-processing chaining (temporal accumulation) and future optimization headroom (see [Design Decisions](architecture.md#9-compute-shader-raymarching)).
+Kiln implements a **compute shader** raymarcher (`src/shaders/`) that generates one thread per pixel. The core loop is functionally equivalent to fragment shader raymarching — the compute pipeline was chosen for cleaner post-processing chaining (temporal accumulation) and future optimization headroom (see [Compute Shader Raymarching](architecture.md#9-compute-shader-raymarching)).
 
 ```wgsl
 @compute @workgroup_size(8, 8, 1)
@@ -126,6 +126,29 @@ fn composeSample(density, stepSize, color, alpha) {
     *alpha += sampleAlpha * (1.0 - *alpha);
 }
 ```
+
+---
+
+## Multichannel Compositing
+
+For multichannel datasets (up to 4 channels), the rendering pipeline switches from transfer-function-based compositing to **additive per-channel blending**. Each channel is sampled from its own atlas texture, windowed independently, and coloured with a user-defined colour. The weighted contributions are summed:
+
+```wgsl
+// Per-channel: sample atlas, apply windowing, weight by channel colour
+for (var ch = 0u; ch < numChannels; ch++) {
+    let density = sampleAtlas(atlasTextures[ch], ...);
+    let windowed = applyWindow(density, channelCenter[ch], channelWidth[ch]);
+    channelColor += channelColors[ch].rgb * windowed * channelColors[ch].a;
+    maxDensity = max(maxDensity, windowed);
+}
+
+// Composite the additive result into the ray
+composeSampleAdditive(channelColor, maxDensity, ...);
+```
+
+The `composeSampleAdditive` function normalises the summed colour by the maximum density to avoid over-brightening, then applies front-to-back compositing (DVR) or tracks per-channel maximums (MIP).
+
+Transfer functions are not used in multichannel mode. See [Multichannel](multichannel.md) for per-mode behaviour and API details.
 
 ---
 

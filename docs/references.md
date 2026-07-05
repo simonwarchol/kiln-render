@@ -40,6 +40,9 @@ The following works were particularly influential during development:
 - **W3C GPU for the Web Working Group. (2026).** *WebGPU*. W3C Candidate Recommendation Draft.
   [https://gpuweb.github.io/gpuweb/](https://gpuweb.github.io/gpuweb/)
 
+- **IDR. (2024).** *OME-NGFF Samples Directory*. Image Data Resource.
+  [https://idr.github.io/ome-ngff-samples/](https://idr.github.io/ome-ngff-samples/)
+
 ---
 
 ## Dataset Credits
