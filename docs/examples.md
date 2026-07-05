@@ -49,13 +49,40 @@ Cryo-ET tomogram from the CryoET Data Portal. Uses an inverted grayscale transfe
 
 ## Multichannel Fluorescence
 
-### IDR Multichannel (3-channel, OME-Zarr)
+All multichannel examples use the dedicated multichannel viewer with per-channel colour, window/level, and visibility controls. Compositing uses additive blending. See the [Multichannel documentation](multichannel.md) for API details and known limitations.
 
-<a href="https://mpanknin.github.io/kiln-render/multichannel/" target="_blank">Live Demo</a>
+### In Situ Genome Sequencing — Human Fibroblast (IDR0101)
+**~1.1 GB — 2048 × 2048 × 35 @ 16-bit · 4 channels · OME-Zarr 0.4**
 
-The multichannel demo renders OME-Zarr datasets with up to 4 channels. Each channel gets independent colour, window/level, and visibility controls. Compositing uses additive blending — no transfer function.
+<a href="https://mpanknin.github.io/kiln-render/multichannel/?dataset=https%3A%2F%2Fd39zu0xtgv0613.cloudfront.net%2Fmultichannel%2F13457227.zarr%2F13457227.zarr" target="_blank">Live Demo</a>
 
-See the [Multichannel documentation](multichannel.md) for API details and known limitations.
+<img width="1725" height="907" alt="In situ genome sequencing — human fibroblast, 4 channels" src="https://github.com/user-attachments/assets/f5da8ea1-a924-4ba6-9f29-6f6c18369405" />
+
+Confocal microscopy of human fibroblasts (PGP1) from an in situ genome sequencing study. Four fluorescence channels across 35 z-slices at 0.108 µm xy / 0.4 µm z spacing.
+
+**Dataset:** [IDR0101 — Payne et al., 2021](https://doi.org/10.1126/science.aay3446) · *In situ genome sequencing resolves DNA sequence and structure in intact biological samples*
+
+### Yeast smFISH — mRNA Expression (IDR0047)
+**~800 MB — 2048 × 2048 × 25 @ 16-bit · 4 channels · OME-Zarr 0.4**
+
+<a href="https://mpanknin.github.io/kiln-render/multichannel/?dataset=https%3A%2F%2Fd39zu0xtgv0613.cloudfront.net%2Fmultichannel%2F4496763.zarr%2F4496763.zarr" target="_blank">Live Demo</a>
+
+<img width="1725" height="907" alt="Yeast smFISH — mRNA expression, 4 channels" src="https://github.com/user-attachments/assets/f5da8ea1-a924-4ba6-9f29-6f6c18369405" />
+
+Fluorescence microscopy of *Saccharomyces cerevisiae* (baker's yeast) showing single-molecule mRNA expression. Channels: CY5, TMR, DAPI, and transmitted light. 25 z-slices at 0.2 µm z spacing.
+
+**Dataset:** [IDR0047 — Li & Neuert, 2019](https://doi.org/10.1038/s41597-019-0106-6) · *Multiplex RNA single molecule FISH of inducible mRNAs in single yeast cells*
+
+### In Situ Genome Sequencing — Cell 002 (IDR0101)
+**~6 MB — 198 × 223 × 12 @ 16-bit · 6 channels (4 rendered) · OME-Zarr 0.4**
+
+<a href="https://mpanknin.github.io/kiln-render/multichannel/?dataset=https%3A%2F%2Fd39zu0xtgv0613.cloudfront.net%2Fmultichannel%2F13457537.zarr%2F13457537.zarr" target="_blank">Live Demo</a>
+
+<img width="1725" height="907" alt="In situ genome sequencing — cell 002, 6 channels" src="https://github.com/user-attachments/assets/f5da8ea1-a924-4ba6-9f29-6f6c18369405" />
+
+A small cropped cell from the same in situ genome sequencing study (PGP1 fibroblasts). Six channels including DAPI and hybridisation probes — Kiln renders the first 4. Compact dataset useful for quick testing.
+
+**Dataset:** [IDR0101 — Payne et al., 2021](https://doi.org/10.1126/science.aay3446) · Image Data Resource
 
 ---
 
