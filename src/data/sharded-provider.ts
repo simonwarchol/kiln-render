@@ -4,7 +4,7 @@
  */
 
 import { DecompressionPool } from './decompression-pool.js';
-import { NetworkTracker } from './network-tracker.js';
+import { NetworkTracker, RollingAvg } from './network-tracker.js';
 import type {
   DataProvider,
   VolumeMetadata,
@@ -13,6 +13,7 @@ import type {
   BrickLoadResult,
   BrickStats,
   NetworkStats,
+  PipelineTimings,
 } from './data-provider.js';
 
 /** Format-specific metadata from volume.json */
@@ -69,6 +70,8 @@ export class ShardedDataProvider implements DataProvider {
   private lodIndices = new Map<number, ShardedLodIndex>();
   private networkTracker = new NetworkTracker();
   private pool: DecompressionPool | null = null;
+  private fetchAvg = new RollingAvg();
+  private assemblyAvg = new RollingAvg();
 
   constructor(basePath: string) {
     this.basePath = basePath;
@@ -243,6 +246,7 @@ export class ShardedDataProvider implements DataProvider {
       const url = `${this.basePath}/${level.binFile}`;
       const rangeEnd = entry.offset + entry.size - 1;
 
+      const tFetch = performance.now();
       const response = await fetch(url, {
         headers: {
           'Range': `bytes=${entry.offset}-${rangeEnd}`,
@@ -256,8 +260,10 @@ export class ShardedDataProvider implements DataProvider {
 
       const buffer = await response.arrayBuffer();
       this.networkTracker.record(buffer.byteLength);
+      this.fetchAvg.add(performance.now() - tFetch);
 
-      // Check if data is compressed
+      // Assembly: decompress + typed array conversion
+      const tAssembly = performance.now();
       const isCompressed = index.compressed ?? this.rawMetadata.compressed ?? false;
 
       let rawData: Uint8Array;
@@ -268,13 +274,13 @@ export class ShardedDataProvider implements DataProvider {
         rawData = new Uint8Array(buffer);
       }
 
-      // Convert to appropriate typed array based on format
       let data: BrickData;
       if (this.rawMetadata.format === 'uint16') {
         data = new Uint16Array(rawData.buffer, rawData.byteOffset, rawData.byteLength / 2);
       } else {
         data = rawData;
       }
+      this.assemblyAvg.add(performance.now() - tAssembly);
 
       this.cache.set(key, data);
       return { data, min: entry.min, max: entry.max, avg: entry.avg };
@@ -286,6 +292,16 @@ export class ShardedDataProvider implements DataProvider {
 
   getNetworkStats(): NetworkStats {
     return this.networkTracker.getStats();
+  }
+
+  getPipelineTimings(): PipelineTimings {
+    return {
+      avgQueueMs: 0, // no worker queue in sharded provider
+      avgFetchMs: this.fetchAvg.value,
+      avgAssemblyMs: this.assemblyAvg.value,
+      avgUploadMs: 0, // measured in StreamingManager
+      sampleCount: this.fetchAvg.count,
+    };
   }
 
   /**
