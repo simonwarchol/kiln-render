@@ -1,13 +1,6 @@
 /**
- * DataProvider - Abstract interface for volume data sources
- *
- * This interface decouples the renderer from specific file formats.
- * Implementations handle format-specific details (HTTP fetching, decompression,
- * metadata parsing) while exposing a uniform API for brick streaming.
- *
- * Implementations:
- * - ShardedDataProvider: Kiln's native sharded binary format
- * - ZarrDataProvider: OME-NGFF/Zarr format
+ * DataProvider - Abstract interface for volume data sources.
+ * Decouples the renderer from file formats (Zarr, sharded binary).
  */
 
 /** Bit depth for volume data */
@@ -23,6 +16,18 @@ export interface BrickStats {
   min: number;
   max: number;
   avg: number;
+}
+
+/** Result of loading a single brick: voxel data + inline statistics. */
+export interface BrickLoadResult {
+  data: BrickData;
+  min: number;
+  max: number;
+  avg: number;
+  /** Raw-space min (float datasets only — before normalisation to [0, 65535]) */
+  rawMin?: number;
+  /** Raw-space max (float datasets only — before normalisation to [0, 65535]) */
+  rawMax?: number;
 }
 
 /**
@@ -60,14 +65,16 @@ export interface VolumeMetadata {
   levels: LodLevel[];
   /** Bit depth of volume data */
   bitDepth: BitDepth;
-  /** Window/level metadata (optional, from OMERO or similar) */
+  /** Window/level metadata (optional, from OMERO or similar) — first channel */
   window?: {
     start: number;
     end: number;
     min: number;
     max: number;
   };
-  /** Number of channels in the volume (1 for single-channel) */
+  /** Per-channel window/level metadata (optional, from OMERO or similar) */
+  channelWindows?: Array<{ start: number; end: number; min: number; max: number } | undefined>;
+  /** Number of channels in the volume (1 for single-channel, N for multi-channel) */
   numChannels: number;
   /** Whether source data is floating-point (float32/float64) */
   isFloat?: boolean;
@@ -82,6 +89,8 @@ export interface VolumeMetadata {
  * All values are milliseconds per brick. Zero means no data yet.
  */
 export interface PipelineTimings {
+  /** Avg queue wait: dispatch → worker starts processing (ms per brick) */
+  avgQueueMs: number;
   /** Avg time for chunk I/O (filesystem read or HTTP fetch + decompress) per brick */
   avgFetchMs: number;
   /** Avg time for brick assembly loop (voxel scatter + any format conversion) per brick */
@@ -90,6 +99,8 @@ export interface PipelineTimings {
   avgUploadMs: number;
   /** Number of bricks in the rolling sample window */
   sampleCount: number;
+  /** Per-worker chunk cache hit ratio (0–1). Measures bandwidth amplification quality. */
+  chunkCacheHitRatio?: number;
 }
 
 /**
@@ -115,15 +126,7 @@ export class UnsupportedDatasetError extends Error {
   }
 }
 
-/**
- * Abstract interface for volume data providers
- *
- * Implementations must handle:
- * - Loading and parsing format-specific metadata
- * - Fetching brick data (network, filesystem, etc.)
- * - Decompression if applicable
- * - Converting to appropriate TypedArray based on bit depth
- */
+/** Abstract interface for volume data providers. */
 export interface DataProvider {
   /**
    * Initialize the provider and load volume metadata
@@ -142,28 +145,10 @@ export interface DataProvider {
    */
   getBrickGrid(lod: number): [number, number, number];
 
-  /**
-   * Load a single brick's voxel data
-   *
-   * @param lod - LOD level (0 = finest)
-   * @param bx - Brick X coordinate
-   * @param by - Brick Y coordinate
-   * @param bz - Brick Z coordinate
-   * @returns Brick data as Uint8Array or Uint16Array, or null if not found
-   */
-  loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex?: number): Promise<BrickData | null>;
+  /** Load a single brick's voxel data with inline statistics. */
+  loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex?: number, signal?: AbortSignal): Promise<BrickLoadResult | null>;
 
-  /**
-   * Check if a brick is empty (below threshold)
-   * Used to skip loading/rendering of empty regions
-   *
-   * @param lod - LOD level
-   * @param bx - Brick X coordinate
-   * @param by - Brick Y coordinate
-   * @param bz - Brick Z coordinate
-   * @param maxThreshold - Optional custom threshold (default from config)
-   * @returns true if brick is empty/should be skipped
-   */
+  /** Check if a brick is empty (below threshold). */
   isBrickEmpty(lod: number, bx: number, by: number, bz: number, maxThreshold?: number): Promise<boolean>;
 
   /**
@@ -181,6 +166,12 @@ export interface DataProvider {
    * Get per-stage pipeline timing averages (optional — returns zeros if not implemented)
    */
   getPipelineTimings?(): PipelineTimings;
+
+  /**
+   * Update the float normalisation range after base LOD range derivation.
+   * Only relevant for float zarr datasets with worker pools.
+   */
+  setFloatRange?(min: number, max: number): Promise<void>;
 
   /**
    * Clean up resources (workers, caches, etc.)

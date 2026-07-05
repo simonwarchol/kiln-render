@@ -1,14 +1,6 @@
 /**
- * ZarrDataProvider - DataProvider implementation for OME-Zarr (NGFF) volumes
- *
- * Loads OME-Zarr v0.5 datasets over HTTP using zarrita.js.
- * All heavy work (fetch, decompress, re-chunk into 66³ bricks) runs in a
- * Web Worker pool — the main thread only handles metadata and GPU uploads.
- *
- * Axis convention:
- * - Zarr stores dimensions as [z, y, x] (C-order, x fastest-varying)
- * - Kiln uses [x, y, z] in metadata but identical memory layout
- * - Only metadata tuples need swapping, no data transposition
+ * ZarrDataProvider - Loads OME-Zarr (NGFF) datasets over HTTP via a Web Worker pool.
+ * Zarr [z,y,x] metadata is swapped to Kiln's [x,y,z]; memory layout is unchanged.
  */
 
 import { open, root, Array as ZarrArray } from 'zarrita';
@@ -16,7 +8,7 @@ import type { DataType, Readable } from 'zarrita';
 import { TolerantFetchStore } from './tolerant-fetch-store.js';
 import { ZarrWorkerPool } from './zarr-worker-pool.js';
 import { BaseZarrProvider, detectCompression } from './base-zarr-provider.js';
-import type { VolumeMetadata, BrickData, PipelineTimings } from './data-provider.js';
+import type { VolumeMetadata, BrickLoadResult, PipelineTimings } from './data-provider.js';
 import { UnsupportedDatasetError } from './data-provider.js';
 import { extractMultiscales } from './zarr-validator.js';
 
@@ -91,11 +83,10 @@ export class ZarrDataProvider extends BaseZarrProvider {
     const name = urlParts[urlParts.length - 1]?.replace(/\.ome\.zarr|\.zarr/, '') ?? 'zarr-volume';
     const { metadata, lodParams } = this.parseOmeMetadata(attrs, arrays, name);
 
-    // Scan coarsest LOD for float range if no OMERO window provided it
+    // Provisional dataRange for float data without OMERO window — real range
+    // is derived incrementally during base LOD loading.
     if (metadata.isFloat && !metadata.dataRange) {
-      console.log('[Kiln] Float dataset — scanning coarsest LOD for data range…');
-      metadata.dataRange = await this.scanFloatRange(arrays[arrays.length - 1]!, lodParams[lodParams.length - 1]!);
-      console.log(`[Kiln] Float data range: [${metadata.dataRange[0]}, ${metadata.dataRange[1]}]`);
+      metadata.dataRange = [0, 1];
     }
 
     metadata.compression = await detectCompression(store, arrayPaths[0] ?? '');
@@ -120,11 +111,8 @@ export class ZarrDataProvider extends BaseZarrProvider {
   }
 
 
-  /**
-   * Load a fully assembled 66³ brick via the worker pool.
-   * The entire pipeline (fetch + decompress + re-chunk + stats) runs off main thread.
-   */
-  async loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex = 0): Promise<BrickData | null> {
+  /** Load a fully assembled 66³ brick via the worker pool (fully off main thread). */
+  async loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex = 0, signal?: AbortSignal): Promise<BrickLoadResult | null> {
     const meta = this.getMetadata();
     const level = meta.levels.find(l => l.lod === lod);
     if (!level) return null;
@@ -136,7 +124,7 @@ export class ZarrDataProvider extends BaseZarrProvider {
     }
 
     try {
-      const result = await this.workerPool!.loadBrick(lod, bx, by, bz, channelIndex);
+      const result = await this.workerPool!.loadBrick(lod, bx, by, bz, channelIndex, signal);
 
       // Cache stats for isBrickEmpty checks
       this.cacheBrickStats(lod, bx, by, bz, {
@@ -148,16 +136,28 @@ export class ZarrDataProvider extends BaseZarrProvider {
       // Track approximate download size
       this.recordDownload(result.data.byteLength);
 
-      return result.data;
+      return result;
     } catch (e) {
+      // Aborted requests are expected — return null silently
+      if (e instanceof DOMException && e.name === 'AbortError') return null;
       console.warn(`Failed to load brick lod${lod}:${bx}-${by}-${bz}:`, e);
       return null;
     }
   }
 
+  /**
+   * Update the float normalisation range on all workers.
+   * Called after base LOD loading derives the actual data range.
+   */
+  async setFloatRange(min: number, max: number): Promise<void> {
+    if (this.workerPool) {
+      await this.workerPool.setFloatRange(min, max);
+    }
+  }
+
   getPipelineTimings(): PipelineTimings {
     return this.workerPool?.getPipelineTimings() ?? {
-      avgFetchMs: 0, avgAssemblyMs: 0, avgUploadMs: 0, sampleCount: 0,
+      avgQueueMs: 0, avgFetchMs: 0, avgAssemblyMs: 0, avgUploadMs: 0, sampleCount: 0,
     };
   }
 

@@ -1,13 +1,10 @@
 /**
- * KilnViewer — self-contained WebGPU volume renderer
- *
- * Encapsulates WebGPU initialisation, data provider selection, subsystem
- * construction, the render loop, and resize handling.  The application layer
- * (main.ts) is responsible for URL parsing, the dataset dialog, the share
- * button, analytics, and the optional VolumeUI panel.
+ * KilnViewer — self-contained WebGPU volume renderer. Handles WebGPU init,
+ * data provider setup, render loop, and resize. App layer handles UI.
  */
 
 import { Renderer, VolumeRenderMode } from './core/renderer.js';
+import { VolumeResources } from './core/volume-resources.js';
 import { Camera, UpAxis } from './core/camera.js';
 import { TransferFunction, TFPreset } from './core/transfer-function.js';
 import { StreamingManager } from './streaming/streaming-manager.js';
@@ -89,24 +86,24 @@ export class KilnViewer {
   readonly device: GPUDevice;
   readonly metadata: VolumeMetadata;
 
-  /**
-   * Optional callback invoked at the start of every render frame.
-   * Use this to drive frame-rate tracking in the UI layer.
-   *
-   * @example
-   * viewer.onBeforeFrame = () => ui.recordFrame();
-   */
+  /** Optional callback invoked at the start of every render frame. */
   onBeforeFrame?: () => void;
+
+  /** Callback invoked when float/channel ranges are derived during base LOD loading. */
+  onChannelWindowsChanged?: () => void;
 
   private readonly dataProvider: DataProvider;
   private readonly context: GPUCanvasContext;
   private readonly canvas: HTMLCanvasElement;
   private readonly resizeObserver: ResizeObserver;
   private rafHandle = 0;
+  private resizeTimer = 0;
   /** User-intended render scale; the frame loop may temporarily override it to
    *  0.25 during camera interaction. */
   private userRenderScale: number;
   private disposed = false;
+  private dirty = true;
+  private lastCameraVersion = -1;
 
   private constructor(
     device: GPUDevice,
@@ -131,21 +128,19 @@ export class KilnViewer {
     this.metadata = metadata;
     this.userRenderScale = userRenderScale;
 
-    this.resizeObserver = new ResizeObserver(() => this.resize());
+    this.renderer.onDirty = () => { this.dirty = true; };
+
+    this.resizeObserver = new ResizeObserver(() => {
+      clearTimeout(this.resizeTimer);
+      this.resizeTimer = setTimeout(() => this.resize(), 100) as unknown as number;
+    });
     this.resizeObserver.observe(canvas);
     this.resize(); // Ensure correct dimensions before first frame
 
     this.rafHandle = requestAnimationFrame(() => this.frame());
   }
 
-  /**
-   * Create a fully initialised KilnViewer.
-   *
-   * @param canvas  The canvas element to render into.
-   * @param dataset URL string (HTTP sharded or OME-Zarr) **or** a pre-constructed
-   *                DataProvider (e.g. LocalZarrDataProvider for File System API).
-   * @param options Optional initial viewer state.
-   */
+  /** Create a fully initialised KilnViewer from a URL or DataProvider. */
   static async create(
     canvas: HTMLCanvasElement,
     dataset: string | DataProvider,
@@ -153,7 +148,7 @@ export class KilnViewer {
   ): Promise<KilnViewer> {
 
     // WebGPU init 
-    const adapter = await navigator.gpu?.requestAdapter();
+    const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('WebGPU not supported');
 
     const adapterLimits = adapter.limits;
@@ -218,7 +213,8 @@ export class KilnViewer {
     const config = new DatasetConfig(metadata.dimensions, metadata.voxelSpacing);
 
     // Construct subsystems
-    const renderer = new Renderer(device, format, effectiveBitDepth, textureFormat, config);
+    const resources = new VolumeResources(device, effectiveBitDepth, textureFormat, config, metadata.numChannels);
+    const renderer = new Renderer(device, format, resources, config);
 
     // Apply 16-bit window/level defaults from metadata
     if (effectiveBitDepth === 16) {
@@ -235,9 +231,25 @@ export class KilnViewer {
       }
     }
 
-    // For float32 datasets: pass raw data range to renderer so the shader can
-    // normalize (raw − floatMin) / (floatMax − floatMin) → [0, 1] on the GPU.
-    // For uint data floatMin/floatMax stay at their defaults (0 / 1 = identity).
+    // Apply per-channel window/level from metadata. Float windows are
+    // relative to the global dataRange (not per-channel OMERO min/max).
+    if (metadata.channelWindows && metadata.numChannels > 1) {
+      const useGlobalRange = (metadata.isFloat ?? false) && !!metadata.dataRange;
+      for (let ch = 0; ch < metadata.channelWindows.length; ch++) {
+        const w = metadata.channelWindows[ch];
+        if (!w) continue;
+        const lo = useGlobalRange ? metadata.dataRange![0] : w.min;
+        const hi = useGlobalRange ? metadata.dataRange![1] : w.max;
+        const range = hi - lo;
+        if (range > 0) {
+          const center = Math.max(0, Math.min(1, ((w.start + w.end) / 2 - lo) / range));
+          const width = Math.max(0.01, Math.min(1, (w.end - w.start) / range));
+          renderer.setChannelWindow(ch, center, width);
+        }
+      }
+    }
+
+    // Pass float32 data range to renderer for GPU normalization.
     if (metadata.isFloat && metadata.dataRange) {
       renderer.floatMin = metadata.dataRange[0];
       renderer.floatMax = metadata.dataRange[1];
@@ -301,11 +313,12 @@ export class KilnViewer {
 
     // Streaming manager
     const streamingManager = new StreamingManager(
-      renderer,
+      resources,
       dataProvider,
       metadata,
       device,
       config,
+      () => renderer.resetAccumulation(),
       options.pageLoadStart,
     );
 
@@ -328,6 +341,30 @@ export class KilnViewer {
       metadata,
       userRenderScale,
     );
+
+    // When base LOD derives float/channel ranges, update renderer + metadata.
+    // Wired after construction so onChannelWindowsChanged can notify external UI.
+    streamingManager.setRangesDerivedCallback((opts) => {
+      if (opts.dataRange) {
+        renderer.floatMin = opts.dataRange[0];
+        renderer.floatMax = opts.dataRange[1];
+        renderer.resetAccumulation();
+      }
+      if (opts.channelRanges && metadata.channelWindows) {
+        for (let ch = 0; ch < opts.channelRanges.length; ch++) {
+          const w = metadata.channelWindows[ch];
+          if (!w) continue;
+          const range = w.max - w.min;
+          if (range > 0) {
+            const center = Math.max(0, Math.min(1, ((w.start + w.end) / 2 - w.min) / range));
+            const width = Math.max(0.01, Math.min(1, (w.end - w.start) / range));
+            renderer.setChannelWindow(ch, center, width);
+          }
+        }
+        renderer.resetAccumulation();
+      }
+      viewer.onChannelWindowsChanged?.();
+    });
 
     device.lost.then(() => viewer.dispose());
 
@@ -376,6 +413,9 @@ export class KilnViewer {
   get renderScale(): number { return this.userRenderScale; }
   set renderScale(value: number) {
     this.userRenderScale = value;
+    // build the scale set now (off the gesture path) and re-render
+    this.renderer.prepareScale(value);
+    this.dirty = true;
   }
 
   // State serialisation
@@ -416,6 +456,7 @@ export class KilnViewer {
     if (this.disposed) return;
     this.disposed = true;
     cancelAnimationFrame(this.rafHandle);
+    clearTimeout(this.resizeTimer);
     this.resizeObserver.disconnect();
     this.dataProvider.dispose();
   }
@@ -428,25 +469,45 @@ export class KilnViewer {
       this.canvas.width = width;
       this.canvas.height = height;
       this.renderer.resize(width, height);
+      this.renderer.prepareScale(0.25);
+      this.renderer.prepareScale(this.userRenderScale);
+      this.dirty = true;
     }
   }
 
   private frame(): void {
     if (this.disposed) return;
 
-    this.onBeforeFrame?.();
-
     // Drop to 0.25 during camera interaction; restore to user scale afterward
-    const targetScale = this.camera.isInteracting() ? 0.25 : this.userRenderScale;
+    const interacting = this.camera.isInteracting();
+    const targetScale = interacting ? 0.25 : this.userRenderScale;
     if (this.renderer.renderScale !== targetScale) {
-      this.renderer.renderScale = targetScale;
-      this.renderer.resizeComputeTexture();
+      this.renderer.activateScale(targetScale);
+      this.dirty = true;
     }
 
-    this.streamingManager.update(this.camera, this.canvas);
+    if (this.camera.version !== this.lastCameraVersion) {
+      this.lastCameraVersion = this.camera.version;
+      this.dirty = true;
+    }
 
-    const view = this.context.getCurrentTexture().createView();
-    this.renderer.render(view, this.camera);
+    // Keep SSE LOD selection in sync with the rendered resolution.
+    // The clamp in computeDesiredSet (max(renderScale, 0.5)) prevents the
+    // LOD-collapse at low render scales.
+    this.streamingManager.renderScale = this.renderer.renderScale;
+
+    // Always run streaming (may trigger onDirty via resetAccumulation)
+    const streamingActive = this.streamingManager.update(this.camera, this.canvas);
+
+    // Determine if we need to render
+    const needsRender = this.dirty || interacting || streamingActive || !this.renderer.isConverged;
+
+    if (needsRender) {
+      this.dirty = false;
+      this.onBeforeFrame?.();
+      const view = this.context.getCurrentTexture().createView();
+      this.renderer.render(view, this.camera);
+    }
 
     this.rafHandle = requestAnimationFrame(() => this.frame());
   }

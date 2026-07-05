@@ -4,37 +4,51 @@
 
 import { mat4 } from 'wgpu-matrix';
 import { Camera } from './camera.js';
-import { VolumeCanvas, createVolumeCanvas, writeToCanvas } from './volume.js';
 import { createBox, createAxis } from '../utils/geometry.js';
 import { TransferFunction } from './transfer-function.js';
-import { IndirectionTable } from './indirection.js';
-import { AtlasAllocator, AtlasSlot } from '../streaming/atlas-allocator.js';
-import { volumeShader, wireframeShader, axisShader, computeShader, blitShader, accumulateShader, slicePlanesShader } from '../shaders/index.js';
+import { VolumeResources } from './volume-resources.js';
+import { wireframeShader, axisShader, computeShader, blitShader, accumulateShader, slicePlanesShader } from '../shaders/index.js';
+import { COMPUTE_UNIFORMS, SLICE_UNIFORMS } from '../shaders/uniform-layout.js';
 import type { DatasetConfig } from './config.js';
-import type { BitDepth } from '../data/data-provider.js';
-
-export type RenderMode = 'fragment' | 'compute';
 
 // Volume render mode (shader-side)
-export type VolumeRenderMode = 'dvr' | 'mip' | 'iso' | 'lod' | 'slice';
+export type VolumeRenderMode = 'dvr' | 'mip' | 'iso' | 'lod' | 'slice' | 'slice-lod';
+
+/** pre-allocated compute/accumulation resources for one render scale */
+interface ScaleSet {
+  scale: number;
+  width: number;
+  height: number;
+  outputTexture: GPUTexture;
+  outputView: GPUTextureView;
+  accumTextures: [GPUTexture, GPUTexture];
+  accumViews: [GPUTextureView, GPUTextureView];
+  accumBindGroups: [GPUBindGroup, GPUBindGroup];
+  computeBindGroup: GPUBindGroup;
+  directBlitBindGroup: GPUBindGroup;
+  blitBindGroups: [GPUBindGroup, GPUBindGroup];
+  accumIndex: number;
+  accumFrameCount: number;
+}
 
 export class Renderer {
   private device: GPUDevice;
 
-  // Volume canvas (atlas texture)
-  canvas: VolumeCanvas;
+  /** Volume atlas textures, indirection table, and slot allocator */
+  readonly resources: VolumeResources;
 
-  // Indirection table for virtual texturing
-  indirection: IndirectionTable;
-
-  // Atlas slot allocator
-  allocator: AtlasAllocator;
+  // Delegate getters for backwards compatibility
+  get numChannels(): number { return this.resources.numChannels; }
+  get canvas() { return this.resources.canvas; }
+  get canvases() { return this.resources.canvases; }
 
   // Debug: toggle indirection on/off
   useIndirection = true;
 
   // Show wireframe box
   showWireframe = false;
+
+  // Density scale for DVR compositing (1.0 = default)
   densityScale = 1.0;
 
   // Show axis helper
@@ -45,9 +59,6 @@ export class Renderer {
 
   // TAA: accumulate jittered frames for temporal anti-aliasing
   enableTAA = true;
-
-  // Rendering mode: 'fragment' (proxy box) or 'compute' (compute shader)
-  renderMode: RenderMode = 'compute';
 
   // Volume render mode: dvr, mip, or iso
   volumeRenderMode: VolumeRenderMode = 'dvr';
@@ -82,8 +93,7 @@ export class Renderer {
   // Render scale for compute shader (0.25–1.0, lower = faster but blurrier)
   renderScale = 0.5;
 
-  // Fragment-based pipelines
-  private volumePipeline: GPURenderPipeline;
+  // Overlay pipelines (rasterized wireframe, axis, slice)
   private wireframePipeline: GPURenderPipeline;
   private axisPipeline: GPURenderPipeline;
   private slicePipeline: GPURenderPipeline;
@@ -93,34 +103,27 @@ export class Renderer {
   // Compute-based pipeline
   private computePipeline: GPUComputePipeline;
   private blitPipeline: GPURenderPipeline;
-  private computeBindGroup: GPUBindGroup;
-  private blitBindGroup: GPUBindGroup; // active blit bind group (set per-frame from blitBindGroups)
-  private blitBindGroups: [GPUBindGroup, GPUBindGroup] = null!; // one per accum texture
-  private directBlitBindGroup: GPUBindGroup; // blit directly from compute output (no TAA)
   private computeUniformBuffer: GPUBuffer;
-  private computeOutputTexture: GPUTexture;
-  private computeOutputView: GPUTextureView;
 
   // Temporal accumulation
   private accumPipeline: GPUComputePipeline;
   private accumUniformBuffer: GPUBuffer;
-  private accumTextures: [GPUTexture, GPUTexture] = null!;
-  private accumViews: [GPUTextureView, GPUTextureView] = null!;
-  private accumBindGroups: [GPUBindGroup, GPUBindGroup] = null!;
-  private accumIndex = 0; // ping-pong index: write to accumTextures[accumIndex], read from other
-  private accumFrameCount = 0;
+
+  // pre-allocated per-scale resources. 
+  // avoids texture/bind-group creation on gesture start/end 
+  
+  private scaleSets = new Map<number, ScaleSet>();
+  private active!: ScaleSet;
+
   private prevVP: Float32Array | null = null;
 
-  // Fragment bind groups
-  private volumeBindGroup: GPUBindGroup;
+  // Overlay bind groups
   private wireframeBindGroup: GPUBindGroup;
   private axisBindGroup: GPUBindGroup;
 
   // Buffers
   private vertexBuffer: GPUBuffer;
-  private indexBuffer: GPUBuffer;
   private wireframeIndexBuffer: GPUBuffer;
-  private uniformBuffer: GPUBuffer;
   private wireframeUniformBuffer: GPUBuffer;
   private axisVertexBuffer: GPUBuffer;
   private axisUniformBuffer: GPUBuffer;
@@ -136,48 +139,42 @@ export class Renderer {
   private tfTexture: GPUTexture;
 
   // Counts
-  private indexCount: number;
   private wireframeIndexCount: number;
 
   // Screen size (full resolution)
   private screenWidth = 1;
   private screenHeight = 1;
 
-  // Compute texture size (may be lower than screen when renderScale < 1)
-  private computeWidth = 1;
-  private computeHeight = 1;
-
   // Frame counter for temporal jitter
   private frameIndex = 0;
 
   private readonly config: DatasetConfig;
 
+  // Per-channel display colors: RGBA (rgb = hue, a = intensity weight). Defaults: blue, yellow, red, white.
+  readonly channelColors = new Float32Array([
+    0, 0, 1, 1,   // ch0: blue
+    1, 1, 0, 1,   // ch1: yellow
+    1, 0, 0, 1,   // ch2: red
+    1, 1, 1, 1,   // ch3: white
+  ]);
+
+  // Per-channel windowing (0-1 normalized). Defaults: center=0.5, width=1.0 (full range).
+  readonly channelWindowCenter = new Float32Array([0.5, 0.5, 0.5, 0.5]);
+  readonly channelWindowWidth  = new Float32Array([1.0, 1.0, 1.0, 1.0]);
+
   // Pre-allocated scratch buffers (avoid per-frame GC pressure)
   private readonly vpScratch = new Float32Array(16);
   private readonly invVPScratch = new Float32Array(16);
-  private readonly fragUniformScratch = new Float32Array(60);
-  private readonly fragUniformView = new DataView(this.fragUniformScratch.buffer);
-  private readonly computeUniformScratch = new Float32Array(48);
+  private readonly computeUniformScratch = new Float32Array(COMPUTE_UNIFORMS.size / 4);
   private readonly computeUniformView = new DataView(this.computeUniformScratch.buffer);
   private readonly accumScratch = new Float32Array(4);
-  private readonly sliceUniformScratch = new Float32Array(36); // 144 bytes
+  private readonly sliceUniformScratch = new Float32Array(SLICE_UNIFORMS.size / 4);
   private readonly sliceUniformView = new DataView(this.sliceUniformScratch.buffer);
-  private static readonly IDENTITY_MAT4 = new Float32Array([
-    1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1,
-  ]);
 
-  constructor(device: GPUDevice, format: GPUTextureFormat, bitDepth: BitDepth, textureFormat: GPUTextureFormat, config: DatasetConfig) {
+  constructor(device: GPUDevice, format: GPUTextureFormat, resources: VolumeResources, config: DatasetConfig) {
     this.device = device;
     this.config = config;
-
-    // Create volume canvas (empty) with specified bit depth and format
-    this.canvas = createVolumeCanvas(device, bitDepth, textureFormat);
-
-    // Create indirection table for virtual texturing
-    this.indirection = new IndirectionTable(device, config);
-
-    // Create atlas allocator
-    this.allocator = new AtlasAllocator();
+    this.resources = resources;
 
     // Create geometry (normalized proxy based on dataset aspect ratio)
     const box = createBox(config.normalizedSize);
@@ -187,13 +184,6 @@ export class Renderer {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     device.queue.writeBuffer(this.vertexBuffer, 0, box.vertices as Float32Array<ArrayBuffer>);
-
-    this.indexBuffer = device.createBuffer({
-      size: box.indices.byteLength,
-      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(this.indexBuffer, 0, box.indices as Uint16Array<ArrayBuffer>);
-    this.indexCount = box.indices.length;
 
     this.wireframeIndexBuffer = device.createBuffer({
       size: box.wireframeIndices.byteLength,
@@ -209,16 +199,6 @@ export class Renderer {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     device.queue.writeBuffer(this.axisVertexBuffer, 0, axis.vertices as Float32Array<ArrayBuffer>);
-
-    // Create uniform buffers
-    // Volume: mat4 mvp (64) + mat4 inverseModel (64) + vec3 cameraPos (12) + useIndirection (4)
-    //       + vec3 datasetSize (12) + renderMode (4) + vec3 normalizedSize (12) + isoValue (4)
-    //       + frameIndex (4) + pad (4) + windowCenter (4) + windowWidth (4) + pad2 vec2 (8)
-    //       + clipMin vec3 (12) + pad3 (4) + clipMax vec3 (12) + pad4 (4) = 240 bytes
-    this.uniformBuffer = device.createBuffer({
-      size: 240,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
 
     // Wireframe: mat4 mvp (64)
     this.wireframeUniformBuffer = device.createBuffer({
@@ -273,26 +253,6 @@ export class Renderer {
       attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
     };
 
-    // Volume pipeline
-    const volumeModule = device.createShaderModule({ code: volumeShader });
-    this.volumePipeline = device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module: volumeModule, entryPoint: 'vs', buffers: [vertexLayout] },
-      fragment: {
-        module: volumeModule,
-        entryPoint: 'fs',
-        targets: [{
-          format,
-          blend: {
-            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-          },
-        }],
-      },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil,
-    });
-
     // Wireframe pipeline
     const wireframeModule = device.createShaderModule({ code: wireframeShader });
     this.wireframePipeline = device.createRenderPipeline({
@@ -321,12 +281,8 @@ export class Renderer {
     });
 
     // Slice planes pipeline
-    // Uniform buffer layout (144 bytes / 36 floats):
-    //   mvp mat4x4f (64) + normalizedSize vec3f + _pad0 (16) + datasetSize vec3f + _pad1 (16)
-    //   + windowCenter/Width/floatMin/floatMax (16) + slicePositions vec3f + _pad2 (16)
-    //   + sliceXYZEnabled u32x3 + _pad3 (16)
     this.sliceUniformBuffer = device.createBuffer({
-      size: 144,
+      size: SLICE_UNIFORMS.size,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -363,27 +319,12 @@ export class Renderer {
       entries: [{ binding: 0, resource: { buffer: this.axisUniformBuffer } }],
     });
 
-    // Volume bind group will be created when TF is set
-    this.volumeBindGroup = null!;
-
     // ===== Compute shader pipeline =====
 
-    // Compute uniform buffer: mat4 inverseViewProj (64) + vec3 cameraPos (12) + useIndirection (4)
-    //                       + vec3 datasetSize (12) + renderMode (4) + vec3 normalizedSize (12) + isoValue (4)
-    //                       + vec2 screenSize (8) + frameIndex (4) + pad3 (4) + windowCenter (4) + windowWidth (4)
-    //                       + pad4 vec2 (8) + clipMin vec3 (12) + pad5 (4) + clipMax vec3 (12) + pad6 (4) = 192 bytes
     this.computeUniformBuffer = device.createBuffer({
-      size: 192,
+      size: COMPUTE_UNIFORMS.size,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-
-    // Output texture (will be resized)
-    this.computeOutputTexture = device.createTexture({
-      size: [1, 1],
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
-    });
-    this.computeOutputView = this.computeOutputTexture.createView();
 
     // Compute pipeline
     const computeModule = device.createShaderModule({ code: computeShader });
@@ -392,9 +333,6 @@ export class Renderer {
       compute: { module: computeModule, entryPoint: 'main' },
     });
 
-    // Compute bind group will be created when TF is set
-    this.computeBindGroup = null!;
-
     // Blit pipeline (fullscreen quad to display compute output)
     const blitModule = device.createShaderModule({ code: blitShader });
     this.blitPipeline = device.createRenderPipeline({
@@ -402,17 +340,8 @@ export class Renderer {
       vertex: { module: blitModule, entryPoint: 'vs' },
       fragment: { module: blitModule, entryPoint: 'fs', targets: [{ format }] },
       primitive: { topology: 'triangle-list' },
+      depthStencil: { depthWriteEnabled: false, depthCompare: 'always', format: 'depth24plus' },
     });
-
-    this.blitBindGroup = device.createBindGroup({
-      layout: this.blitPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.computeOutputView },
-        { binding: 1, resource: this.blitSampler },
-      ],
-    });
-
-    this.directBlitBindGroup = this.blitBindGroup; // will be recreated with compute textures
 
     // Accumulation pipeline
     const accumModule = device.createShaderModule({ code: accumulateShader });
@@ -427,79 +356,54 @@ export class Renderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    // Accumulation textures (ping-pong, will be resized)
-    const dummyTex = () => device.createTexture({
-      size: [1, 1],
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
-    });
-    this.accumTextures = [dummyTex(), dummyTex()];
-    this.accumViews = [this.accumTextures[0].createView(), this.accumTextures[1].createView()];
-    this.accumBindGroups = [null!, null!];
+    // initial dummy scale set (will be properly sized at first resize)
+    this.active = this.buildScaleSet(this.renderScale);
+    this.scaleSets.set(this.renderScale, this.active);
   }
 
-  /**
-   * Load a brick into the atlas at the next available slot
-   * @param virtualX, virtualY, virtualZ - Virtual brick position in the dataset grid
-   * @param data - Brick voxel data (BRICK_SIZE³)
-   * @param lod - LOD level (0 = full res, 1 = 2x downsample, 2 = 4x, 3 = 8x)
-   * Returns the atlas slot used, or null if atlas is full
-   */
-  loadBrick(
-    virtualX: number, virtualY: number, virtualZ: number,
-    data: Uint8Array,
-    lod: number = 0
-  ): AtlasSlot | null {
-    const result = this.allocator.allocate();
-    if (!result) {
-      console.warn('Atlas full, cannot load brick');
-      return null;
-    }
+  /** Callback invoked when the scene needs a re-render (parameter change, brick arrival, etc.) */
+  onDirty?: () => void;
 
-    const slot = result.slot;
-
-    // Write brick data to atlas
-    const offset: [number, number, number] = [
-      slot.x * 66, // Use PHYSICAL_BRICK_SIZE
-      slot.y * 66,
-      slot.z * 66
-    ];
-    writeToCanvas(this.device, this.canvas, data, [66, 66, 66], offset);
-
-    // Set up indirection mapping with LOD level
-    this.indirection.setBrick(virtualX, virtualY, virtualZ, slot.x, slot.y, slot.z, lod);
-
-    return slot;
-  }
-
-  /**
-   * Unload a brick from the atlas
-   * @param lod - LOD level of the brick being unloaded
-   * @param fallbackAtlas - Optional atlas position to fall back to (parent brick)
-   * @param fallbackLod - Optional LOD of fallback brick
-   */
-  unloadBrick(
-    virtualX: number, virtualY: number, virtualZ: number,
-    slot: AtlasSlot,
-    lod: number = 0,
-    fallbackAtlas?: [number, number, number],
-    fallbackLod?: number
-  ): void {
-    this.indirection.clearBrick(virtualX, virtualY, virtualZ, lod, fallbackAtlas, fallbackLod);
-    this.allocator.free(slot);
-  }
-
-  /**
-   * Clear all bricks from atlas
-   */
-  clearAllBricks(): void {
-    this.indirection.clearAll();
-    this.allocator.reset();
+  /** Signal that the scene changed and needs a re-render (without resetting accumulation) */
+  markDirty(): void {
+    this.onDirty?.();
   }
 
   /** Reset temporal accumulation (call when rendering parameters change) */
   resetAccumulation(): void {
-    this.accumFrameCount = 0;
+    for (const set of this.scaleSets.values()) {
+      set.accumFrameCount = 0;
+    }
+    this.onDirty?.();
+  }
+
+  /** Whether the image is stable (no further rendering will change the output) */
+  private get isSliceMode(): boolean {
+    return this.volumeRenderMode === 'slice' || this.volumeRenderMode === 'slice-lod';
+  }
+
+  get isConverged(): boolean {
+    return this.isSliceMode
+      || !this.enableTAA
+      || this.active.accumFrameCount >= 64;
+  }
+
+  /** Set the display color and intensity weight for a channel (0–3). Resets accumulation. */
+  setChannelColor(ch: number, r: number, g: number, b: number, a = 1.0): void {
+    const base = Math.min(Math.max(0, ch), 3) * 4;
+    this.channelColors[base]     = r;
+    this.channelColors[base + 1] = g;
+    this.channelColors[base + 2] = b;
+    this.channelColors[base + 3] = a;
+    this.resetAccumulation();
+  }
+
+  /** Set the window center and width for a channel (0–3). Resets accumulation. */
+  setChannelWindow(ch: number, center: number, width: number): void {
+    const i = Math.min(Math.max(0, ch), 3);
+    this.channelWindowCenter[i] = center;
+    this.channelWindowWidth[i]  = width;
+    this.resetAccumulation();
   }
 
   /**
@@ -513,42 +417,25 @@ export class Renderer {
   private recreateVolumeBindGroups(): void {
     if (!this.tfTexture) return;
 
-    this.volumeBindGroup = this.device.createBindGroup({
-      layout: this.volumePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: this.volumeSampler },
-        { binding: 2, resource: this.canvas.texture.createView() },
-        { binding: 3, resource: this.tfSampler },
-        { binding: 4, resource: this.tfTexture.createView() },
-        { binding: 6, resource: this.indirection.texture.createView() },
-      ],
-    });
-
     this.sliceBindGroup = this.device.createBindGroup({
       layout: this.slicePipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.sliceUniformBuffer } },
         { binding: 1, resource: this.volumeSampler },
-        { binding: 2, resource: this.canvas.texture.createView() },
+        { binding: 2, resource: this.resources.atlasView(0) },
         { binding: 3, resource: this.tfSampler },
         { binding: 4, resource: this.tfTexture.createView() },
-        { binding: 6, resource: this.indirection.texture.createView() },
+        { binding: 6, resource: this.resources.indirection.texture.createView() },
+        { binding: 8, resource: this.resources.atlasView(1) },
+        { binding: 9, resource: this.resources.atlasView(2) },
+        { binding: 10, resource: this.resources.atlasView(3) },
       ],
     });
 
-    this.computeBindGroup = this.device.createBindGroup({
-      layout: this.computePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.computeUniformBuffer } },
-        { binding: 1, resource: this.volumeSampler },
-        { binding: 2, resource: this.canvas.texture.createView() },
-        { binding: 3, resource: this.tfSampler },
-        { binding: 4, resource: this.tfTexture.createView() },
-        { binding: 6, resource: this.indirection.texture.createView() },
-        { binding: 7, resource: this.computeOutputView },
-      ],
-    });
+    // rebuild bind groups for all pre-allocated scale sets
+    for (const set of this.scaleSets.values()) {
+      this.rebuildScaleSetBindGroups(set);
+    }
   }
 
   resize(width: number, height: number) {
@@ -564,102 +451,133 @@ export class Renderer {
     });
     this.depthView = this.depthTexture.createView();
 
-    // Resize compute output texture (scaled resolution)
-    this.resizeComputeTexture();
+    // rebuild all pre-allocated scale sets at new screen size
+    const scales = [...this.scaleSets.keys()];
+    for (const set of this.scaleSets.values()) this.destroyScaleSet(set);
+    this.scaleSets.clear();
+
+    for (const scale of scales) {
+      this.scaleSets.set(scale, this.buildScaleSet(scale));
+    }
+    this.active = this.scaleSets.get(this.renderScale)!;
   }
 
-  /** Recreate compute output texture at current renderScale. Call after changing renderScale. */
-  resizeComputeTexture(): void {
-    this.computeWidth = Math.max(1, Math.round(this.screenWidth * this.renderScale));
-    this.computeHeight = Math.max(1, Math.round(this.screenHeight * this.renderScale));
+  prepareScale(scale: number): void {
+    if (this.scaleSets.has(scale)) return;
+    this.scaleSets.set(scale, this.buildScaleSet(scale));
+  }
 
-    this.computeOutputTexture.destroy();
-    this.computeOutputTexture = this.device.createTexture({
-      size: [this.computeWidth, this.computeHeight],
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
-    });
-    this.computeOutputView = this.computeOutputTexture.createView();
+  /** switch to a pre-allocated scale set */
+  activateScale(scale: number): void {
+    if (this.renderScale === scale) return;
+    this.renderScale = scale;
+    let set = this.scaleSets.get(scale);
+    if (!set) {
+      set = this.buildScaleSet(scale);
+      this.scaleSets.set(scale, set);
+    }
+    this.active = set;
+    this.active.accumFrameCount = 0;
+    this.active.accumIndex = 0;
+  }
 
-    // Resize accumulation textures
-    for (const tex of this.accumTextures) tex.destroy();
-    const size: [number, number] = [this.computeWidth, this.computeHeight];
-    const accumUsage = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
-    this.accumTextures = [
-      this.device.createTexture({ size, format: 'rgba8unorm', usage: accumUsage }),
-      this.device.createTexture({ size, format: 'rgba8unorm', usage: accumUsage }),
+  private buildScaleSet(scale: number): ScaleSet {
+    const width = Math.max(1, Math.round(this.screenWidth * scale));
+    const height = Math.max(1, Math.round(this.screenHeight * scale));
+    const usage = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
+
+    const outputTexture = this.device.createTexture({ size: [width, height], format: 'rgba16float', usage });
+    const outputView = outputTexture.createView();
+    const accumTextures: [GPUTexture, GPUTexture] = [
+      this.device.createTexture({ size: [width, height], format: 'rgba16float', usage }),
+      this.device.createTexture({ size: [width, height], format: 'rgba16float', usage }),
     ];
-    this.accumViews = [this.accumTextures[0].createView(), this.accumTextures[1].createView()];
-    this.accumFrameCount = 0;
-    this.accumIndex = 0;
+    const accumViews: [GPUTextureView, GPUTextureView] = [
+      accumTextures[0].createView(), accumTextures[1].createView(),
+    ];
 
-    this.recreateComputeBindGroups();
+    const set: ScaleSet = {
+      scale, width, height,
+      outputTexture, outputView,
+      accumTextures, accumViews,
+      accumBindGroups: [null!, null!],
+      computeBindGroup: null!,
+      directBlitBindGroup: null!,
+      blitBindGroups: [null!, null!],
+      accumIndex: 0,
+      accumFrameCount: 0,
+    };
+
+    this.rebuildScaleSetBindGroups(set);
+    return set;
   }
 
-  private recreateComputeBindGroups() {
+  private destroyScaleSet(set: ScaleSet): void {
+    set.outputTexture.destroy();
+    for (const tex of set.accumTextures) tex.destroy();
+  }
+
+  private rebuildScaleSetBindGroups(set: ScaleSet): void {
     if (!this.tfTexture) return;
 
-    this.computeBindGroup = this.device.createBindGroup({
+    set.computeBindGroup = this.device.createBindGroup({
       layout: this.computePipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.computeUniformBuffer } },
         { binding: 1, resource: this.volumeSampler },
-        { binding: 2, resource: this.canvas.texture.createView() },
+        { binding: 2, resource: this.resources.atlasView(0) },
         { binding: 3, resource: this.tfSampler },
         { binding: 4, resource: this.tfTexture.createView() },
-        { binding: 6, resource: this.indirection.texture.createView() },
-        { binding: 7, resource: this.computeOutputView },
+        { binding: 6, resource: this.resources.indirection.texture.createView() },
+        { binding: 7, resource: set.outputView },
+        { binding: 8, resource: this.resources.atlasView(1) },
+        { binding: 9, resource: this.resources.atlasView(2) },
+        { binding: 10, resource: this.resources.atlasView(3) },
       ],
     });
 
-    // Accumulation bind groups: two configurations for ping-pong
-    // Config 0: read history from accumTextures[1], write to accumTextures[0]
-    // Config 1: read history from accumTextures[0], write to accumTextures[1]
     const accumLayout = this.accumPipeline.getBindGroupLayout(0);
-    this.accumBindGroups = [
+    set.accumBindGroups = [
       this.device.createBindGroup({
         layout: accumLayout,
         entries: [
           { binding: 0, resource: { buffer: this.accumUniformBuffer } },
-          { binding: 1, resource: this.computeOutputView },
-          { binding: 2, resource: this.accumViews[1] },
-          { binding: 3, resource: this.accumViews[0] },
+          { binding: 1, resource: set.outputView },
+          { binding: 2, resource: set.accumViews[1] },
+          { binding: 3, resource: set.accumViews[0] },
         ],
       }),
       this.device.createBindGroup({
         layout: accumLayout,
         entries: [
           { binding: 0, resource: { buffer: this.accumUniformBuffer } },
-          { binding: 1, resource: this.computeOutputView },
-          { binding: 2, resource: this.accumViews[0] },
-          { binding: 3, resource: this.accumViews[1] },
+          { binding: 1, resource: set.outputView },
+          { binding: 2, resource: set.accumViews[0] },
+          { binding: 3, resource: set.accumViews[1] },
         ],
       }),
-    ] as [GPUBindGroup, GPUBindGroup];
+    ];
 
-    // Direct blit bind group: always points to compute output (no TAA)
     const blitLayout = this.blitPipeline.getBindGroupLayout(0);
-    this.directBlitBindGroup = this.device.createBindGroup({
+    set.directBlitBindGroup = this.device.createBindGroup({
       layout: blitLayout,
       entries: [
-        { binding: 0, resource: this.computeOutputView },
+        { binding: 0, resource: set.outputView },
         { binding: 1, resource: this.blitSampler },
       ],
     });
-
-    // Blit bind groups: one per accumulation texture
-    this.blitBindGroups = [
+    set.blitBindGroups = [
       this.device.createBindGroup({
         layout: blitLayout,
         entries: [
-          { binding: 0, resource: this.accumViews[0]! },
+          { binding: 0, resource: set.accumViews[0] },
           { binding: 1, resource: this.blitSampler },
         ],
       }),
       this.device.createBindGroup({
         layout: blitLayout,
         entries: [
-          { binding: 0, resource: this.accumViews[1]! },
+          { binding: 0, resource: set.accumViews[1] },
           { binding: 1, resource: this.blitSampler },
         ],
       }),
@@ -667,32 +585,27 @@ export class Renderer {
   }
 
   private updateSliceUniforms(vp: Float32Array): void {
-    // SliceUniforms layout (144 bytes / 36 f32 slots):
-    //  0-15: mvp mat4x4f
-    // 16-18: normalizedSize, 19: _pad0
-    // 20-22: datasetSize,    23: _pad1
-    //    24: windowCenter,   25: windowWidth, 26: floatMin, 27: floatMax
-    // 28-30: slicePositions, 31: _pad2
-    //    32: sliceXEnabled,  33: sliceYEnabled, 34: sliceZEnabled, 35: _pad3
+    const o = SLICE_UNIFORMS.offsets;
     const d = this.sliceUniformScratch;
     const dv = this.sliceUniformView;
-    d.set(vp, 0);
-    d[16] = this.config.normalizedSize[0]!;
-    d[17] = this.config.normalizedSize[1]!;
-    d[18] = this.config.normalizedSize[2]!;
-    d[20] = this.config.dimensions[0]!;
-    d[21] = this.config.dimensions[1]!;
-    d[22] = this.config.dimensions[2]!;
-    d[24] = this.windowCenter;
-    d[25] = this.windowWidth;
-    d[26] = this.floatMin;
-    d[27] = this.floatMax;
-    d[28] = this.sliceX;
-    d[29] = this.sliceY;
-    d[30] = this.sliceZ;
-    dv.setUint32(32 * 4, this.showSliceX ? 1 : 0, true);
-    dv.setUint32(33 * 4, this.showSliceY ? 1 : 0, true);
-    dv.setUint32(34 * 4, this.showSliceZ ? 1 : 0, true);
+    d.set(vp, o.mvp / 4);
+    d.set(this.config.normalizedSize, o.normalizedSize / 4);
+    d.set(this.config.dimensions, o.datasetSize / 4);
+    d[o.windowCenter / 4] = this.windowCenter;
+    d[o.windowWidth / 4] = this.windowWidth;
+    d[o.floatMin / 4] = this.floatMin;
+    d[o.floatMax / 4] = this.floatMax;
+    d[o.slicePositions / 4] = this.sliceX;
+    d[o.slicePositions / 4 + 1] = this.sliceY;
+    d[o.slicePositions / 4 + 2] = this.sliceZ;
+    dv.setUint32(o.sliceXEnabled, this.showSliceX ? 1 : 0, true);
+    dv.setUint32(o.sliceYEnabled, this.showSliceY ? 1 : 0, true);
+    dv.setUint32(o.sliceZEnabled, this.showSliceZ ? 1 : 0, true);
+    dv.setUint32(o.numChannels, this.numChannels, true);
+    dv.setUint32(o.lodDebug, this.volumeRenderMode === 'slice-lod' ? 1 : 0, true);
+    d.set(this.channelColors, o.channelColors / 4);
+    d.set(this.channelWindowCenter, o.channelWindowCenter / 4);
+    d.set(this.channelWindowWidth, o.channelWindowWidth / 4);
     this.device.queue.writeBuffer(this.sliceUniformBuffer, 0, d as Float32Array<ArrayBuffer>);
   }
 
@@ -702,11 +615,7 @@ export class Renderer {
     const proj = camera.getProjectionMatrix(aspect);
     mat4.multiply(proj, view, this.vpScratch);
 
-    if (this.renderMode === 'compute') {
-      this.renderCompute(colorView, camera, this.vpScratch);
-    } else {
-      this.renderFragment(colorView, camera, this.vpScratch);
-    }
+    this.renderCompute(colorView, camera, this.vpScratch);
 
     this.frameIndex++;
   }
@@ -718,82 +627,6 @@ export class Renderer {
       case 'lod': return 3;
       default: return 0;  // dvr
     }
-  }
-
-  private renderFragment(colorView: GPUTextureView, camera: Camera, vp: Float32Array) {
-    // Update volume uniforms (reuse pre-allocated scratch buffer)
-    // Layout: mat4 mvp (64) + mat4 inverseModel (64) + vec3 cameraPos (12) + useIndirection (4)
-    //       + vec3 datasetSize (12) + renderMode (4) + vec3 normalizedSize (12) + isoValue (4)
-    //       + frameIndex (4) + pad (4) + windowCenter (4) + windowWidth (4) = 208 bytes
-    const d = this.fragUniformScratch;
-    const dv = this.fragUniformView;
-    d.set(vp, 0);                              // 0-15: mvp (model is identity)
-    d.set(Renderer.IDENTITY_MAT4, 16);         // 16-31: inverseModel
-    d.set(camera.position, 32);                // 32-34: cameraPos
-    d[35] = this.useIndirection ? 1.0 : 0.0;  // 35: useIndirection
-    d.set(this.config.dimensions, 36);         // 36-38: datasetSize
-    dv.setInt32(39 * 4, this.getRenderModeInt(), true);  // 39: renderMode (i32)
-    d.set(this.config.normalizedSize, 40);    // 40-42: normalizedSize
-    d[43] = this.isoValue;                     // 43: isoValue
-    dv.setUint32(44 * 4, this.frameIndex, true);  // 44: frameIndex (u32)
-    // 45: _pad1
-    d[46] = this.windowCenter;                 // 46: windowCenter
-    d[47] = this.windowWidth;                  // 47: windowWidth
-    d[48] = this.floatMin;                     // 48: floatMin
-    d[49] = this.floatMax;                     // 49: floatMax
-    d.set(this.clipMin, 50);                   // 50-52: clipMin
-    // 53: _pad3
-    d.set(this.clipMax, 54);                   // 54-56: clipMax
-    d[57] = this.densityScale;                 // 57: densityScale
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, d as Float32Array<ArrayBuffer>);
-
-    // Update wireframe uniforms
-    this.device.queue.writeBuffer(this.wireframeUniformBuffer, 0, vp as Float32Array<ArrayBuffer>);
-
-    // Render
-    const encoder = this.device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: colorView,
-        clearValue: [0.05, 0.05, 0.05, 1],
-        loadOp: 'clear',
-        storeOp: 'store',
-      }],
-      depthStencilAttachment: {
-        view: this.depthView,
-        depthClearValue: 1,
-        depthLoadOp: 'clear',
-        depthStoreOp: 'store',
-      },
-    });
-
-    // Draw volume
-    pass.setPipeline(this.volumePipeline);
-    pass.setBindGroup(0, this.volumeBindGroup);
-    pass.setVertexBuffer(0, this.vertexBuffer);
-    pass.setIndexBuffer(this.indexBuffer, 'uint16');
-    pass.drawIndexed(this.indexCount);
-
-    // Draw wireframe
-    if (this.showWireframe) {
-      pass.setPipeline(this.wireframePipeline);
-      pass.setBindGroup(0, this.wireframeBindGroup);
-      pass.setVertexBuffer(0, this.vertexBuffer);
-      pass.setIndexBuffer(this.wireframeIndexBuffer, 'uint16');
-      pass.drawIndexed(this.wireframeIndexCount);
-    }
-
-    // Draw axis
-    if (this.showAxis) {
-      this.device.queue.writeBuffer(this.axisUniformBuffer, 0, vp as Float32Array<ArrayBuffer>);
-      pass.setPipeline(this.axisPipeline);
-      pass.setBindGroup(0, this.axisBindGroup);
-      pass.setVertexBuffer(0, this.axisVertexBuffer);
-      pass.draw(6); // 6 vertices (2 per axis)
-    }
-
-    pass.end();
-    this.device.queue.submit([encoder.finish()]);
   }
 
   /** Get depth view for external renderers (debug wireframes, etc) */
@@ -823,114 +656,115 @@ export class Renderer {
     if (!this.prevVP) this.prevVP = new Float32Array(16);
     this.prevVP.set(vp);
     if (vpChanged) {
-      this.accumFrameCount = 0;
+      for (const set of this.scaleSets.values()) set.accumFrameCount = 0;
     }
 
     // Compute inverse view-projection for ray generation (writes into scratch buffer)
     mat4.inverse(vp, this.invVPScratch);
 
-    // Update compute uniforms (reuse pre-allocated scratch buffer)
-    // Layout: mat4 inverseViewProj (64) + vec3 cameraPos (12) + useIndirection (4)
-    //       + vec3 datasetSize (12) + renderMode (4) + vec3 normalizedSize (12) + isoValue (4)
-    //       + vec2 screenSize (8) + frameIndex (4) + pad (4) + windowCenter (4) + windowWidth (4) = 136 bytes = 34 floats
+    // Update compute uniforms (offsets from COMPUTE_UNIFORMS — single source of truth)
+    const o = COMPUTE_UNIFORMS.offsets;
     const d = this.computeUniformScratch;
     const dv = this.computeUniformView;
-    d.set(this.invVPScratch, 0);               // 0-15: inverseViewProj
-    d.set(camera.position, 16);                // 16-18: cameraPos
-    d[19] = this.useIndirection ? 1.0 : 0.0;  // 19: useIndirection
-    d.set(this.config.dimensions, 20);         // 20-22: datasetSize
-    dv.setInt32(23 * 4, this.getRenderModeInt(), true);  // 23: renderMode (i32)
-    d.set(this.config.normalizedSize, 24);    // 24-26: normalizedSize
-    d[27] = this.isoValue;                     // 27: isoValue
-    d[28] = this.computeWidth;                 // 28: screenSize.x
-    d[29] = this.computeHeight;                // 29: screenSize.y
-    dv.setUint32(30 * 4, this.enableJitter ? this.frameIndex : 0, true);  // 30: frameIndex (u32)
-    // 31: _pad3
-    d[32] = this.windowCenter;                 // 32: windowCenter
-    d[33] = this.windowWidth;                  // 33: windowWidth
-    d[34] = this.floatMin;                     // 34: floatMin
-    d[35] = this.floatMax;                     // 35: floatMax
-    d.set(this.clipMin, 36);                   // 36-38: clipMin
-    // 39: _pad5
-    d.set(this.clipMax, 40);                   // 40-42: clipMax
-    d[43] = this.densityScale;                 // 43: densityScale
+    d.set(this.invVPScratch, o.inverseViewProj / 4);
+    d.set(camera.position, o.cameraPos / 4);
+    d[o.useIndirection / 4] = this.useIndirection ? 1.0 : 0.0;
+    d.set(this.config.dimensions, o.datasetSize / 4);
+    dv.setInt32(o.renderMode, this.getRenderModeInt(), true);
+    d.set(this.config.normalizedSize, o.normalizedSize / 4);
+    d[o.isoValue / 4] = this.isoValue;
+    d[o.screenSize / 4] = this.active.width;
+    d[o.screenSize / 4 + 1] = this.active.height;
+    dv.setUint32(o.frameIndex, this.frameIndex, true);
+    dv.setUint32(o.jitter, (this.enableJitter && this.enableTAA) ? 1 : 0, true);
+    d[o.windowCenter / 4] = this.windowCenter;
+    d[o.windowWidth / 4] = this.windowWidth;
+    d[o.floatMin / 4] = this.floatMin;
+    d[o.floatMax / 4] = this.floatMax;
+    d.set(this.clipMin, o.clipMin / 4);
+    d[o.densityScale / 4] = this.densityScale;
+    d.set(this.clipMax, o.clipMax / 4);
+    dv.setUint32(o.numChannels, this.numChannels, true);
+    d.set(this.channelColors, o.channelColors / 4);
+    d.set(this.channelWindowCenter, o.channelWindowCenter / 4);
+    d.set(this.channelWindowWidth, o.channelWindowWidth / 4);
     this.device.queue.writeBuffer(this.computeUniformBuffer, 0, d as Float32Array<ArrayBuffer>);
 
     const encoder = this.device.createCommandEncoder();
-    const workgroupsX = Math.ceil(this.computeWidth / 8);
-    const workgroupsY = Math.ceil(this.computeHeight / 8);
+    const workgroupsX = Math.ceil(this.active.width / 8);
+    const workgroupsY = Math.ceil(this.active.height / 8);
 
-    if (this.volumeRenderMode !== 'slice') {
+    if (!this.isSliceMode) {
       // Normal volume compute path
       const computePass = encoder.beginComputePass();
       computePass.setPipeline(this.computePipeline);
-      computePass.setBindGroup(0, this.computeBindGroup);
+      computePass.setBindGroup(0, this.active.computeBindGroup);
       computePass.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
       computePass.end();
 
       // Temporal accumulation pass
       if (this.enableTAA) {
-        const weight = 1.0 / (this.accumFrameCount + 1);
-        this.accumScratch[0] = this.computeWidth;
-        this.accumScratch[1] = this.computeHeight;
+        const weight = 1.0 / (this.active.accumFrameCount + 1);
+        this.accumScratch[0] = this.active.width;
+        this.accumScratch[1] = this.active.height;
         this.accumScratch[2] = weight;
         this.device.queue.writeBuffer(this.accumUniformBuffer, 0, this.accumScratch as Float32Array<ArrayBuffer>);
 
         const accumPass = encoder.beginComputePass();
         accumPass.setPipeline(this.accumPipeline);
-        accumPass.setBindGroup(0, this.accumBindGroups[this.accumIndex]);
+        accumPass.setBindGroup(0, this.active.accumBindGroups[this.active.accumIndex]);
         accumPass.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
         accumPass.end();
       }
 
-      // Blit result to screen
-      this.blitBindGroup = this.enableTAA ? this.blitBindGroups[this.accumIndex]! : this.directBlitBindGroup;
-      const blitPass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: colorView,
-          clearValue: [0.05, 0.05, 0.05, 1],
-          loadOp: 'clear',
-          storeOp: 'store',
-        }],
-      });
-      blitPass.setPipeline(this.blitPipeline);
-      blitPass.setBindGroup(0, this.blitBindGroup);
-      blitPass.draw(3);
-      blitPass.end();
-
       // Advance accumulation state (cap at 64 — diminishing returns beyond that)
       if (this.enableTAA) {
-        this.accumIndex = 1 - this.accumIndex as 0 | 1;
-        if (this.accumFrameCount < 64) {
-          this.accumFrameCount++;
+        this.active.accumIndex = 1 - this.active.accumIndex as 0 | 1;
+        if (this.active.accumFrameCount < 64) {
+          this.active.accumFrameCount++;
         }
       }
     }
 
-    // Update uniforms for overlay pass
-    this.device.queue.writeBuffer(this.wireframeUniformBuffer, 0, vp as Float32Array<ArrayBuffer>);
-    if (this.volumeRenderMode === 'slice') {
+    // update uniforms for overlay pass
+    if (this.showWireframe) {
+      this.device.queue.writeBuffer(this.wireframeUniformBuffer, 0, vp as Float32Array<ArrayBuffer>);
+    }
+    if (this.isSliceMode) {
       this.updateSliceUniforms(vp);
     }
 
-    // In slice mode the overlay pass clears to background; otherwise it loads the blitted volume
+    // Single merged pass: blit volume (if any) then draw overlays.
+    // Always clears — avoids a tile flush+reload on TBDR GPUs.
+    // Depth is never read back, so discard saves a full-screen write.
     const overlayPass = encoder.beginRenderPass({
       colorAttachments: [{
         view: colorView,
         clearValue: [0.05, 0.05, 0.05, 1],
-        loadOp: this.volumeRenderMode === 'slice' ? 'clear' : 'load',
+        loadOp: 'clear',
         storeOp: 'store',
       }],
       depthStencilAttachment: {
         view: this.depthView,
         depthClearValue: 1,
         depthLoadOp: 'clear',
-        depthStoreOp: 'store',
+        depthStoreOp: 'discard',
       },
     });
 
+    // Blit volume compute result as first draw (depthCompare: 'always', no depth write)
+    if (!this.isSliceMode) {
+      // select blit source: TAA accumulation result or direct compute output
+      const blitBG = this.enableTAA
+        ? this.active.blitBindGroups[1 - this.active.accumIndex as 0 | 1]!
+        : this.active.directBlitBindGroup;
+      overlayPass.setPipeline(this.blitPipeline);
+      overlayPass.setBindGroup(0, blitBG);
+      overlayPass.draw(3);
+    }
+
     // Draw slice planes
-    if (this.volumeRenderMode === 'slice' && this.sliceBindGroup) {
+    if (this.isSliceMode && this.sliceBindGroup) {
       overlayPass.setPipeline(this.slicePipeline);
       overlayPass.setBindGroup(0, this.sliceBindGroup);
       overlayPass.draw(6, 3); // 6 vertices × 3 instances (X, Y, Z planes)

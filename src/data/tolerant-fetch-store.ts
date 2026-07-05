@@ -1,16 +1,6 @@
 /**
- * TolerantFetchStore - Zarr store that handles quirky HTTP backends
- *
- * 1. CloudFront / S3 with OAI/OAC returns HTTP 403 instead of 404 for missing
- *    objects. zarrita's FetchStore only treats 404 as "not found", so we map
- *    403 → undefined as well.
- *
- * 2. Vite's dev server (and other SPA hosts) return index.html with HTTP 200
- *    for any unmatched path. zarrita's FetchStore accepts any 200 response as
- *    valid data, so when zarrita probes for zarr.json (v3 format detection) it
- *    receives index.html, tries to JSON-parse it, and throws
- *    "Unexpected token '<'". We detect HTML responses by Content-Type and
- *    return undefined instead.
+ * TolerantFetchStore - Zarr store that handles quirky HTTP backends.
+ * Maps 403→undefined, rejects HTML 200s, retries 5xx with backoff.
  */
 
 import { FetchStore } from 'zarrita';
@@ -23,6 +13,13 @@ function resolveUrl(base: string | URL, key: AbsolutePath): string {
   const resolved = new URL(key.slice(1), url);
   resolved.search = url.search;
   return resolved.href;
+}
+
+const MAX_RETRIES = 3;
+const RETRY_DELAYS = [250, 1000, 4000];
+
+function delay(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 export class TolerantFetchStore implements AsyncReadable<RequestInit> {
@@ -39,32 +36,60 @@ export class TolerantFetchStore implements AsyncReadable<RequestInit> {
   async get(key: AbsolutePath, options?: RequestInit): Promise<Uint8Array | undefined> {
     const href = resolveUrl(this.baseUrl, key);
     const init: RequestInit = { ...this.overrides, ...options };
-    let response: Response;
-    try {
-      response = await fetch(href, init);
-    } catch {
-      return undefined; // network error
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      let response: Response;
+      try {
+        response = await fetch(href, init);
+      } catch (e) {
+        // AbortError — don't retry, rethrow immediately
+        if (e instanceof DOMException && e.name === 'AbortError') throw e;
+        // Network error — retry with backoff
+        if (attempt < MAX_RETRIES) {
+          await delay(RETRY_DELAYS[attempt]!);
+          continue;
+        }
+        throw new Error(`Network error fetching ${key} after ${MAX_RETRIES + 1} attempts`);
+      }
+
+      // 403/404 are intentional "not found" (CloudFront OAI, missing chunks)
+      if (response.status === 404 || response.status === 403) return undefined;
+
+      if (response.status === 200 || response.status === 206) {
+        const ct = response.headers.get('content-type') ?? '';
+        if (ct.includes('text/html')) return undefined;
+        return new Uint8Array(await response.arrayBuffer());
+      }
+
+      // 5xx or unexpected status — retry with backoff
+      if (attempt < MAX_RETRIES) {
+        await delay(RETRY_DELAYS[attempt]!);
+        continue;
+      }
+      throw new Error(`HTTP ${response.status} fetching ${key} after ${MAX_RETRIES + 1} attempts`);
     }
 
-    if (response.status === 404 || response.status === 403) return undefined;
-
-    if (response.status === 200 || response.status === 206) {
-      const ct = response.headers.get('content-type') ?? '';
-      if (ct.includes('text/html')) return undefined;
-      return new Uint8Array(await response.arrayBuffer());
-    }
-
-    throw new Error(`Unexpected response status ${response.status} ${response.statusText}`);
+    return undefined; // unreachable, satisfies TS
   }
 
   async getRange(key: AbsolutePath, range: RangeQuery, options?: RequestInit): Promise<Uint8Array | undefined> {
-    try {
-      return await this.inner.getRange!(key, range, options);
-    } catch (e) {
-      if (e instanceof Error && e.message.includes('403')) {
-        return undefined;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await this.inner.getRange!(key, range, options);
+      } catch (e) {
+        // AbortError — don't retry, rethrow immediately
+        if (e instanceof DOMException && e.name === 'AbortError') throw e;
+        // Intentional "not found" semantics (CloudFront OAI) — not an error
+        if (e instanceof Error && e.message.includes('403')) {
+          return undefined;
+        }
+        if (attempt < MAX_RETRIES) {
+          await delay(RETRY_DELAYS[attempt]!);
+          continue;
+        }
+        throw e;
       }
-      throw e;
     }
+    return undefined; // unreachable, satisfies TS
   }
 }

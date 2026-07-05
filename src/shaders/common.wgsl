@@ -7,6 +7,7 @@ const BORDER: f32 = 1.0;
 const STEPS_PER_BRICK: f32 = 64.0;
 const MAX_BRICK_TRAVERSALS: u32 = 512u;
 const EARLY_EXIT_ALPHA: f32 = 0.95;
+const LOG2E: f32 = 1.4426950408889634; // pre computed LOG2E
 
 const RENDER_MODE_DVR: i32 = 0;
 const RENDER_MODE_MIP: i32 = 1;
@@ -20,20 +21,21 @@ const SPECULAR: f32 = 0.3;
 const SHININESS: f32 = 32.0;
 
 // LOD level colors for debugging (lodLevel is stored as lod+1, so 1=LOD0, 2=LOD1, etc.)
+// Maximally distinct hues so adjacent LOD levels are easy to tell apart.
 fn getLodColor(lodLevel: u32) -> vec3f {
     switch(lodLevel) {
-        case 1u: { return vec3f(0.0, 1.0, 0.0); }  // LOD 0 = Green (finest)
-        case 2u: { return vec3f(0.5, 1.0, 0.0); }  // LOD 1 = Yellow-Green
-        case 3u: { return vec3f(1.0, 1.0, 0.0); }  // LOD 2 = Yellow
-        case 4u: { return vec3f(1.0, 0.5, 0.0); }  // LOD 3 = Orange
-        case 5u: { return vec3f(1.0, 0.0, 0.0); }  // LOD 4 = Red
-        case 6u: { return vec3f(0.5, 0.0, 0.5); }  // LOD 5 = Purple
-        case 7u: { return vec3f(0.0, 0.0, 1.0); }  // LOD 6 = Blue
-        case 8u: { return vec3f(0.0, 0.5, 0.5); }  // LOD 7 = Cyan
-        case 9u: { return vec3f(1.0, 0.0, 0.5); }  // LOD 8 = Magenta
-        case 10u: { return vec3f(0.5, 0.5, 0.5); } // LOD 9 = Gray
-        case 11u: { return vec3f(0.8, 0.4, 0.2); } // LOD 10 = Brown (coarsest)
-        default: { return vec3f(0.2, 0.2, 0.2); } // Not loaded = Dark gray
+        case 1u: { return vec3f(0.15, 0.85, 0.25); } // LOD 0 = Green (finest)
+        case 2u: { return vec3f(0.0,  0.75, 1.0);  } // LOD 1 = Cyan
+        case 3u: { return vec3f(1.0,  0.85, 0.0);  } // LOD 2 = Yellow
+        case 4u: { return vec3f(1.0,  0.2,  0.2);  } // LOD 3 = Red
+        case 5u: { return vec3f(0.7,  0.3,  1.0);  } // LOD 4 = Purple
+        case 6u: { return vec3f(1.0,  0.55, 0.0);  } // LOD 5 = Orange
+        case 7u: { return vec3f(0.2,  0.4,  1.0);  } // LOD 6 = Blue
+        case 8u: { return vec3f(1.0,  0.4,  0.7);  } // LOD 7 = Pink
+        case 9u: { return vec3f(0.0,  0.65, 0.55); } // LOD 8 = Teal
+        case 10u: { return vec3f(0.75, 0.55, 1.0); } // LOD 9 = Lavender
+        case 11u: { return vec3f(0.85, 0.6,  0.2); } // LOD 10 = Amber (coarsest)
+        default: { return vec3f(0.2, 0.2, 0.2); }    // Not loaded = Dark gray
     }
 }
 
@@ -102,11 +104,7 @@ fn phongLighting(normal: vec3f, lightDir: vec3f, baseColor: vec3f) -> vec3f {
     return ambient + diffuse + specular;
 }
 
-// Window/Level (windowing) for density remapping
-// Maps a sub-range of density values to the full 0-1 range for better contrast
-// windowCenter: center of the window (0-1)
-// windowWidth: width of the window (0-1, where 1 = full range)
-// Returns density remapped to 0-1 based on window settings
+// Window/Level: remap a density sub-range to [0,1] for contrast adjustment.
 fn applyWindow(density: f32, windowCenter: f32, windowWidth: f32) -> f32 {
     let halfWidth = windowWidth * 0.5;
     let minVal = windowCenter - halfWidth;

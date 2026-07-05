@@ -1,16 +1,6 @@
 /**
- * BaseZarrProvider - Shared base class for Zarr data providers
- *
- * Contains common logic for:
- * - OME-Zarr metadata parsing (multiscales, OMERO window metadata, voxel spacing)
- * - LOD level calculation with virtual dimensions
- * - Brick statistics caching
- * - Network/IO statistics tracking
- * - Common utility methods
- *
- * Subclasses implement the actual brick loading strategy:
- * - ZarrDataProvider: Uses worker pool for HTTP fetching
- * - LocalZarrDataProvider: Main thread assembly from File System Access API
+ * BaseZarrProvider - Shared base for OME-Zarr metadata parsing, LOD calculation,
+ * and brick stats. Subclassed by ZarrDataProvider (HTTP) and LocalZarrDataProvider (FS).
  */
 
 import type { Array as ZarrArray } from 'zarrita';
@@ -20,7 +10,7 @@ import type {
   DataProvider,
   VolumeMetadata,
   LodLevel,
-  BrickData,
+  BrickLoadResult,
   BrickStats,
   BitDepth,
   NetworkStats,
@@ -56,13 +46,7 @@ export interface LodParams {
   channelAxisIdx: number;
 }
 
-/**
- * Detect the compression codec by reading raw zarr metadata from a store.
- * Tries zarr v2 (.zarray) first, then zarr v3 (zarr.json).
- *
- * @param store - Any zarr store with a `get(key)` method
- * @param arrayPath - Path to the zarr array relative to the store root (e.g. "s0" or "0/s0")
- */
+/** Detect the compression codec from zarr v2 (.zarray) or v3 (zarr.json) metadata. */
 export async function detectCompression(
   store: { get: (key: any) => Promise<Uint8Array | undefined> },
   arrayPath: string,
@@ -102,7 +86,7 @@ export abstract class BaseZarrProvider implements DataProvider {
 
   // Abstract methods that subclasses must implement
   abstract initialize(): Promise<VolumeMetadata>;
-  abstract loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex?: number): Promise<BrickData | null>;
+  abstract loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex?: number, signal?: AbortSignal): Promise<BrickLoadResult | null>;
   abstract dispose(): void;
 
   /**
@@ -252,24 +236,78 @@ export abstract class BaseZarrProvider implements DataProvider {
     return [lo, hi];
   }
 
+  /** Scan coarsest LOD per-channel for min/max (fallback when no OMERO window). */
+  protected async scanChannelRanges(
+    arr: ZarrArray<DataType, any>,
+    params: LodParams,
+    numChannels: number,
+  ): Promise<Array<{ min: number; max: number }>> {
+    const { actualDimX, actualDimY, actualDimZ, csx, csy, csz, shapePrefixLength, channelAxisIdx } = params;
+    const maxCx = Math.floor((actualDimX - 1) / csx);
+    const maxCy = Math.floor((actualDimY - 1) / csy);
+    const maxCz = Math.floor((actualDimZ - 1) / csz);
+
+    const chunkCoords: [number, number, number][] = [];
+    for (let cz = 0; cz <= maxCz; cz++) {
+      for (let cy = 0; cy <= maxCy; cy++) {
+        for (let cx = 0; cx <= maxCx; cx++) {
+          chunkCoords.push([cz, cy, cx]);
+        }
+      }
+    }
+
+    const results: Array<{ min: number; max: number }> = [];
+    for (let ch = 0; ch < numChannels; ch++) {
+      const prefix = new Array(shapePrefixLength).fill(0);
+      if (channelAxisIdx >= 0 && channelAxisIdx < shapePrefixLength) {
+        prefix[channelAxisIdx] = ch;
+      }
+
+      const chunks = await Promise.all(
+        chunkCoords.map(([cz, cy, cx]) => arr.getChunk([...prefix, cz, cy, cx]))
+      );
+
+      let chMin = Infinity;
+      let chMax = -Infinity;
+      for (const chunk of chunks) {
+        const data = chunk.data as ArrayLike<number>;
+        for (let i = 0; i < data.length; i++) {
+          const v = Number(data[i]);
+          if (v < chMin) chMin = v;
+          if (v > chMax) chMax = v;
+        }
+      }
+
+      results.push({
+        min: isFinite(chMin) ? chMin : 0,
+        max: isFinite(chMax) ? chMax : (isFinite(chMin) ? chMin + 1 : 1),
+      });
+    }
+
+    return results;
+  }
+
   /**
    * Cache brick statistics
    */
   protected cacheBrickStats(lod: number, bx: number, by: number, bz: number, stats: BrickStats): void {
     const key = `${lod}:${bx}/${by}/${bz}`;
-    this.brickStatsCache.set(key, stats);
+    const existing = this.brickStatsCache.get(key);
+    if (existing) {
+      // Multiple channels update the same key — keep the max across all channels.
+      // isBrickEmpty should return true only if ALL channels are below the threshold,
+      // not just whichever channel happened to write last.
+      this.brickStatsCache.set(key, {
+        min: Math.min(existing.min, stats.min),
+        max: Math.max(existing.max, stats.max),
+        avg: (existing.avg + stats.avg) / 2,
+      });
+    } else {
+      this.brickStatsCache.set(key, stats);
+    }
   }
 
-  /**
-   * Parse OME-Zarr metadata and build VolumeMetadata
-   *
-   * This handles:
-   * - Extracting OME multiscales from group attributes
-   * - Detecting bit depth from dtype
-   * - Parsing voxel spacing from coordinateTransformations
-   * - Building LOD levels with virtual dimensions
-   * - Extracting OMERO window metadata
-   */
+  /** Parse OME-Zarr metadata and build VolumeMetadata. */
   protected parseOmeMetadata(
     attrs: Record<string, unknown>,
     arrays: ZarrArray<DataType, any>[],
@@ -291,6 +329,9 @@ export abstract class BaseZarrProvider implements DataProvider {
     // Parse axes — supports both v0.4 string arrays and v0.5 typed objects
     const axisNames = normalizeAxes(ms.axes);
     const channelAxisIdx = axisNames.findIndex(a => a.type === 'channel');
+    const numChannels = channelAxisIdx >= 0
+      ? Math.max(1, arrays[0]!.shape[channelAxisIdx] ?? 1)
+      : 1;
 
     // Safety-net validation (catches direct ?dataset= URL loads that bypassed dialog pre-check)
     const dtype = arrays[0]!.dtype;
@@ -374,11 +415,15 @@ export abstract class BaseZarrProvider implements DataProvider {
       };
     });
 
-    // Extract OMERO window metadata if available
-    let windowMeta: { start: number; end: number; min: number; max: number } | undefined;
+    // Extract OMERO window metadata if available (per-channel and backward-compat single)
+    type WindowEntry = { start: number; end: number; min: number; max: number };
+    let windowMeta: WindowEntry | undefined;
+    let channelWindows: Array<WindowEntry | undefined> | undefined;
     const omeroAttr = omeAttr?.omero;
-    if (omeroAttr?.channels?.[0]?.window) {
-      windowMeta = omeroAttr.channels[0].window;
+    if (Array.isArray(omeroAttr?.channels) && omeroAttr.channels.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      channelWindows = omeroAttr.channels.map((ch: any) => ch?.window as WindowEntry | undefined);
+      windowMeta = channelWindows[0];
     }
 
     // For float data, derive initial dataRange from OMERO window (absolute min/max).
@@ -398,7 +443,8 @@ export abstract class BaseZarrProvider implements DataProvider {
       levels,
       bitDepth,
       window: windowMeta,
-      numChannels: 1,
+      channelWindows,
+      numChannels,
       isFloat,
       dataRange,
     };

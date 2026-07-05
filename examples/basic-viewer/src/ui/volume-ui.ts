@@ -87,17 +87,20 @@ export class VolumeUI {
     lodLevels: '',
     textureFormat: '',
     // Streaming
-    atlasUsage: '',
-    loadedBricks: '',
+    cacheUsage: '',
     pendingBricks: '',
-    // Network
+    evictedBricks: '',
     throughput: '',
     totalDownloaded: '',
-    // Pipeline timings
+    brickLatency: '',
+    // Pipeline
+    pipelineQueue: '',
     pipelineFetch: '',
     pipelineAssembly: '',
     pipelineUpload: '',
-    pipelineSamples: '',
+    brickLifecycle: '',
+    wastedRate: '',
+    chunkCacheHit: '',
   };
 
   // Frame timing tracking
@@ -186,8 +189,9 @@ export class VolumeUI {
         DVR: 'dvr',
         MIP: 'mip',
         ISO: 'iso',
-        LOD: 'lod',
         Slices: 'slice',
+        LOD: 'lod',
+        'Slice LOD': 'slice-lod',
       },
     }).on('change', (ev: { value: unknown }) => {
       const mode = ev.value as VolumeRenderMode;
@@ -209,6 +213,7 @@ export class VolumeUI {
       },
     }).on('change', (ev: { value: unknown }) => {
       this.camera.setUpAxis(ev.value as UpAxis);
+      this.renderer.resetAccumulation();
     });
 
     // Render scale slider
@@ -367,10 +372,12 @@ export class VolumeUI {
       const posBinding = folder.addBinding(this.params, posKey as string, { label, min: 0, max: dim, step: 1 });
       posBinding.on('change', (ev: { value: unknown }) => {
         (this.renderer as unknown as Record<string, number>)[posKey as string] = (ev.value as number) / dim;
+        this.renderer.markDirty();
       });
       const visBinding = folder.addBinding(this.params, visKey as string, { label: '' });
       visBinding.on('change', (ev: { value: unknown }) => {
         (this.renderer as unknown as Record<string, boolean>)[visKey as string] = ev.value as boolean;
+        this.renderer.markDirty();
       });
 
       // Combine into a single flex row
@@ -421,12 +428,14 @@ export class VolumeUI {
       label: 'Wireframe',
     }).on('change', (ev: { value: unknown }) => {
       this.renderer.showWireframe = ev.value as boolean;
+      this.renderer.markDirty();
     });
 
     debugFolder.addBinding(this.params, 'showAxis', {
       label: 'Axis',
     }).on('change', (ev: { value: unknown }) => {
       this.renderer.showAxis = ev.value as boolean;
+      this.renderer.markDirty();
     });
   }
 
@@ -479,43 +488,24 @@ export class VolumeUI {
       readonly: true,
     });
 
-    // Streaming section
+    // Streaming section — operational health
     const streamFolder = statsPane.addFolder({ title: 'Streaming', expanded: false });
+    streamFolder.addBinding(this.statsParams, 'cacheUsage', { label: 'Cache', readonly: true });
+    streamFolder.addBinding(this.statsParams, 'pendingBricks', { label: 'Pending', readonly: true });
+    streamFolder.addBinding(this.statsParams, 'evictedBricks', { label: 'Evicted', readonly: true });
+    streamFolder.addBinding(this.statsParams, 'throughput', { label: 'Throughput', readonly: true });
+    streamFolder.addBinding(this.statsParams, 'totalDownloaded', { label: 'Downloaded', readonly: true });
+    streamFolder.addBinding(this.statsParams, 'brickLatency', { label: 'Latency', readonly: true });
 
-    streamFolder.addBinding(this.statsParams, 'atlasUsage', {
-      label: 'Atlas',
-      readonly: true,
-    });
-
-    streamFolder.addBinding(this.statsParams, 'loadedBricks', {
-      label: 'Loaded',
-      readonly: true,
-    });
-
-    streamFolder.addBinding(this.statsParams, 'pendingBricks', {
-      label: 'Pending',
-      readonly: true,
-    });
-
-    // Network section
-    const netFolder = statsPane.addFolder({ title: 'Network', expanded: false });
-
-    netFolder.addBinding(this.statsParams, 'throughput', {
-      label: 'Throughput',
-      readonly: true,
-    });
-
-    netFolder.addBinding(this.statsParams, 'totalDownloaded', {
-      label: 'Downloaded',
-      readonly: true,
-    });
-
-    // Pipeline timing section (hidden)
-    // const pipeFolder = statsPane.addFolder({ title: 'Pipeline (avg/brick)', expanded: false });
-    // pipeFolder.addBinding(this.statsParams, 'pipelineFetch', { label: 'Fetch', readonly: true });
-    // pipeFolder.addBinding(this.statsParams, 'pipelineAssembly', { label: 'Assembly', readonly: true });
-    // pipeFolder.addBinding(this.statsParams, 'pipelineUpload', { label: 'GPU upload', readonly: true });
-    // pipeFolder.addBinding(this.statsParams, 'pipelineSamples', { label: 'Samples', readonly: true });
+    // Pipeline section — per-brick diagnostics
+    const pipeFolder = statsPane.addFolder({ title: 'Pipeline', expanded: false });
+    pipeFolder.addBinding(this.statsParams, 'pipelineQueue', { label: 'Queue', readonly: true });
+    pipeFolder.addBinding(this.statsParams, 'pipelineFetch', { label: 'Fetch', readonly: true });
+    pipeFolder.addBinding(this.statsParams, 'pipelineAssembly', { label: 'Assembly', readonly: true });
+    pipeFolder.addBinding(this.statsParams, 'pipelineUpload', { label: 'Upload', readonly: true });
+    pipeFolder.addBinding(this.statsParams, 'brickLifecycle', { label: 'Lifecycle', readonly: true });
+    pipeFolder.addBinding(this.statsParams, 'wastedRate', { label: 'Wasted', readonly: true });
+    pipeFolder.addBinding(this.statsParams, 'chunkCacheHit', { label: 'Cache hit', readonly: true });
   }
 
   private initStreaming(manager: StreamingManager, metadata: VolumeMetadata): void {
@@ -524,7 +514,8 @@ export class VolumeUI {
 
     // Set static metadata info
     const dims = metadata.dimensions;
-    this.statsParams.dimensions = `${dims[0]} × ${dims[1]} × ${dims[2]}`;
+    const chSuffix = metadata.numChannels > 1 ? ` × ${metadata.numChannels}ch` : '';
+    this.statsParams.dimensions = `${dims[0]} × ${dims[1]} × ${dims[2]}${chSuffix}`;
 
     // Calculate raw file size in MB based on bit depth
     const totalVoxels = dims[0] * dims[1] * dims[2];
@@ -573,24 +564,32 @@ export class VolumeUI {
     if (this.streamingManager) {
       const stats = this.streamingManager.getStats();
 
+      // Streaming
       const atlasPercent = ((stats.atlasUsage / stats.atlasCapacity) * 100).toFixed(0);
-      this.statsParams.atlasUsage = `${stats.atlasUsage}/${stats.atlasCapacity} (${atlasPercent}%)`;
-      this.statsParams.loadedBricks = `${stats.loadedCount} / ${stats.desiredCount}`;
+      this.statsParams.cacheUsage = `${stats.atlasUsage}/${stats.atlasCapacity} (${atlasPercent}%)`;
       this.statsParams.pendingBricks = `${stats.pendingCount}`;
-
-      // Network stats
+      this.statsParams.evictedBricks = `${stats.evictedCount}`;
       const throughputMBps = stats.bytesPerSecond / (1024 * 1024);
       this.statsParams.throughput = `${throughputMBps.toFixed(2)} MB/s`;
-
       const totalMB = stats.totalBytesDownloaded / (1024 * 1024);
       this.statsParams.totalDownloaded = `${totalMB.toFixed(2)} MB`;
+      this.statsParams.brickLatency = stats.avgBrickLatencyMs > 0 ? `${stats.avgBrickLatencyMs.toFixed(1)} ms` : '—';
 
-      // Pipeline timings
+      // Pipeline
       const pt = stats.pipelineTimings;
+      this.statsParams.pipelineQueue = pt.sampleCount > 0 ? `${pt.avgQueueMs.toFixed(1)} ms` : '—';
       this.statsParams.pipelineFetch = pt.sampleCount > 0 ? `${pt.avgFetchMs.toFixed(1)} ms` : '—';
       this.statsParams.pipelineAssembly = pt.sampleCount > 0 ? `${pt.avgAssemblyMs.toFixed(1)} ms` : '—';
       this.statsParams.pipelineUpload = pt.sampleCount > 0 ? `${pt.avgUploadMs.toFixed(1)} ms` : '—';
-      this.statsParams.pipelineSamples = `${pt.sampleCount}`;
+      const d = stats.bricksDispatched;
+      const c = stats.bricksCommitted;
+      const x = stats.bricksCancelled;
+      const w = stats.bricksDiscarded;
+      this.statsParams.brickLifecycle = `D:${d} C:${c} X:${x} W:${w}`;
+      const wastedDenom = c + w;
+      this.statsParams.wastedRate = wastedDenom > 0 ? `${((w / wastedDenom) * 100).toFixed(1)}%` : '—';
+      const hitRatio = pt.chunkCacheHitRatio;
+      this.statsParams.chunkCacheHit = hitRatio !== undefined ? `${(hitRatio * 100).toFixed(1)}%` : '—';
 
       // Time to first render
       if (stats.timeToFirstRender !== null) {
@@ -830,7 +829,7 @@ export class VolumeUI {
 
   private updateVisibility(): void {
     const mode = this.params.renderMode;
-    const isSlice = mode === 'slice';
+    const isSlice = mode === 'slice' || mode === 'slice-lod';
 
     // ISO section only in ISO mode
     if (this.isoFolder) this.isoFolder.hidden = mode !== 'iso';

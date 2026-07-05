@@ -1,8 +1,4 @@
-/**
- * Simple arcball camera with mouse and touch interaction
- * Mouse: Left drag = orbit, Right drag = pan, Wheel = zoom
- * Touch: One finger = orbit, Two finger = pan + pinch zoom
- */
+/** Arcball camera — mouse (orbit/pan/wheel) and touch (orbit/pinch/pan). */
 
 import { mat4 } from 'wgpu-matrix';
 
@@ -17,10 +13,12 @@ export class Camera {
   private rotationY = 3.5;
   private isDragging = false;
   private isPanning = false;
-  private isZooming = false;
-  private zoomTimer: number | null = null;
+  private lastInteractionTime = 0;
   private lastX = 0;
   private lastY = 0;
+
+  private readonly viewScratch = new Float32Array(16);
+  private readonly projScratch = new Float32Array(16);
 
   // Touch state tracking
   private activeTouches: Map<number, { x: number; y: number }> = new Map();
@@ -34,6 +32,13 @@ export class Camera {
 
   // Clamp away from poles to avoid degenerate view matrix
   private poleEpsilon = 0.001;
+
+  // monotonic counter to capture state changes
+  private version_ = 0;
+
+  get version(): number {
+    return this.version_;
+  }
 
   constructor(canvas: HTMLCanvasElement) {
     this.position = new Float32Array(3);
@@ -66,6 +71,7 @@ export class Camera {
         this.applyPan(dx, dy);
       }
 
+      this.lastInteractionTime = performance.now();
       this.updatePosition();
     });
 
@@ -82,15 +88,9 @@ export class Camera {
       e.preventDefault();
       this.distance *= 1 + e.deltaY * 0.001;
       // Zoom limits for normalized space
-      this.distance = Math.max(0.5, Math.min(10, this.distance));
+      this.distance = Math.max(0.1, Math.min(10, this.distance));
+      this.lastInteractionTime = performance.now();
       this.updatePosition();
-
-      this.isZooming = true;
-      if (this.zoomTimer !== null) clearTimeout(this.zoomTimer);
-      this.zoomTimer = setTimeout(() => {
-        this.isZooming = false;
-        this.zoomTimer = null;
-      }, 200) as unknown as number;
     }, { passive: false });
 
     // Touch controls
@@ -140,6 +140,7 @@ export class Camera {
 
         this.applyOrbit(dx, dy);
 
+        this.lastInteractionTime = performance.now();
         this.updatePosition();
 
       } else if (e.touches.length === 2 && this.isTouchPanning) {
@@ -165,6 +166,7 @@ export class Camera {
         }
         this.lastTouchCenter = currentCenter;
 
+        this.lastInteractionTime = performance.now();
         this.updatePosition();
       }
     }, { passive: false });
@@ -233,6 +235,7 @@ export class Camera {
   }
 
   private updatePosition() {
+    this.version_++;
     const cosX = Math.cos(this.rotationX);
     const sinX = Math.sin(this.rotationX);
     const cosY = Math.cos(this.rotationY);
@@ -337,26 +340,20 @@ export class Camera {
   }
 
    isInteracting(): boolean {
-    return this.isDragging || this.isPanning || this.isZooming;
+    return this.isDragging || this.isPanning || this.isTouchPanning
+      || performance.now() - this.lastInteractionTime < 200;
   }
 
   getViewMatrix(): Float32Array {
-    return mat4.lookAt(this.position, this.target, this.upVector) as Float32Array;
+    return mat4.lookAt(this.position, this.target, this.upVector, this.viewScratch) as Float32Array;
   }
 
   getProjectionMatrix(aspect: number): Float32Array {
-    // Near/far planes for normalized space
-    const near = 0.01;
-    const far = 100;
-    return mat4.perspective(Math.PI / 4, aspect, near, far) as Float32Array;
+    return mat4.perspective(Math.PI / 4, aspect, 0.01, 100, this.projScratch) as Float32Array;
   }
 }
 
-/**
- * Frustum planes for culling.
- * Each plane is [a, b, c, d] where ax + by + cz + d = 0
- * Normal points inward (positive side is inside frustum)
- */
+/** Frustum planes for culling. Each plane [a,b,c,d]: normal points inward. */
 export type FrustumPlanes = {
   left: [number, number, number, number];
   right: [number, number, number, number];

@@ -1,12 +1,14 @@
 /**
- * Atlas Allocator - manages free/used brick slots in the atlas texture
- *
- * Uses LRU (Least Recently Used) eviction when the atlas is full.
- * Each slot tracks the brick metadata so we can properly clear the
- * indirection table when evicting.
+ * Atlas Allocator - manages free/used brick slots in the atlas texture.
+ * Uses LRU eviction when full, tracking brick metadata for indirection cleanup.
  */
 
 import { GRID_SIZE } from '../core/config.js';
+
+// Slots touched within this many frames are protected from eviction.
+// Prevents thrash when atlas is under pressure — a freshly loaded brick
+// can't be immediately evicted by the next allocation in the same burst.
+const MIN_EVICTION_AGE = 30;
 
 export interface AtlasSlot {
   x: number;
@@ -118,13 +120,13 @@ export class AtlasAllocator {
     return this.slotMetadata[slotIndex] ?? null;
   }
 
-  /**
-   * Allocate a slot in the atlas
-   * If atlas is full, evicts the least recently used slot
-   *
-   * @param frame - Current frame number for LRU tracking
-   * @returns AllocationResult with slot and any evicted brick metadata
-   */
+  // cheap pre-dispatch check for the streaming manager's backpressure
+  hasEvictableSlot(currentFrame: number): boolean {
+    if (this.freeList.length > 0) return true;
+    return this.findLRUSlot(currentFrame) !== -1;
+  }
+
+  /** Allocate a slot, evicting the LRU slot if the atlas is full. */
   allocate(frame: number = 0): AllocationResult | null {
     // Try free list first
     if (this.freeList.length > 0) {
@@ -140,9 +142,10 @@ export class AtlasAllocator {
     }
 
     // Atlas is full - find LRU slot to evict
-    const victim = this.findLRUSlot();
+    const victim = this.findLRUSlot(frame);
     if (victim === -1) {
-      // This shouldn't happen if atlas has slots
+      // nothing evictable right now (all pinned or recently touched)
+      // bricks stay desired and retry
       return null;
     }
 
@@ -160,18 +163,22 @@ export class AtlasAllocator {
   }
 
   /**
-   * Find the least recently used slot (skips pinned slots)
+   * Find the least recently used slot (skips pinned and recently-touched slots)
    */
-  private findLRUSlot(): number {
+  private findLRUSlot(currentFrame: number): number {
     let oldestFrame = Infinity;
     let victimIdx = -1;
 
     for (let i = 0; i < this.totalSlots; i++) {
-      // Never evict pinned slots
       if (this.pinned.has(i)) continue;
+      if (!this.used.has(i)) continue;
 
       const frameNum = this.lastUsedFrame[i] ?? 0;
-      if (this.used.has(i) && frameNum < oldestFrame) {
+
+      // Skip recently-touched slots to prevent thrash
+      if (currentFrame - frameNum < MIN_EVICTION_AGE) continue;
+
+      if (frameNum < oldestFrame) {
         oldestFrame = frameNum;
         victimIdx = i;
       }
@@ -192,6 +199,8 @@ export class AtlasAllocator {
     }
 
     this.used.delete(idx);
+    // a freed slot must not stay pinned
+    this.pinned.delete(idx);
     this.slotMetadata[idx] = null;
     this.lastUsedFrame[idx] = 0;
     this.freeList.push(idx);

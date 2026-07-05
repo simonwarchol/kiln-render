@@ -1,23 +1,10 @@
 /**
- * Shader module assembly
- *
- * Combines modular WGSL shader components into complete shader programs.
- *
- * Architecture:
- * - common.wgsl: Constants, utility functions, coordinate transforms
- * - sampling.wgsl: Indirection table and atlas sampling
- * - compositing.wgsl: Front-to-back volume compositing
- * - raymarching.wgsl: Brick traversal and integration core
- * - dvr.wgsl: Direct Volume Rendering mode
- * - mip.wgsl: Maximum Intensity Projection mode
- * - iso.wgsl: Isosurface rendering mode
- * - lod-debug.wgsl: LOD visualization mode
- * - wireframe.wgsl: Proxy box wireframe
- * - axis.wgsl: RGB axis helper
- * - blit.wgsl: Fullscreen texture blit
+ * Shader module assembly — combines modular WGSL components into
+ * complete shader programs (compute, blit, overlays).
  */
 
 import { CONFIG } from '../core/config.js';
+import { COMPUTE_UNIFORMS, SLICE_UNIFORMS } from './uniform-layout.js';
 
 // Import WGSL shader sources
 import commonWGSL from './common.wgsl?raw';
@@ -50,6 +37,9 @@ const sharedBindings = /* wgsl */ `
 @group(0) @binding(3) var tfSampler: sampler;
 @group(0) @binding(4) var tfTexture: texture_2d<f32>;
 @group(0) @binding(6) var indirectionTexture: texture_3d<u32>;
+@group(0) @binding(8) var volumeTexture1: texture_3d<f32>;
+@group(0) @binding(9) var volumeTexture2: texture_3d<f32>;
+@group(0) @binding(10) var volumeTexture3: texture_3d<f32>;
 `;
 
 // Assemble the common shader code
@@ -89,101 +79,17 @@ fn rayMarchMode(
 }
 `;
 
-// Volume shader (fragment-based rendering with proxy box)
-export const volumeShader = /* wgsl */ `
-struct Uniforms {
-    mvp: mat4x4f,
-    inverseModel: mat4x4f,
-    cameraPos: vec3f,
-    useIndirection: f32,
-    datasetSize: vec3f,
-    renderMode: i32,
-    normalizedSize: vec3f,
-    isoValue: f32,
-    frameIndex: u32,
-    _pad1: u32,
-    windowCenter: f32,
-    windowWidth: f32,
-    floatMin: f32,
-    floatMax: f32,
-    clipMin: vec3f,
-    _pad3: f32,
-    clipMax: vec3f,
-    densityScale: f32,
-}
-
-${sharedCode}
-
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-${sharedBindings}
-
-struct VertexOut {
-    @builtin(position) position: vec4f,
-    @location(0) modelPos: vec3f,
-}
-
-@vertex
-fn vs(@location(0) pos: vec3f) -> VertexOut {
-    var out: VertexOut;
-    out.position = uniforms.mvp * vec4f(pos, 1.0);
-    out.modelPos = pos;
-    return out;
-}
-
-${modeDispatch}
-
-@fragment
-fn fs(@location(0) modelPos: vec3f) -> @location(0) vec4f {
-    let camInModel = (uniforms.inverseModel * vec4f(uniforms.cameraPos, 1.0)).xyz;
-    let rayOrigin = camInModel;
-    let rayDir = normalize(modelPos - camInModel);
-
-    let halfSize = uniforms.normalizedSize * 0.5;
-    let hit = intersectBox(rayOrigin, rayDir, -halfSize, halfSize);
-
-    if (hit.x > hit.y || hit.y <= 0.0) { discard; }
-
-    // Apply clipping planes
-    let clipped = applyClippingPlanes(
-        rayOrigin, rayDir, max(hit.x, 0.0), hit.y,
-        uniforms.normalizedSize, uniforms.clipMin, uniforms.clipMax
-    );
-
-    if (clipped.x > clipped.y) { discard; }
-
-    let useIndirection = uniforms.useIndirection > 0.5;
-    return rayMarchMode(rayOrigin, rayDir, clipped.x, clipped.y, uniforms.normalizedSize, uniforms.datasetSize, uniforms.renderMode, uniforms.isoValue, useIndirection);
-}
-`;
-
 // Compute shader (full-screen ray marching)
 export const computeShader = /* wgsl */ `
 struct Uniforms {
-    inverseViewProj: mat4x4f,
-    cameraPos: vec3f,
-    useIndirection: f32,
-    datasetSize: vec3f,
-    renderMode: i32,
-    normalizedSize: vec3f,
-    isoValue: f32,
-    screenSize: vec2f,
-    frameIndex: u32,
-    _pad3: f32,
-    windowCenter: f32,
-    windowWidth: f32,
-    floatMin: f32,
-    floatMax: f32,
-    clipMin: vec3f,
-    _pad5: f32,
-    clipMax: vec3f,
-    densityScale: f32,
+${COMPUTE_UNIFORMS.fields}
 }
 
 ${sharedCode}
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 ${sharedBindings}
-@group(0) @binding(7) var outputTexture: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(7) var outputTexture: texture_storage_2d<rgba16float, write>;
 
 ${modeDispatch}
 
@@ -244,6 +150,9 @@ export const accumulateShader = accumulateWGSL;
 
 // Slice planes shader: axis-aligned cross-sections through the volume
 export const slicePlanesShader = [
+  `struct Uniforms {\n${SLICE_UNIFORMS.fields}\n}`,
+  `@group(0) @binding(0) var<uniform> uniforms: Uniforms;`,
+  sharedBindings,
   injectConfig(commonWGSL),
   samplingWGSL,
   slicePlanesWGSL,

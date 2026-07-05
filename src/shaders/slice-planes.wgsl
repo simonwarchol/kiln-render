@@ -1,33 +1,4 @@
-// Axis-aligned slice planes through the volume in 3D space.
-// Three instanced quads (instance 0=X, 1=Y, 2=Z) positioned in normalized
-// volume space and sampled from the atlas.
-//
-// Prepend: common.wgsl + sampling.wgsl
-
-struct Uniforms {
-    mvp:             mat4x4f,
-    normalizedSize:  vec3f,
-    _pad0:           f32,
-    datasetSize:     vec3f,
-    _pad1:           f32,
-    windowCenter:    f32,
-    windowWidth:     f32,
-    floatMin:        f32,
-    floatMax:        f32,
-    slicePositions:  vec3f,  // X, Y, Z slice positions in [0, 1]
-    _pad2:           f32,
-    sliceXEnabled:   u32,
-    sliceYEnabled:   u32,
-    sliceZEnabled:   u32,
-    _pad3:           u32,
-}
-
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var volumeSampler: sampler;
-@group(0) @binding(2) var volumeTexture: texture_3d<f32>;
-@group(0) @binding(3) var tfSampler: sampler;
-@group(0) @binding(4) var tfTexture: texture_2d<f32>;
-@group(0) @binding(6) var indirectionTexture: texture_3d<u32>;
+// Axis-aligned slice planes: three instanced quads (X, Y, Z) sampled from the atlas.
 
 struct VertexOut {
     @builtin(position) position: vec4f,
@@ -92,8 +63,50 @@ fn vs(
 
 @fragment
 fn fs(@location(0) voxelPos: vec3f) -> @location(0) vec4f {
-    let rawDensity     = sampleWithIndirection(voxelPos);
-    let density        = clamp((rawDensity - uniforms.floatMin) / max(uniforms.floatMax - uniforms.floatMin, 0.0001), 0.0, 1.0);
-    let windowed       = applyWindow(density, uniforms.windowCenter, uniforms.windowWidth);
-    return textureSampleLevel(tfTexture, tfSampler, vec2f(windowed, 0.5), 0.0);
+    let brickIndex = floor(voxelPos / LOGICAL_BRICK_SIZE);
+    let indirection = lookupIndirection(brickIndex);
+    if (indirection.w == 0u || indirection.w == 255u) {
+        if (uniforms.lodDebug != 0u) { return vec4f(0.2, 0.2, 0.2, 1.0); }
+        return vec4f(0.0);
+    }
+    let lodScale = getLodScale(indirection);
+
+    // LOD debug: color by LOD level, ignore data
+    if (uniforms.lodDebug != 0u) {
+        let lodColor = getLodColor(indirection.w);
+        return vec4f(lodColor, 1.0);
+    }
+
+    if (uniforms.numChannels > 1u) {
+        // Multi-channel opacity-weighted average (VTK.js ImageMapper approach):
+        // each channel contributes color weighted by its windowed intensity,
+        // normalized by total weight so relative proportions are preserved
+        // without being too dim (additive) or too sensitive (maxDensity norm).
+        var weightedColor = vec3f(0.0);
+        var totalWeight: f32 = 0.0;
+        // Normalise raw float samples to [0,1] before per-channel windowing
+        // (identity for uint data where floatMin=0 / floatMax=1)
+        let floatInvRange = 1.0 / max(uniforms.floatMax - uniforms.floatMin, 0.0001);
+        for (var ch = 0u; ch < uniforms.numChannels; ch++) {
+            let rawSample = sampleAtlasCh(ch, voxelPos, indirection, lodScale);
+            let raw = clamp((rawSample - uniforms.floatMin) * floatInvRange, 0.0, 1.0);
+            let wc = uniforms.channelWindowCenter[ch];
+            let ww = max(uniforms.channelWindowWidth[ch], 0.0001);
+            let intensity = clamp((raw - (wc - ww * 0.5)) / ww, 0.0, 1.0);
+            let chColor = uniforms.channelColors[ch];
+            let weight = intensity * chColor.a;
+            weightedColor += chColor.rgb * weight;
+            totalWeight += weight;
+        }
+        if (totalWeight > 0.001) {
+            weightedColor /= totalWeight;
+        }
+        return vec4f(weightedColor, step(0.001, totalWeight));
+    } else {
+        // Single channel: TF-based with windowing and float normalisation
+        let rawDensity = sampleAtlas(voxelPos, indirection, lodScale);
+        let density = clamp((rawDensity - uniforms.floatMin) / max(uniforms.floatMax - uniforms.floatMin, 0.0001), 0.0, 1.0);
+        let windowed = applyWindow(density, uniforms.windowCenter, uniforms.windowWidth);
+        return textureSampleLevel(tfTexture, tfSampler, vec2f(windowed, 0.5), 0.0);
+    }
 }

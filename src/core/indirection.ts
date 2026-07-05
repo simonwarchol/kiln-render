@@ -1,10 +1,6 @@
 /**
- * Indirection Table for Virtual Volume Texturing
- *
- * Maps virtual brick coordinates to atlas positions.
- *
- * Virtual volume is divided into bricks (BRICK_SIZE³ bricks, forming a GRID_SIZE³ grid)
- * Each entry in the indirection table tells the shader where to find that brick in the atlas.
+ * Indirection Table - Maps virtual brick coordinates to atlas positions
+ * for virtual volume texturing.
  */
 
 import type { DatasetConfig } from './config.js';
@@ -61,15 +57,8 @@ export class IndirectionTable {
   }
 
   /**
-   * Register a brick mapping: virtual position -> atlas position
-   *
-   * For LOD 0, this sets a single cell in the indirection table.
-   * For coarser LODs, this fills multiple cells (2^lod)³ to cover the
-   * equivalent region in the finest LOD grid.
-   *
-   * @param virtualX/Y/Z - Virtual brick position at this LOD level
-   * @param atlasX/Y/Z - Atlas slot position
-   * @param lod - LOD level (0 = full res, 1 = 2x downsample, 2 = 4x, 3 = 8x)
+   * Register a brick mapping: virtual position -> atlas position.
+   * Coarser LODs fill (2^lod)³ cells to cover the equivalent region.
    */
   setBrick(
     virtualX: number, virtualY: number, virtualZ: number,
@@ -120,14 +109,8 @@ export class IndirectionTable {
   }
 
   /**
-   * Mark a brick region as empty (known to have no data)
-   *
-   * Unlike clearBrick (which reverts to unloaded), this marks cells as
-   * "loaded but empty" so coarser LOD data doesn't show through.
-   * Uses a special marker: LOD 255 means "empty brick, don't render".
-   *
-   * @param virtualX/Y/Z - Virtual brick position at this LOD level
-   * @param lod - LOD level of the empty brick
+   * Mark a brick region as empty (LOD 255) so coarser LOD data
+   * doesn't show through. Unlike clearBrick, this means "loaded but empty".
    */
   setEmpty(
     virtualX: number, virtualY: number, virtualZ: number,
@@ -149,9 +132,11 @@ export class IndirectionTable {
 
           const idx = (x + y * this.gridX + z * this.gridX * this.gridY) * 4;
 
-          // Only overwrite if this LOD is finer or equal (same logic as setBrick)
+          // Never overwrite loaded data with the empty marker.
+          // Any cell with a real brick (w in 1..254) must keep its data —
+          // even coarser LOD fallback is better than marking the cell empty.
           const existingLod = this.data[idx + 3] ?? 0;
-          if (existingLod > 0 && existingLod < 255 && existingLod <= lod + 1) {
+          if (existingLod > 0 && existingLod < 255) {
             continue;
           }
 
@@ -168,16 +153,8 @@ export class IndirectionTable {
   }
 
   /**
-   * Clear a brick region (mark as not loaded)
-   *
-   * For LOD 0, clears a single cell.
-   * For coarser LODs, clears all cells that were covered by this brick,
-   * but only if they still point to this LOD (don't clear finer LOD data).
-   *
-   * @param virtualX/Y/Z - Virtual brick position at this LOD level
-   * @param lod - LOD level of the brick being cleared
-   * @param fallbackAtlas - Optional: atlas position to fall back to (e.g., parent brick)
-   * @param fallbackLod - Optional: LOD of fallback brick
+   * Clear a brick region (mark as not loaded). For coarser LODs, only clears
+   * cells still pointing to this LOD. Optional fallback restores parent brick.
    */
   clearBrick(
     virtualX: number, virtualY: number, virtualZ: number,
@@ -213,7 +190,8 @@ export class IndirectionTable {
             this.data[idx + 2] = fallbackAtlas[2];
             this.data[idx + 3] = fallbackLod + 1;
           } else {
-            // Clear completely
+            // Clear completely — cell reverts to "unloaded" state.
+            // Streaming manager will re-request it if still desired.
             this.data[idx + 0] = 0;
             this.data[idx + 1] = 0;
             this.data[idx + 2] = 0;

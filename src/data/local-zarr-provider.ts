@@ -1,9 +1,6 @@
 /**
- * LocalZarrDataProvider - Load OME-Zarr from local filesystem
- *
- * Uses File System Access API to read local Zarr datasets.
- * Unlike ZarrDataProvider, this runs on the main thread since
- * FileSystemDirectoryHandle cannot be transferred to workers.
+ * LocalZarrDataProvider - Loads OME-Zarr from local filesystem via
+ * File System Access API. Runs on main thread (handles can't transfer to workers).
  */
 
 import { open, root, Array as ZarrArray } from 'zarrita';
@@ -11,7 +8,7 @@ import type { DataType } from 'zarrita';
 import { FileSystemStore } from './filesystem-store.js';
 import { BaseZarrProvider, detectCompression, type LodParams } from './base-zarr-provider.js';
 import { float32ToFloat16Bits } from '../utils/float16.js';
-import type { VolumeMetadata, BrickData, BrickStats, PipelineTimings } from './data-provider.js';
+import type { VolumeMetadata, BrickData, BrickLoadResult, BrickStats, PipelineTimings } from './data-provider.js';
 import { UnsupportedDatasetError } from './data-provider.js';
 import { extractMultiscales } from './zarr-validator.js';
 import { RollingAvg } from './network-tracker.js';
@@ -71,11 +68,9 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
     const name = this.dirHandle.name.replace(/\.ome\.zarr|\.zarr/, '');
     const { metadata, lodParams } = this.parseOmeMetadata(attrs, this.arrays, name);
 
-    // Scan coarsest LOD for float range if no OMERO window provided it
+    // Provisional dataRange — real range derived during base LOD loading
     if (metadata.isFloat && !metadata.dataRange) {
-      console.log('[Kiln] Float dataset — scanning coarsest LOD for data range…');
-      metadata.dataRange = await this.scanFloatRange(this.arrays[this.arrays.length - 1]!, lodParams[lodParams.length - 1]!);
-      console.log(`[Kiln] Float data range: [${metadata.dataRange[0]}, ${metadata.dataRange[1]}]`);
+      metadata.dataRange = [0, 1];
     }
 
     metadata.compression = await detectCompression(store, `${subGroupPath}${ms.datasets[0]!.path}`);
@@ -86,7 +81,7 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
     return this.metadata;
   }
 
-  async loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex = 0): Promise<BrickData | null> {
+  async loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex = 0): Promise<BrickLoadResult | null> {
     const meta = this.metadata;
     if (!meta) return null;
 
@@ -104,7 +99,14 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
       this.cacheBrickStats(lod, bx, by, bz, result.stats);
       this.recordDownload(result.data.byteLength);
 
-      return result.data;
+      return {
+        data: result.data,
+        min: result.stats.min,
+        max: result.stats.max,
+        avg: result.stats.avg,
+        rawMin: result.rawMin,
+        rawMax: result.rawMax,
+      };
     } catch (e) {
       console.warn(`Failed to load brick lod${lod}:${bx}-${by}-${bz}:`, e);
       return null;
@@ -113,6 +115,7 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
 
   getPipelineTimings(): PipelineTimings {
     return {
+      avgQueueMs: 0, // no worker queue in local provider
       avgFetchMs: this.fetchAvg.value,
       avgAssemblyMs: this.assemblyAvg.value,
       avgUploadMs: 0, // measured in StreamingManager
@@ -120,7 +123,8 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
     };
   }
 
-  private async assembleBrick(lod: number, bx: number, by: number, bz: number, channelIndex = 0): Promise<{ data: BrickData; stats: BrickStats }> {
+
+  private async assembleBrick(lod: number, bx: number, by: number, bz: number, channelIndex = 0): Promise<{ data: BrickData; stats: BrickStats; rawMin?: number; rawMax?: number }> {
     const arr = this.arrays[lod]!;
     const params = this.lodParams[lod]!;
     const { scaleX, scaleY, scaleZ, actualDimX, actualDimY, actualDimZ, csx, csy, csz, shapePrefixLength, channelAxisIdx } = params;
@@ -147,22 +151,32 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
 
     // --- Stage 1: chunk fetch (filesystem I/O + zarr decompression) ---
     const t0 = performance.now();
-    const chunkCache = new Map<string, { data: ArrayLike<number>; shape: number[] }>();
+    // Flat chunk lookup: direct integer indexing replaces Map<string> + per-voxel
+    // string allocation in the assembly loop.
+    const ncx = maxCx - minCx + 1;
+    const ncy = maxCy - minCy + 1;
+    const chunkCount = ncx * ncy * (maxCz - minCz + 1);
+    const chunkDataArr: (ArrayLike<number> | null)[] = new Array(chunkCount).fill(null);
+    const chunkStY = new Int32Array(chunkCount);  // per-chunk width (stride for Y)
+    const chunkStZ = new Int32Array(chunkCount);  // per-chunk W*H (stride for Z)
+
     const chunkFetches: Promise<void>[] = [];
     for (let cz = minCz; cz <= maxCz; cz++) {
       for (let cy = minCy; cy <= maxCy; cy++) {
         for (let cx = minCx; cx <= maxCx; cx++) {
+          const fi = (cz - minCz) * ncy * ncx + (cy - minCy) * ncx + (cx - minCx);
           const prefix = new Array(shapePrefixLength).fill(0);
           if (channelAxisIdx >= 0 && channelAxisIdx < shapePrefixLength) {
             prefix[channelAxisIdx] = channelIndex;
           }
-          const key = `${cz}/${cy}/${cx}`;
           chunkFetches.push(
             arr.getChunk([...prefix, cz, cy, cx]).then(chunk => {
-              chunkCache.set(key, {
-                data: chunk.data as unknown as ArrayLike<number>,
-                shape: chunk.shape,
-              });
+              const data = chunk.data as unknown as ArrayLike<number>;
+              const w = chunk.shape[chunk.shape.length - 1]!;
+              const h = chunk.shape[chunk.shape.length - 2]!;
+              chunkDataArr[fi] = data;
+              chunkStY[fi] = w;
+              chunkStZ[fi] = w * h;
             })
           );
         }
@@ -171,7 +185,33 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
     await Promise.all(chunkFetches);
     this.fetchAvg.add(performance.now() - t0);
 
-    // --- Stage 2: brick assembly (voxel scatter + format conversion) ---
+    // --- Stage 2: brick assembly (LUT-based voxel scatter + format conversion) ---
+    // Precompute per-axis LUTs: local brick coord → (chunk index, intra-chunk offset).
+    // Eliminates ~287k string allocations + Map.get calls per 66³ brick.
+    const lutChunkX = new Int32Array(physSize);
+    const lutChunkY = new Int32Array(physSize);
+    const lutChunkZ = new Int32Array(physSize);
+    const lutOffX = new Int32Array(physSize);
+    const lutOffY = new Int32Array(physSize);
+    const lutOffZ = new Int32Array(physSize);
+
+    for (let i = 0; i < physSize; i++) {
+      const gx = Math.max(0, Math.min(actualDimX - 1, Math.round((vStartX + i) * scaleX)));
+      const cxI = Math.floor(gx / csx);
+      lutChunkX[i] = cxI - minCx;
+      lutOffX[i] = gx - cxI * csx;
+
+      const gy = Math.max(0, Math.min(actualDimY - 1, Math.round((vStartY + i) * scaleY)));
+      const cyI = Math.floor(gy / csy);
+      lutChunkY[i] = cyI - minCy;
+      lutOffY[i] = gy - cyI * csy;
+
+      const gz = Math.max(0, Math.min(actualDimZ - 1, Math.round((vStartZ + i) * scaleZ)));
+      const czI = Math.floor(gz / csz);
+      lutChunkZ[i] = czI - minCz;
+      lutOffZ[i] = gz - czI * csz;
+    }
+
     const t1 = performance.now();
     const is16bit = this.metadata!.bitDepth === 16;
     const isFloat = this.metadata!.isFloat ?? false;
@@ -184,57 +224,51 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
     let min = Infinity;
     let max = -Infinity;
     let sum = 0;
+    let rawMinVal = Infinity;
+    let rawMaxVal = -Infinity;
 
     for (let lz = 0; lz < physSize; lz++) {
+      const czi = lutChunkZ[lz]!;
+      const lcz = lutOffZ[lz]!;
+      const zBase = czi * ncy * ncx;
+      const brickZBase = lz * physSize * physSize;
+
       for (let ly = 0; ly < physSize; ly++) {
+        const cyi = lutChunkY[ly]!;
+        const lcy = lutOffY[ly]!;
+        const yzBase = zBase + cyi * ncx;
+        const brickYZBase = brickZBase + ly * physSize;
+
         for (let lx = 0; lx < physSize; lx++) {
-          const vx = vStartX + lx;
-          const vy = vStartY + ly;
-          const vz = vStartZ + lz;
+          const fi = yzBase + lutChunkX[lx]!;
+          const data = chunkDataArr[fi];
+          if (data) {
+            const idx = lcz * chunkStZ[fi]! + lcy * chunkStY[fi]! + lutOffX[lx]!;
+            const raw = Number(data[idx]!);
 
-          const gx = Math.max(0, Math.min(actualDimX - 1, Math.round(vx * scaleX)));
-          const gy = Math.max(0, Math.min(actualDimY - 1, Math.round(vy * scaleY)));
-          const gz = Math.max(0, Math.min(actualDimZ - 1, Math.round(vz * scaleZ)));
-
-          const cx = Math.floor(gx / csx);
-          const cy = Math.floor(gy / csy);
-          const cz = Math.floor(gz / csz);
-
-          const lcx = gx - cx * csx;
-          const lcy = gy - cy * csy;
-          const lcz = gz - cz * csz;
-
-          const key = `${cz}/${cy}/${cx}`;
-          const chunk = chunkCache.get(key);
-          if (chunk) {
-            const chunkW = chunk.shape[chunk.shape.length - 1]!;
-            const chunkH = chunk.shape[chunk.shape.length - 2]!;
-            const chunkD = chunk.shape[chunk.shape.length - 3]!;
-
-            if (lcx >= 0 && lcx < chunkW && lcy >= 0 && lcy < chunkH && lcz >= 0 && lcz < chunkD) {
-              const idx = lcz * chunkH * chunkW + lcy * chunkW + lcx;
-              const raw = Number(chunk.data[idx]!);
-
-              let brickVal: number;
-              let statVal: number;
-              if (isFloat) {
-                const range = floatMax - floatMin;
-                const normalizedVal = range > 0
-                  ? Math.max(0, Math.min(1, (raw - floatMin) / range))
-                  : 0;
-                statVal = Math.round(normalizedVal * 65535);
-                // Store raw float value as float16 bits — shader normalises using uniforms
-                brickVal = float32ToFloat16Bits(Math.max(-65504, Math.min(65504, raw)));
-              } else {
-                brickVal = raw;
-                statVal = raw;
+            let brickVal: number;
+            let statVal: number;
+            if (isFloat) {
+              const range = floatMax - floatMin;
+              const normalizedVal = range > 0
+                ? Math.max(0, Math.min(1, (raw - floatMin) / range))
+                : 0;
+              statVal = Math.round(normalizedVal * 65535);
+              // Store raw float value as float16 bits — shader normalises using uniforms
+              brickVal = float32ToFloat16Bits(Math.max(-65504, Math.min(65504, raw)));
+              if (isFinite(raw)) {
+                if (raw < rawMinVal) rawMinVal = raw;
+                if (raw > rawMaxVal) rawMaxVal = raw;
               }
-
-              brick[lx + ly * physSize + lz * physSize * physSize] = brickVal;
-              min = Math.min(min, statVal);
-              max = Math.max(max, statVal);
-              sum += statVal;
+            } else {
+              brickVal = raw;
+              statVal = raw;
             }
+
+            brick[brickYZBase + lx] = brickVal;
+            min = Math.min(min, statVal);
+            max = Math.max(max, statVal);
+            sum += statVal;
           }
         }
       }
@@ -250,6 +284,8 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
         max: max === -Infinity ? 0 : max,
         avg: sum / voxelCount,
       },
+      rawMin: isFloat && isFinite(rawMinVal) ? rawMinVal : undefined,
+      rawMax: isFloat && isFinite(rawMaxVal) ? rawMaxVal : undefined,
     };
   }
 

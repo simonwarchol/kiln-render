@@ -1,15 +1,6 @@
 /**
- * ZarrChunkWorker - Web Worker for fully off-main-thread Zarr brick loading
- *
- * Runs the entire pipeline inside the worker:
- *   1. Fetch compressed Zarr chunks over HTTP
- *   2. Decompress via zarrita's codec pipeline (zstd/blosc WASM)
- *   3. Assemble 66³ brick from overlapping chunks (re-chunking + ghost borders)
- *   4. Compute brick stats (min/max/avg)
- *   5. Transfer the assembled brick buffer back to main thread (zero-copy)
- *
- * The main thread never touches voxel data — it just dispatches requests
- * and uploads the returned buffers to the GPU atlas.
+ * ZarrChunkWorker - Web Worker that fetches, decompresses, and assembles
+ * 66³ bricks entirely off-thread, transferring results back zero-copy.
  */
 
 import { open, root, Array as ZarrArray, registry } from 'zarrita';
@@ -20,10 +11,7 @@ import zstd from 'numcodecs/zstd';
 import { TolerantFetchStore } from './tolerant-fetch-store.js';
 import { uint16ToFloat16, float32ToFloat16Bits } from '../utils/float16.js';
 
-// Override zarrita's default codec registry with static imports.
-// By default zarrita lazily loads codecs via dynamic import("numcodecs/blosc") etc.,
-// which Vite pre-bundles to @fs paths that workers cannot fetch in dev mode.
-// Static imports bundle the codecs directly into the worker chunk.
+// Static codec imports — zarrita's dynamic imports fail in Vite dev workers.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 registry.set('blosc', async () => blosc as any);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -33,7 +21,7 @@ registry.set('zstd', async () => zstd as any);
 
 /** Messages from main thread to worker */
 export interface ZarrWorkerRequest {
-  type: 'init' | 'loadBrick' | 'setTargetFormat';
+  type: 'init' | 'loadBrick' | 'setTargetFormat' | 'setFloatRange' | 'cancel';
   id: number;
   /** For 'init': dataset URL and array paths */
   url?: string;
@@ -56,6 +44,8 @@ export interface ZarrWorkerRequest {
   }[];
   /** Channel index to load (for datasets with a channel axis) */
   channelIndex?: number;
+  /** Main-thread timestamp (performance.now) when request was dispatched — for queue wait measurement */
+  dispatchTime?: number;
   is16bit?: boolean;
   /** Target texture format: r8unorm (8-bit), r16unorm (16-bit uint), r16float (16-bit float) */
   targetFormat?: 'r8unorm' | 'r16unorm' | 'r16float';
@@ -68,7 +58,7 @@ export interface ZarrWorkerRequest {
 
 /** Messages from worker to main thread */
 export interface ZarrWorkerResponse {
-  type: 'init' | 'loadBrick' | 'setTargetFormat';
+  type: 'init' | 'loadBrick' | 'setTargetFormat' | 'setFloatRange';
   id: number;
   error?: string;
   /** For 'loadBrick': assembled brick data (transferable) */
@@ -77,9 +67,17 @@ export interface ZarrWorkerResponse {
   min?: number;
   max?: number;
   avg?: number;
+  /** Raw-space min/max for float data (before normalisation) — used for range derivation */
+  rawMin?: number;
+  rawMax?: number;
   /** Per-stage timing (ms) — for pipeline telemetry */
   fetchMs?: number;
   assemblyMs?: number;
+  /** Worker queue wait: dispatchTime → worker starts processing (ms) */
+  queueMs?: number;
+  /** Chunk-cache hit ratio for this brick (hits / total chunks needed) */
+  chunkHits?: number;
+  chunkTotal?: number;
 }
 
 // Worker state
@@ -96,7 +94,18 @@ let floatMax = 1;
 // Per-worker chunk cache (LRU, bounded by byte count to prevent OOM)
 const chunkCache = new Map<string, { data: ArrayLike<number>; shape: number[]; bytes: number }>();
 let cacheBytes = 0;
-const MAX_CACHE_BYTES = 128 * 1024 * 1024; // 128 MB per worker
+const MAX_CACHE_BYTES = 32 * 1024 * 1024; // 32 MB per worker
+
+// In-flight chunk fetch promises — coalesces concurrent requests for the same chunk
+// so multiple assembleBrick calls that need the same chunk share one fetch+decompress
+const inflightFetches = new Map<string, Promise<{ data: ArrayLike<number>; shape: number[] }>>();
+
+// Store reference
+let workerStore: TolerantFetchStore | null = null;
+
+// Cancellation state
+const cancelledRequests = new Set<number>();
+const activeControllers = new Map<number, AbortController>();
 
 function cacheKey(lod: number, cz: number, cy: number, cx: number, channelIndex: number): string {
   return `${lod}:ch${channelIndex}:${cz}/${cy}/${cx}`;
@@ -125,8 +134,17 @@ function cacheSet(key: string, data: ArrayLike<number>, shape: number[]): void {
   cacheBytes += bytes;
 }
 
-self.onmessage = async (event: MessageEvent<ZarrWorkerRequest>) => {
+self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
   const { type, id } = event.data;
+
+  // Cancel messages are handled immediately — not queued.
+  // They must arrive and take effect even while a loadBrick is in progress.
+  if (type === 'cancel') {
+    cancelledRequests.add(id);
+    const controller = activeControllers.get(id);
+    if (controller) controller.abort();
+    return;
+  }
 
   if (type === 'setTargetFormat') {
     targetFormat = event.data.targetFormat ?? 'r16unorm';
@@ -135,62 +153,104 @@ self.onmessage = async (event: MessageEvent<ZarrWorkerRequest>) => {
     return;
   }
 
+  if (type === 'setFloatRange') {
+    floatMin = event.data.floatMin ?? 0;
+    floatMax = event.data.floatMax ?? 1;
+    const resp: ZarrWorkerResponse = { type: 'setFloatRange', id };
+    (self as unknown as Worker).postMessage(resp);
+    return;
+  }
+
   if (type === 'init') {
-    try {
-      const { url, paths } = event.data;
-      LOGICAL_SIZE = event.data.logicalBrickSize ?? 64;
-      PHYSICAL_SIZE = event.data.physicalBrickSize ?? 66;
-      lodParams = event.data.lodParams ?? [];
-      is16bit = event.data.is16bit ?? false;
-      targetFormat = event.data.targetFormat ?? 'r16unorm';
-      isFloat32 = event.data.isFloat32 ?? false;
-      floatMin = event.data.floatMin ?? 0;
-      floatMax = event.data.floatMax ?? 1;
-      if (isFloat32) {
-        console.log(`[ZarrWorker] Float32 normalization range: [${floatMin}, ${floatMax}]`);
+    // Init is called once at startup before any loadBrick — safe to handle directly
+    (async () => {
+      try {
+        const { url, paths } = event.data;
+        LOGICAL_SIZE = event.data.logicalBrickSize ?? 64;
+        PHYSICAL_SIZE = event.data.physicalBrickSize ?? 66;
+        lodParams = event.data.lodParams ?? [];
+        is16bit = event.data.is16bit ?? false;
+        targetFormat = event.data.targetFormat ?? 'r16unorm';
+        isFloat32 = event.data.isFloat32 ?? false;
+        floatMin = event.data.floatMin ?? 0;
+        floatMax = event.data.floatMax ?? 1;
+        if (isFloat32) {
+          console.log(`[ZarrWorker] Float32 normalization range: [${floatMin}, ${floatMax}]`);
+        }
+
+        workerStore = new TolerantFetchStore(url!);
+        const rootGroup = await open(root(workerStore), { kind: 'group' });
+
+        arrays = [];
+        for (const path of paths!) {
+          const arr = await open(rootGroup.resolve(path), { kind: 'array' });
+          arrays.push(arr);
+        }
+
+        const resp: ZarrWorkerResponse = { type: 'init', id };
+        (self as unknown as Worker).postMessage(resp);
+      } catch (e) {
+        const resp: ZarrWorkerResponse = {
+          type: 'init', id,
+          error: e instanceof Error ? e.message : 'Init failed',
+        };
+        (self as unknown as Worker).postMessage(resp);
       }
+    })();
+    return;
+  }
 
-      const store = new TolerantFetchStore(url!);
-      const rootGroup = await open(root(store), { kind: 'group' });
+  if (type === 'loadBrick') {
+    const { lod, bx, by, bz, dispatchTime } = event.data;
+    const channelIndex = event.data.channelIndex ?? 0;
+    const queueMs = dispatchTime !== undefined ? performance.now() - dispatchTime : undefined;
 
-      arrays = [];
-      for (const path of paths!) {
-        const arr = await open(rootGroup.resolve(path), { kind: 'array' });
-        arrays.push(arr);
+    // Already cancelled before we started? Skip entirely.
+    if (cancelledRequests.has(id)) {
+      cancelledRequests.delete(id);
+      return;
+    }
+
+    const controller = new AbortController();
+    activeControllers.set(id, controller);
+
+    (async () => {
+      try {
+        const result = await assembleBrick(lod!, bx!, by!, bz!, channelIndex, controller.signal);
+
+        activeControllers.delete(id);
+        cancelledRequests.delete(id);
+
+        if (controller.signal.aborted) return;
+
+        const resp: ZarrWorkerResponse = {
+          type: 'loadBrick', id,
+          data: result.buffer,
+          min: result.min,
+          max: result.max,
+          avg: result.avg,
+          rawMin: result.rawMin,
+          rawMax: result.rawMax,
+          fetchMs: result.fetchMs,
+          assemblyMs: result.assemblyMs,
+          queueMs,
+          chunkHits: result.chunkHits,
+          chunkTotal: result.chunkTotal,
+        };
+        (self as unknown as Worker).postMessage(resp, [result.buffer]);
+      } catch (e) {
+        activeControllers.delete(id);
+        cancelledRequests.delete(id);
+
+        if (e instanceof DOMException && e.name === 'AbortError') return;
+
+        const resp: ZarrWorkerResponse = {
+          type: 'loadBrick', id,
+          error: e instanceof Error ? e.message : 'loadBrick failed',
+        };
+        (self as unknown as Worker).postMessage(resp);
       }
-
-      const resp: ZarrWorkerResponse = { type: 'init', id };
-      (self as unknown as Worker).postMessage(resp);
-    } catch (e) {
-      const resp: ZarrWorkerResponse = {
-        type: 'init', id,
-        error: e instanceof Error ? e.message : 'Init failed',
-      };
-      (self as unknown as Worker).postMessage(resp);
-    }
-  } else if (type === 'loadBrick') {
-    try {
-      const { lod, bx, by, bz } = event.data;
-      const channelIndex = event.data.channelIndex ?? 0;
-      const result = await assembleBrick(lod!, bx!, by!, bz!, channelIndex);
-
-      const resp: ZarrWorkerResponse = {
-        type: 'loadBrick', id,
-        data: result.buffer,
-        min: result.min,
-        max: result.max,
-        avg: result.avg,
-        fetchMs: result.fetchMs,
-        assemblyMs: result.assemblyMs,
-      };
-      (self as unknown as Worker).postMessage(resp, [result.buffer]);
-    } catch (e) {
-      const resp: ZarrWorkerResponse = {
-        type: 'loadBrick', id,
-        error: e instanceof Error ? e.message : 'loadBrick failed',
-      };
-      (self as unknown as Worker).postMessage(resp);
-    }
+    })();
   }
 };
 
@@ -198,8 +258,8 @@ self.onmessage = async (event: MessageEvent<ZarrWorkerRequest>) => {
  * Full brick assembly: fetch overlapping chunks, decompress, re-chunk into 66³ brick
  */
 async function assembleBrick(
-  lod: number, bx: number, by: number, bz: number, channelIndex: number
-): Promise<{ buffer: ArrayBuffer; min: number; max: number; avg: number; fetchMs: number; assemblyMs: number }> {
+  lod: number, bx: number, by: number, bz: number, channelIndex: number, signal?: AbortSignal
+): Promise<{ buffer: ArrayBuffer; min: number; max: number; avg: number; rawMin?: number; rawMax?: number; fetchMs: number; assemblyMs: number; chunkHits: number; chunkTotal: number }> {
   const arr = arrays[lod]!;
   const params = lodParams![lod]!;
   const { scaleX, scaleY, scaleZ, actualDimX, actualDimY, actualDimZ, csx, csy, csz, shapePrefixLength, channelAxisIdx } = params;
@@ -226,31 +286,78 @@ async function assembleBrick(
   const maxCy = Math.floor(aEndY / csy);
   const maxCz = Math.floor(aEndZ / csz);
 
-  // --- Stage 1: chunk fetch (HTTP + zarr decompression, parallel, with cache) ---
+  // --- Stage 1: chunk fetch (HTTP + zarr decompression, parallel, with cache + dedup) ---
   const t0 = performance.now();
-  // Per-brick snapshot: concurrent assembleBrick calls share chunkCache and can evict
-  // each other's entries between the await and the loop below. Read from here, not chunkCache.
-  const localChunks = new Map<string, { data: ArrayLike<number>; shape: number[] }>();
+  // Flat chunk lookup: direct integer indexing replaces Map<string> + per-voxel
+  // string allocation in the assembly loop.
+  // Index = (cz-minCz)*ncy*ncx + (cy-minCy)*ncx + (cx-minCx)
+  const ncx = maxCx - minCx + 1;
+  const ncy = maxCy - minCy + 1;
+  const chunkCount = ncx * ncy * (maxCz - minCz + 1);
+  const chunkDataArr: (ArrayLike<number> | null)[] = new Array(chunkCount).fill(null);
+  const chunkW = new Int32Array(chunkCount);  // per-chunk width (stride for Y)
+  const chunkWH = new Int32Array(chunkCount); // per-chunk W*H (stride for Z)
+
+  const setChunkEntry = (fi: number, data: ArrayLike<number>, shape: number[]) => {
+    chunkDataArr[fi] = data;
+    const w = shape[shape.length - 1]!;
+    const h = shape[shape.length - 2]!;
+    chunkW[fi] = w;
+    chunkWH[fi] = w * h;
+  };
+
+  let chunkHits = 0;
   const fetchPromises: Promise<void>[] = [];
   for (let cz = minCz; cz <= maxCz; cz++) {
     for (let cy = minCy; cy <= maxCy; cy++) {
       for (let cx = minCx; cx <= maxCx; cx++) {
+        const fi = (cz - minCz) * ncy * ncx + (cy - minCy) * ncx + (cx - minCx);
         const key = cacheKey(lod, cz, cy, cx, channelIndex);
         const cached = chunkCache.get(key);
         if (cached) {
-          localChunks.set(key, cached);
+          // refresh recency: delete+re-set moves to end of map iteration order (LRU)
+          chunkCache.delete(key);
+          chunkCache.set(key, cached);
+          setChunkEntry(fi, cached.data, cached.shape);
+          chunkHits++;
         } else {
+          // In-flight dedup: if another assembleBrick is already fetching this
+          // chunk, share its promise instead of issuing a duplicate HTTP request
+          let chunkPromise = inflightFetches.get(key);
           const prefix = new Array(shapePrefixLength).fill(0);
           if (channelAxisIdx >= 0 && channelAxisIdx < shapePrefixLength) {
             prefix[channelAxisIdx] = channelIndex;
           }
-          fetchPromises.push(
-            arr.getChunk([...prefix, cz, cy, cx]).then(chunk => {
+          const coords = [...prefix, cz, cy, cx];
+          if (!chunkPromise) {
+            chunkPromise = arr.getChunk(coords, { signal } as RequestInit).then(chunk => {
               const entry = { data: chunk.data as unknown as ArrayLike<number>, shape: chunk.shape };
-              localChunks.set(key, entry);
-              cacheSet(key, chunk.data as unknown as ArrayLike<number>, chunk.shape);
-            })
-          );
+              cacheSet(key, entry.data, entry.shape);
+              return entry;
+            }).finally(() => {
+              inflightFetches.delete(key);
+            });
+            inflightFetches.set(key, chunkPromise);
+          }
+          fetchPromises.push(chunkPromise.then(entry => {
+            setChunkEntry(fi, entry.data, entry.shape);
+          }).catch(e => {
+            // Dedup conflict: the shared fetch was aborted by another brick's
+            // signal, but this brick is still active. Retry with our own signal.
+            if (e instanceof DOMException && e.name === 'AbortError' && !signal?.aborted) {
+              const cached = chunkCache.get(key);
+              if (cached) {
+                setChunkEntry(fi, cached.data, cached.shape);
+                return;
+              }
+              return arr.getChunk(coords, { signal } as RequestInit).then(chunk => {
+                const entry = { data: chunk.data as unknown as ArrayLike<number>, shape: chunk.shape };
+                cacheSet(key, entry.data, entry.shape);
+                setChunkEntry(fi, entry.data, entry.shape);
+              });
+            }
+            throw e;
+          }));
         }
       }
     }
@@ -260,7 +367,39 @@ async function assembleBrick(
   }
   const fetchMs = performance.now() - t0;
 
-  // --- Stage 2: brick assembly (voxel scatter + format conversion) ---
+  // Abort check between fetch and assembly — the CPU-bound assembly loop
+  // can't yield, so this is the last interruptible point.
+  if (signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
+  // --- Stage 2: brick assembly (LUT-based voxel scatter + format conversion) ---
+  // Precompute per-axis LUTs: local brick coord → (chunk index, intra-chunk offset).
+  // Eliminates ~287k string allocations + Map.get calls per 66³ brick.
+  const lutChunkX = new Int32Array(physSize);
+  const lutChunkY = new Int32Array(physSize);
+  const lutChunkZ = new Int32Array(physSize);
+  const lutOffX = new Int32Array(physSize);
+  const lutOffY = new Int32Array(physSize);
+  const lutOffZ = new Int32Array(physSize);
+
+  for (let i = 0; i < physSize; i++) {
+    const gx = Math.max(0, Math.min(actualDimX - 1, Math.round((vStartX + i) * scaleX)));
+    const cxI = Math.floor(gx / csx);
+    lutChunkX[i] = cxI - minCx;
+    lutOffX[i] = gx - cxI * csx;
+
+    const gy = Math.max(0, Math.min(actualDimY - 1, Math.round((vStartY + i) * scaleY)));
+    const cyI = Math.floor(gy / csy);
+    lutChunkY[i] = cyI - minCy;
+    lutOffY[i] = gy - cyI * csy;
+
+    const gz = Math.max(0, Math.min(actualDimZ - 1, Math.round((vStartZ + i) * scaleZ)));
+    const czI = Math.floor(gz / csz);
+    lutChunkZ[i] = czI - minCz;
+    lutOffZ[i] = gz - czI * csz;
+  }
+
   const t1 = performance.now();
   const brick = is16bit
     ? new Uint16Array(physSize * physSize * physSize)
@@ -269,33 +408,29 @@ async function assembleBrick(
   let min = Infinity;
   let max = -Infinity;
   let sum = 0;
+  // Raw-space min/max for float data — used by StreamingManager to derive
+  // the actual data range during base LOD loading.
+  let rawMinVal = Infinity;
+  let rawMaxVal = -Infinity;
 
   for (let lz = 0; lz < physSize; lz++) {
+    const czi = lutChunkZ[lz]!;
+    const lcz = lutOffZ[lz]!;
+    const zBase = czi * ncy * ncx;
+    const brickZBase = lz * physSize * physSize;
+
     for (let ly = 0; ly < physSize; ly++) {
+      const cyi = lutChunkY[ly]!;
+      const lcy = lutOffY[ly]!;
+      const yzBase = zBase + cyi * ncx;
+      const brickYZBase = brickZBase + ly * physSize;
+
       for (let lx = 0; lx < physSize; lx++) {
-        const vx = vStartX + lx;
-        const vy = vStartY + ly;
-        const vz = vStartZ + lz;
-
-        const gx = Math.max(0, Math.min(actualDimX - 1, Math.round(vx * scaleX)));
-        const gy = Math.max(0, Math.min(actualDimY - 1, Math.round(vy * scaleY)));
-        const gz = Math.max(0, Math.min(actualDimZ - 1, Math.round(vz * scaleZ)));
-
-        const cx = Math.floor(gx / csx);
-        const cy = Math.floor(gy / csy);
-        const cz = Math.floor(gz / csz);
-
-        const lcx = gx - cx * csx;
-        const lcy = gy - cy * csy;
-        const lcz = gz - cz * csz;
-
-        const key = cacheKey(lod, cz, cy, cx, channelIndex);
-        const chunk = localChunks.get(key);
-        if (chunk) {
-          const chunkW = chunk.shape[chunk.shape.length - 1]!;
-          const chunkH = chunk.shape[chunk.shape.length - 2]!;
-          const idx = lcz * chunkH * chunkW + lcy * chunkW + lcx;
-          const raw = Number(chunk.data[idx]!);
+        const fi = yzBase + lutChunkX[lx]!;
+        const data = chunkDataArr[fi];
+        if (data) {
+          const idx = lcz * chunkWH[fi]! + lcy * chunkW[fi]! + lutOffX[lx]!;
+          const raw = Number(data[idx]!);
 
           let brickVal: number;
           let statVal: number;
@@ -310,12 +445,17 @@ async function assembleBrick(
             // Store raw float value as float16 bits — shader normalises using floatMin/floatMax uniforms.
             // Clamp to r16float representable range (±65504) before encoding.
             brickVal = float32ToFloat16Bits(Math.max(-65504, Math.min(65504, raw)));
+            // Track raw-space extremes for range derivation
+            if (isFinite(raw)) {
+              if (raw < rawMinVal) rawMinVal = raw;
+              if (raw > rawMaxVal) rawMaxVal = raw;
+            }
           } else {
             brickVal = raw;
             statVal = raw;
           }
 
-          brick[lx + ly * physSize + lz * physSize * physSize] = brickVal;
+          brick[brickYZBase + lx] = brickVal;
           min = Math.min(min, statVal);
           max = Math.max(max, statVal);
           sum += statVal;
@@ -372,7 +512,11 @@ async function assembleBrick(
     min: min === Infinity ? 0 : min,
     max: max === -Infinity ? 0 : max,
     avg: sum / voxelCount,
+    rawMin: isFloat32 && isFinite(rawMinVal) ? rawMinVal : undefined,
+    rawMax: isFloat32 && isFinite(rawMaxVal) ? rawMaxVal : undefined,
     fetchMs,
     assemblyMs,
+    chunkHits,
+    chunkTotal: chunkCount,
   };
 }
