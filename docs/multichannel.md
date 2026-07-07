@@ -43,9 +43,9 @@ A 4-component RGBA colour. The RGB components define the channel's display colou
 Default colours:
 | Channel | Colour |
 |---------|--------|
-| 0 | Blue (0.2, 0.4, 1.0) |
-| 1 | Yellow (1.0, 0.9, 0.2) |
-| 2 | Red (1.0, 0.2, 0.2) |
+| 0 | Blue (0.0, 0.0, 1.0) |
+| 1 | Yellow (1.0, 1.0, 0.0) |
+| 2 | Red (1.0, 0.0, 0.0) |
 | 3 | White (1.0, 1.0, 1.0) |
 
 ### Window / Level
@@ -154,6 +154,6 @@ Channel state encodes each channel as `r,g,b,a,visible,windowMin,windowMax` (0�
 - **Max 4 channels** — GPU uniforms use `vec4f` for per-channel data, limiting to 4 channels. Datasets with more channels will use the first 4.
 - **No transfer function** — Multichannel mode uses additive compositing with direct per-channel colours. The transfer function editor is not available.
 - **No ISO mode** — Isosurface rendering is not supported for multichannel datasets.
-- **VRAM scales with channel count** — Each channel gets its own atlas texture. A 4-channel 16-bit dataset uses ~2.2 GiB of VRAM (4 × ~548 MiB).
+- **VRAM scales with channel count** — Each channel gets its own atlas texture, but the atlas grid shrinks as channels increase to stay within a VRAM budget (e.g. a 4-channel 16-bit dataset uses an ~528³ grid, ~1.2 GiB, instead of the full 660³ ~2.2 GiB).
 - **Increased network load** — Each brick requires one fetch per channel, so a 4-channel dataset issues 4× the network requests of a single-channel dataset.
 - **Kiln binary format** — The sharded binary format is single-channel only. Multichannel requires OME-Zarr.

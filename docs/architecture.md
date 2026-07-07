@@ -27,8 +27,8 @@ Kiln implements a **virtual texturing** system that decouples the logical volume
 │                              GPU Resources                                  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Atlas Texture (3D)         │  Indirection Texture     │  Compute Pipeline  │
-│  - 660³ r8unorm             │  - Grid³ rgba8uint       │  - Ray generation  │
-│  - 10×10×10 = 1000 slots    │  - Per-cell LOD + slot   │  - Brick traversal │
+│  - ≤660³ r16float/r8unorm   │  - Grid³ rgba8uint       │  - Ray generation  │
+│  - ≤10³ slots (budget-fit)  │  - Per-cell LOD + slot   │  - Brick traversal │
 │  - 66³ per slot (w/ border) │  - 255 = empty marker    │  - Compositing     │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -63,9 +63,9 @@ The **indirection table** is a 3D texture (`rgba8uint`) dimensioned to the LOD 0
 
 | Channel | Purpose                                           |
 |---------|---------------------------------------------------|
-| R       | Atlas slot X coordinate (0-7)                     |
-| G       | Atlas slot Y coordinate (0-7)                     |
-| B       | Atlas slot Z coordinate (0-7)                     |
+| R       | Atlas slot X coordinate (0-9 at full grid)        |
+| G       | Atlas slot Y coordinate (0-9 at full grid)        |
+| B       | Atlas slot Z coordinate (0-9 at full grid)        |
 | A       | LOD level + 1 (0=unloaded, 1-4=LOD 0-3, 255=empty)|
 
 When a coarse LOD brick is loaded, it fills **multiple cells** in the indirection table proportional to its coverage. A LOD 2 brick covers a 4×4×4 region in the LOD 0 grid, so 64 cells are updated with the same atlas coordinates. This enables seamless LOD transitions without shader-side LOD selection logic.
@@ -87,12 +87,13 @@ When a finer LOD brick loads, it **overwrites** only its specific cell, leaving 
 
 ### 3. Atlas Texture
 
-The **atlas** is a single 3D texture (`660³`) organized as a 10×10×10 grid of 66³ slots. The texture format depends on the source data:
+The **atlas** is a single 3D texture organized as a grid of 66³ slots. Its size adapts to fit a VRAM budget — up to `660³` (a 10×10×10 grid), shrinking for multichannel datasets (see below). The texture format depends on the source data:
 - **8-bit volumes**: `r8unorm` (1 byte per voxel)
-- **16-bit integer volumes**: `r16unorm` (2 bytes per voxel, requires WebGPU `texture-formats-tier1` feature)
-- **float32 volumes**: `r16float` (2 bytes per voxel) — `filterable-float32-texture` is not universally available, so float32 inputs are repacked to half-precision on ingest
+- **16-bit integer volumes**: `r16float` (2 bytes per voxel) — `uint16` values are converted to half-precision on ingest
+- **float32 volumes**: `r16float` (2 bytes per voxel) — repacked to half-precision on ingest
+- **Fallback**: if `r16float` is unsupported, the atlas drops to `r8unorm` (16→8-bit, quality loss)
 
-> **Note:** Atlas dimensions (660³, 1,000 slots) are fixed at build time in `src/core/config.ts`. They are not configurable via the public `KilnViewer` API.
+> **Note:** The maximum atlas grid (`660³`, 1,000 slots) is defined in `src/core/config.ts`. The actual size is chosen at startup by `computeAtlasGrid()` to fit a VRAM budget — `numChannels × atlasSize³ × bytesPerVoxel` stays under the budget (default ~1.3 GiB, overridable via `ViewerOptions.atlasBudgetBytes`). Single- and dual-channel datasets keep the full `660³`.
 
 ```
 Atlas Layout (660³ total)
@@ -105,13 +106,13 @@ Atlas Layout (660³ total)
    ...           1,000 total slots (10×10×10)          ...
 ```
 
-Each slot stores 66³ voxels. Atlas size:
+Each slot stores 66³ voxels. At the full `660³` grid (1,000 slots):
 - **8-bit**: 287,496 bytes per slot × 1,000 slots = **~274 MiB** VRAM
 - **16-bit**: 574,992 bytes per slot × 1,000 slots = **~548 MiB** VRAM
 
 #### Multichannel Atlas
 
-For multichannel datasets (up to 4 channels), each channel gets its own atlas texture. A 4-channel 16-bit dataset uses 4 × ~548 MiB = ~2.2 GiB of VRAM. The indirection table is shared across all channels — all channels of a given brick use the same atlas slot indices. See [Multichannel](multichannel.md) for details.
+For multichannel datasets (up to 4 channels), each channel gets its own atlas texture, so VRAM scales with channel count. To stay within budget the atlas grid shrinks as channels increase — e.g. a 4-channel 16-bit dataset uses an ~528³ grid (~1.2 GiB total) instead of the full 660³ (~2.2 GiB). The indirection table is shared across all channels — all channels of a given brick use the same atlas slot indices. See [Multichannel](multichannel.md) for details.
 
 The 1-voxel **ghost border** duplicates neighboring brick data to enable hardware trilinear filtering without seams:
 
@@ -168,7 +169,7 @@ const traverse = (bx, by, bz, lod) => {
 };
 ```
 
-**Screen-Space Error (SSE)** measures how many pixels a voxel projects to on screen. When the projected error exceeds a threshold (default: 2.0 pixels), the brick should split to a finer LOD. This approach adapts automatically to:
+**Screen-Space Error (SSE)** measures how many pixels a voxel projects to on screen. When the projected error exceeds a threshold (default: 8.0 pixels), the brick splits to a finer LOD. A hysteresis band (splitting only above the threshold, collapsing only below 0.7× it) prevents LOD oscillation during gestures. This approach adapts automatically to:
 - Screen resolution (higher res = more splits for same view)
 - Field of view (narrower FOV = more detail at same distance)
 - Anisotropic voxel spacing (non-uniform datasets)
@@ -180,7 +181,7 @@ After computing the desired set, the manager:
 1. **Cancels stale requests**: In-flight fetches for bricks no longer in desired set are aborted via `AbortController`
 2. **Touches loaded bricks**: Updates LRU timestamps for bricks that remain desired
 3. **Queues missing bricks**: Sorts by distance, closest first (prioritizes visible regions)
-4. **Rate limits requests**: Maximum 4 concurrent HTTP requests to avoid network saturation
+4. **Rate limits requests**: Caps concurrent requests (8 single-channel, 12 multichannel) to avoid network saturation. Stale requests wait a 200 ms grace period before cancellation so brief LOD oscillation doesn't thrash fetches
 
 ```
 Desired Set: [A, B, C, D, E, F, G, H]  (sorted by distance)
@@ -192,7 +193,7 @@ Actions:
   - Touch A, B (update LRU)
   - Cancel X, Y, Z if in-flight (no longer needed)
   - Keep C in-flight (still desired)
-  - Queue D, E, F, G, H (limited to max 4 concurrent)
+  - Queue D, E, F, G, H (limited to max concurrent: 8 single / 12 multichannel)
 ```
 
 ### LRU Eviction
@@ -222,7 +223,7 @@ allocate(frame: number): AllocationResult {
 }
 ```
 
-**Pinned bricks** (the coarsest LOD) are never evicted, ensuring a complete fallback representation always exists.
+**Pinned bricks** (the coarsest LOD) are never evicted, ensuring a complete fallback representation always exists. Slots touched within the last 30 frames are also protected, so a freshly loaded brick can't be evicted by the next allocation in the same burst (thrash guard).
 
 ---
 
@@ -290,10 +291,10 @@ Kiln supports 8-bit unsigned, 16-bit unsigned, and 32-bit float volumes:
 | Feature | 8-bit | 16-bit integer | float32 |
 |---------|-------|----------------|---------|
 | Source dtype | `uint8` | `uint16` | `float32` |
-| Texture format | `r8unorm` | `r16unorm` | `r16float` |
+| Texture format | `r8unorm` | `r16float` | `r16float` |
 | Bytes per voxel (GPU) | 1 | 2 | 2 |
 | Atlas size | ~274 MiB | ~548 MiB | ~548 MiB |
-| WebGPU feature | (none) | `texture-formats-tier1` | (none) |
+| WebGPU feature | (none) | (none) | (none) |
 
 ### Windowing/Leveling
 
@@ -313,7 +314,7 @@ For example, a CT soft tissue window might use center=0.5, width=0.1 to expand a
 
 ## Memory Budget Analysis
 
-For a 1024³ volume with 4 LOD levels:
+For a 1024 × 512 × 1024 volume with 4 LOD levels:
 
 **8-bit volume:**
 
@@ -339,7 +340,7 @@ For a 1024³ volume with 4 LOD levels:
 
 ### 1. Screen-Space Error LOD Selection
 
-SSE determines when to use finer/coarser LODs based on how many pixels a voxel projects to. This adapts automatically to screen resolution, FOV, and viewing distance. A single threshold (default 2.0 pixels) controls the quality/performance tradeoff across all viewing conditions.
+SSE determines when to use finer/coarser LODs based on how many pixels a voxel projects to. This adapts automatically to screen resolution, FOV, and viewing distance. A single threshold (default 8.0 pixels) controls the quality/performance tradeoff across all viewing conditions.
 
 ### 2. LRU Eviction
 

@@ -154,12 +154,12 @@ Transfer functions are not used in multichannel mode. See [Multichannel](multich
 
 ## Resolution Scaling
 
-The compute shader can render at a reduced resolution to decrease the number of rays cast per frame. A configurable `renderScale` factor (0.25-1.0, default 0.75) multiplies the canvas dimensions to produce a smaller compute output texture. The blit pass then upscales this to the full canvas using bilinear filtering.
+The compute shader can render at a reduced resolution to decrease the number of rays cast per frame. A configurable `renderScale` factor (0.25-1.0, default 0.5) multiplies the canvas dimensions to produce a smaller compute output texture. The blit pass then upscales this to the full canvas using bilinear filtering.
 
 ```
 Canvas: 1920 × 1080
 renderScale: 0.5
-Compute texture: 1440 × 810  (56% fewer pixels)
+Compute texture: 960 × 540  (75% fewer pixels)
 Blit: bilinear upscale back to 1920 × 1080
 ```
 

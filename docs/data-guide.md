@@ -120,12 +120,12 @@ For raw volume files, use the preprocessing script to convert into Kiln's sharde
 ### Quick Start
 
 ```bash
-npx ts-node scripts/decompose-volume.ts <input.raw> <W> <H> <D> [options]
+npx tsx scripts/decompose-volume.ts <input.raw> <W> <H> <D> [options]
 ```
 
 Example:
 ```bash
-npx ts-node scripts/decompose-volume.ts data/chameleon_1024x1024x1080.raw --bits 16
+npx tsx scripts/decompose-volume.ts data/chameleon_1024x1024x1080.raw --bits 16
 ```
 
 ### Input Format
@@ -157,9 +157,9 @@ The script can parse metadata from filenames:
 ### Script Usage
 
 ```bash
-npx ts-node scripts/decompose-volume.ts <input.raw> <output-dir> [options]
+npx tsx scripts/decompose-volume.ts <input.raw> <output-dir> [options]
 # OR with dimensions as positional args:
-npx ts-node scripts/decompose-volume.ts <input.raw> <W> <H> <D> [options]
+npx tsx scripts/decompose-volume.ts <input.raw> <W> <H> <D> [options]
 ```
 
 When dimensions are provided as positional args, the output directory defaults to `public/datasets/<input-name>/`.
@@ -181,21 +181,21 @@ When dimensions are provided as positional args, the output directory defaults t
 
 ```bash
 # Parse dimensions from filename
-npx ts-node scripts/decompose-volume.ts data/chameleon_1024x1024x1080.raw public/datasets/chameleon
+npx tsx scripts/decompose-volume.ts data/chameleon_1024x1024x1080.raw public/datasets/chameleon
 
 # Specify dimensions explicitly
-npx ts-node scripts/decompose-volume.ts data/scan.raw 512 512 256
+npx tsx scripts/decompose-volume.ts data/scan.raw 512 512 256
 
 # 16-bit normalized to 8-bit (smaller output)
-npx ts-node scripts/decompose-volume.ts data/mri.raw 256 256 128 \
+npx tsx scripts/decompose-volume.ts data/mri.raw 256 256 128 \
   --bits 16 --spacing 0.5,0.5,1.0
 
 # 16-bit native (full precision, use windowing in viewer)
-npx ts-node scripts/decompose-volume.ts data/ct_scan.raw 512 512 400 \
+npx tsx scripts/decompose-volume.ts data/ct_scan.raw 512 512 400 \
   --bits 16 --native --output public/datasets/ct_16bit
 
 # Skip 2048-byte header (common in some medical formats)
-npx ts-node scripts/decompose-volume.ts data/dicom.raw 512 512 400 --header 2048
+npx tsx scripts/decompose-volume.ts data/dicom.raw 512 512 400 --header 2048
 ```
 
 ### Important: Coarsest LOD Size
@@ -334,7 +334,7 @@ Converting the Stag Beetle dataset:
 curl -O https://example.com/stagbeetle_832x832x494_uint16.raw
 
 # Convert to streaming format
-npx ts-node scripts/decompose-volume.ts \
+npx tsx scripts/decompose-volume.ts \
   stagbeetle_832x832x494_uint16.raw \
   public/datasets/stagbeetle \
   --bits 16
@@ -350,7 +350,7 @@ aws s3 sync public/datasets/stagbeetle s3://my-bucket/datasets/stagbeetle
 Specify dimensions explicitly:
 
 ```bash
-npx ts-node scripts/decompose-volume.ts data.raw 512 512 256
+npx tsx scripts/decompose-volume.ts data.raw 512 512 256
 ```
 
 ### Large volumes run out of memory

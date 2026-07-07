@@ -8,16 +8,15 @@ See also: [Architecture](architecture.md) | [Rendering Pipeline](rendering.md) |
 
 Kiln is built on WebGPU rather than WebGL. This section documents the technical differences relevant to volume rendering.
 
-### Native 16-bit Texture Support
+### 16-bit and Float Texture Support
 
-WebGPU provides native `r16unorm` texture format, where 16-bit unsigned integers are stored directly and normalized to `[0,1]` floats during sampling. Hardware trilinear filtering works correctly on the 16-bit values.
+WebGPU's `r16float` format stores half-precision floats with hardware trilinear filtering, and is a core feature (no extension required). Kiln stores all 16-bit and float data in `r16float`: `uint16` values are converted to half-precision and `float32` inputs are repacked to half-precision on ingest.
 
-**Fallback chain**: Kiln detects format support at runtime and falls back if needed:
-- **r16unorm** (preferred) — native 16-bit normalized integers
-- **r16float** (fallback) — 16-bit floats if unorm unsupported
+**Fallback chain**: Kiln detects format support at runtime:
+- **r16float** (preferred) — half-precision, filterable, core WebGPU
 - **r8unorm** (last resort) — workers downsample 16→8 bit via high-byte extraction (`>> 8`)
 
-The r8unorm fallback triggers a console warning and shows `(⚠️ downsampled)` in the UI. Users can enable experimental WebGPU features (Chrome: `chrome://flags/#enable-unsafe-webgpu`) for full 16-bit support.
+The r8unorm fallback triggers a console warning and shows `(⚠️ downsampled)` in the UI.
 
 WebGL lacks native 16-bit single-channel textures. Common workarounds include:
 - **Two-channel packing**: Store high/low bytes in separate channels, reconstruct in shader
@@ -68,7 +67,7 @@ WebGL 2 supports integer textures but with more limited format options and requi
 
 | Capability | WebGL 2 | WebGPU |
 |------------|---------|--------|
-| 16-bit textures | Emulated | Native `r16unorm` |
+| 16-bit / float textures | Emulated | Native `r16float` |
 | 3D texture limit | Typically 2048³ | Up to 16384³ |
 | Compute shaders | No | Yes (pipeline flexibility, future headroom) |
 | Texture uploads | Synchronous | Asynchronous queue |
