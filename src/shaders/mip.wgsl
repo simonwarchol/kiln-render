@@ -11,14 +11,26 @@ fn rayMarchMIP(
     let windowCenter = uniforms.windowCenter;
     let windowWidth = uniforms.windowWidth;
 
-    // precompute per-channel windowing constants (multichannel path)
+    // precompute per-channel windowing constants, a local copy of the channel
+    // colors, and a compacted list of visible channels (alpha > 0) — hidden
+    // channels then cost nothing in the per-sample loop below instead of a
+    // dynamically-indexed uniform read + branch per channel per sample.
     var chLower: array<f32, 4>;
     var chInvWidth: array<f32, 4>;
+    var chColorLocal: array<vec4f, 4>;
+    var visibleCh: array<u32, 4>;
+    var numVisible = 0u;
     if (numCh > 1u) {
         for (var ch = 0u; ch < numCh; ch++) {
             let ww = max(uniforms.channelWindowWidth[ch], 0.0001);
             chLower[ch] = uniforms.channelWindowCenter[ch] - ww * 0.5;
             chInvWidth[ch] = 1.0 / ww;
+            let c = uniforms.channelColors[ch];
+            chColorLocal[ch] = c;
+            if (c.a > 0.0) {
+                visibleCh[numVisible] = ch;
+                numVisible++;
+            }
         }
     }
 
@@ -26,7 +38,11 @@ fn rayMarchMIP(
     let floatInvRange = 1.0 / max(uniforms.floatMax - uniforms.floatMin, 0.0001);
 
     // compute jitter fraction once for the whole ray
-    let jitterFrac = select(0.0, rand(rayToSeed(rayDir) + uniforms.frameIndex), uniforms.jitter != 0u);
+    // select() is not short-circuiting in WGSL — rand() would run even with jitter off.
+    var jitterFrac = 0.0;
+    if (uniforms.jitter != 0u) {
+        jitterFrac = rand(rayToSeed(rayDir) + uniforms.frameIndex);
+    }
 
     // Single-channel: scalar max. Multi-channel: per-channel max densities.
     var maxDensity = 0.0;
@@ -59,9 +75,8 @@ fn rayMarchMIP(
             let voxel = normalizedToVoxel(pos, normalizedSize, datasetSize);
 
             if (numCh > 1u) {
-                for (var ch = 0u; ch < numCh; ch++) {
-                    let chColor = uniforms.channelColors[ch];
-                    if (chColor.a <= 0.0) { continue; }
+                for (var vi = 0u; vi < numVisible; vi++) {
+                    let ch = visibleCh[vi];
                     let raw = sampleAtlasChAffine(ch, voxel, brick.atlasOffset, brick.atlasScale);
                     let norm = clamp((raw - uniforms.floatMin) * floatInvRange, 0.0, 1.0);
                     let density = clamp((norm - chLower[ch]) * chInvWidth[ch], 0.0, 1.0);
@@ -84,9 +99,9 @@ fn rayMarchMIP(
         // Composite per-channel max densities with channel colors
         var rgb = vec3f(0.0);
         var peak = 0.0;
-        for (var ch = 0u; ch < numCh; ch++) {
-            let chColor = uniforms.channelColors[ch];
-            if (chColor.a <= 0.0) { continue; }
+        for (var vi = 0u; vi < numVisible; vi++) {
+            let ch = visibleCh[vi];
+            let chColor = chColorLocal[ch];
             rgb += chMaxDensity[ch] * chColor.rgb * chColor.a;
             peak = max(peak, chMaxDensity[ch]);
         }

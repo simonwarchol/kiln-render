@@ -2,13 +2,11 @@
 
 Why Kiln uses WebGPU, how it compares to WebGL for volume rendering, and future GPU optimization opportunities.
 
-See also: [Architecture](architecture.md) | [Rendering Pipeline](rendering.md) | [Data Guide](data-guide.md)
-
-## WebGPU vs WebGL for Volume Rendering
+## WebGPU vs WebGL for volume rendering
 
 Kiln is built on WebGPU rather than WebGL. This section documents the technical differences relevant to volume rendering.
 
-### 16-bit and Float Texture Support
+### 16-bit and float texture support
 
 WebGPU's `r16float` format stores half-precision floats with hardware trilinear filtering, and is a core feature (no extension required). Kiln stores all 16-bit and float data in `r16float`: `uint16` values are converted to half-precision and `float32` inputs are repacked to half-precision on ingest.
 
@@ -25,7 +23,7 @@ WebGL lacks native 16-bit single-channel textures. Common workarounds include:
 
 Each workaround adds shader complexity and may affect filtering behavior at brick boundaries.
 
-### Compute Shaders
+### Compute shaders
 
 WebGPU compute shaders enable per-pixel raymarching with explicit thread dispatch:
 
@@ -45,19 +43,19 @@ WebGL requires rendering a full-screen quad and performing raymarching in a frag
 
 Kiln does not yet leverage compute-specific features like shared memory, subgroup operations, or indirect dispatch. The compute choice is an architectural investment in future headroom rather than a current necessity.
 
-### Asynchronous Texture Updates
+### Asynchronous texture updates
 
 WebGPU's `device.queue.writeTexture()` queues texture uploads without blocking the CPU or stalling rendering. Multiple brick uploads can be batched and executed asynchronously.
 
 WebGL's `texSubImage3D()` is synchronous on the CPU timeline. While the GPU may process it asynchronously, the CPU call blocks until the data is transferred to GPU-accessible memory. This can cause frame drops during intensive streaming.
 
-### 3D Texture Limits
+### 3D texture limits
 
 WebGPU allows querying actual device limits via `device.limits.maxTextureDimension3D`. Modern GPUs commonly support 16384³, though this varies by hardware.
 
 WebGL 2 specifies a minimum of 256³ for 3D textures, with most implementations supporting 2048³. Larger atlases may require multiple textures or texture arrays.
 
-### Integer Texture Formats
+### Integer texture formats
 
 The indirection table uses `rgba8uint` format to store slot indices and LOD levels as exact integers. WebGPU provides `textureLoad()` for non-interpolated integer sampling.
 

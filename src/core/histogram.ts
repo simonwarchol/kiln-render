@@ -3,7 +3,7 @@
  */
 
 import type { BitDepth } from '../data/data-provider.js';
-import { float16BitsToFloat32 } from '../utils/float16.js';
+import { getFloat16ToFloat32Lut } from '../utils/float16.js';
 
 /**
  * Compute a histogram from volume data arrays. Handles uint8/uint16 directly,
@@ -23,11 +23,13 @@ export function computeHistogram(
   // uint16 source stored as r16float: float16 bits encode [0,1], decode directly
   const isUint16AsFloat16 = !isFloat32 && bitDepth === 16 && targetFormat === 'r16float';
 
+  const f16ToF32 = bitDepth === 16 && (isFloat32 || isUint16AsFloat16) ? getFloat16ToFloat32Lut() : null;
+
   for (const data of dataArrays) {
-    if (bitDepth === 16 && (isFloat32 || isUint16AsFloat16)) {
+    if (f16ToF32) {
       // Decode float16 bit-patterns; for isFloat32 apply floatMin/floatMax range.
       for (let i = 0; i < data.length; i++) {
-        const rawFloat = float16BitsToFloat32(data[i]!);
+        const rawFloat = f16ToF32[data[i]!]!;
         if (!isFinite(rawFloat)) continue;
         const normalized = isFloat32 && floatRange > 0
           ? Math.max(0, Math.min(1, (rawFloat - floatMin) / floatRange))

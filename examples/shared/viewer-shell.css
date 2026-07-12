@@ -1,0 +1,461 @@
+/**
+ * Shared chrome CSS for the example viewers — top bar, status strip, toast,
+ * spinner, and the dataset dialog. Extracted from the near-identical
+ * <style> blocks that used to live in each viewer's index.html, then
+ * restyled per docs/audits/kiln-render — Interface Audit & Redesign Plan.md
+ * (Phase 2: tokens + chrome consolidation; Phase 3 removed Tweakpane
+ * entirely, so these tokens are now the only theme system in the examples).
+ */
+
+:root {
+  --bg-canvas: #1a1a1c;
+  --bg-panel: rgba(35, 35, 38, 0.92);
+  --stroke: #3a3a3e;
+  --text: #e8e6e3;
+  --text-dim: #8a8a90;
+  --ember: #ff7a2f;
+  --ember-dim: #b35a2a;
+  --radius: 6px;
+  --radius-lg: 8px;
+  --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', monospace;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background-color: var(--bg-canvas);
+}
+
+canvas {
+  width: 100vw;
+  height: 100vh;
+  display: block;
+}
+
+#error {
+  color: #ff6b6b;
+  background: #2a2a2a;
+  padding: 20px;
+  border-radius: 8px;
+  max-width: 500px;
+  display: none;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+/* --- Focus ring: the one interactive-state signal besides --ember fills --- */
+button:focus-visible,
+input:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--ember);
+  outline-offset: 2px;
+}
+
+/* --- Top bar: wordmark, dataset name, load button (left) — share/GitHub (right) --- */
+.top-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 36px;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  background: var(--bg-panel);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--stroke);
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.top-bar-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wordmark {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.wordmark:hover {
+  color: var(--ember);
+}
+
+.wordmark sup {
+  color: var(--ember-dim);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.dataset-name {
+  color: var(--text-dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* --- Status strip: streaming state (left) — dataset dims/format (right) --- */
+.status-strip {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-left: 10px;
+  padding-right: 10px;
+  background: var(--bg-panel);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid var(--stroke);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+
+.status-strip-left,
+.status-strip-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--stroke);
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.status-dot.active {
+  background: var(--ember);
+  animation: status-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* --- Toolbar buttons (top-bar / debug-panel triggers) --- */
+.toolbar-btn {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background 0.15s, color 0.15s;
+}
+
+.toolbar-btn:hover {
+  background: rgba(187, 188, 196, 0.08);
+  color: var(--text);
+}
+
+.toolbar-btn svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.toolbar-btn.copied {
+  background: var(--ember);
+  color: #fff;
+}
+
+.load-dataset-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--radius);
+  background: rgba(187, 188, 196, 0.08);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+
+.load-dataset-btn:hover {
+  background: rgba(187, 188, 196, 0.15);
+  color: var(--text);
+}
+
+.load-dataset-btn svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+
+.toast {
+  position: fixed;
+  top: 44px;
+  right: 8px;
+  background: var(--ember);
+  color: #fff;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: var(--radius);
+  z-index: 1001;
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+}
+
+.toast.visible {
+  opacity: 1;
+}
+
+/* Pre-first-render only — ongoing streaming activity lives in the status strip. */
+#spinner {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  z-index: 1001;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#spinner::before {
+  content: '';
+  width: 24px;
+  height: 24px;
+  border: 3px solid rgba(187, 188, 196, 0.15);
+  border-top-color: var(--ember);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+#spinner.active {
+  opacity: 1;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* --- Dataset dialog: one surface, hairline-divided rows, no nested boxes (V-5) --- */
+#dataset-dialog {
+  border: none;
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  backdrop-filter: blur(8px);
+  color: var(--text);
+  font-family: system-ui, -apple-system, sans-serif;
+  padding: 0;
+  max-width: 460px;
+  width: 90vw;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+#dataset-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+}
+
+.dialog-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--stroke);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.dialog-header h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
+.dialog-content {
+  display: flex;
+  flex-direction: column;
+}
+
+.load-option {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--stroke);
+}
+
+.load-option-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.load-option-title svg {
+  width: 14px;
+  height: 14px;
+  fill: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.load-option-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+  line-height: 1.4;
+}
+
+.load-btn {
+  width: 100%;
+  padding: 8px 16px;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--ember);
+  color: #fff;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.load-btn:hover:not(:disabled) {
+  background: var(--ember-dim);
+}
+
+.load-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.remote-input-group {
+  display: flex;
+  gap: 8px;
+}
+
+.remote-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.remote-input:focus {
+  outline: none;
+  border-color: var(--ember);
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.dialog-error {
+  display: none;
+  margin: 0 20px 16px;
+  padding: 12px 16px;
+  background: rgba(200, 80, 60, 0.12);
+  border: 1px solid rgba(200, 80, 60, 0.35);
+  border-radius: var(--radius);
+  color: #ff8a7a;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.dialog-error strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.dialog-error ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.dialog-footer {
+  padding: 12px 20px;
+  border-top: 1px solid var(--stroke);
+  display: flex;
+  justify-content: flex-end;
+}
+
+.dialog-docs-link {
+  font-size: 12px;
+  color: var(--text-dim);
+  text-decoration: none;
+}
+
+.dialog-docs-link:hover {
+  color: var(--text);
+}
+
+.cancel-btn {
+  padding: 8px 16px;
+  border: none;
+  border-radius: var(--radius);
+  background: rgba(187, 188, 196, 0.1);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.cancel-btn:hover {
+  background: rgba(187, 188, 196, 0.15);
+  color: var(--text);
+}

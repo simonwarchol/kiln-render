@@ -1,11 +1,16 @@
 /**
- * ZarrWorkerPool - Round-robin pool of Web Workers for parallel brick loading.
- * Each worker runs fetch + decompress + assemble; main thread only uploads to GPU.
+ * ZarrWorkerPool - Pool of Web Workers for parallel brick loading. Each worker
+ * runs fetch + decompress + assemble; main thread only uploads to GPU.
+ * Worker selection uses spatial-hash routing (see workerIndexFor) so a
+ * brick's chunks land on the same worker's cache, falling back to
+ * round-robin when per-LOD params aren't available — see
+ * docs/audits/kiln-render - fetch_patterns.md (P2).
  */
 
 import type { ZarrWorkerRequest, ZarrWorkerResponse } from './zarr-chunk-worker.js';
 import type { PipelineTimings } from './data-provider.js';
 import { RollingAvg } from './network-tracker.js';
+import { isFlagEnabled } from '../core/feature-flags.js';
 import ZarrChunkWorkerInline from './zarr-chunk-worker.ts?worker&inline';
 
 /** Dev: URL worker for Vite imports. Prod: pre-bundled inline worker. */
@@ -27,6 +32,10 @@ export interface BrickResult {
   rawMin?: number;
   /** Raw-space max (float datasets only) */
   rawMax?: number;
+  /** Real network bytes fetched for this brick's chunks (delta since this worker's previous response). */
+  chunkBytesFetched?: number;
+  /** Real HTTP requests issued for this brick's chunks (delta since this worker's previous response). */
+  chunkRequestsIssued?: number;
 }
 
 interface PendingRequest {
@@ -45,6 +54,14 @@ export class ZarrWorkerPool {
   private assemblyAvg = new RollingAvg();
   private chunkHitTotal = 0;
   private chunkReqTotal = 0;
+
+  /** Per-worker last-seen cumulative store bytes/requests, for delta computation. */
+  private workerLastBytes: number[] = [];
+  private workerLastRequests: number[] = [];
+
+  /** Stored from init() for spatial worker routing (see workerIndexFor). */
+  private lodParams: ZarrWorkerRequest['lodParams'] = [];
+  private logicalBrickSize = 64;
 
   /** Maps request ID → worker index, for routing cancel messages */
   private requestToWorker = new Map<number, number>();
@@ -73,13 +90,17 @@ export class ZarrWorkerPool {
     floatRange?: [number, number],
   ): Promise<void> {
     this.is16bit = is16bit;
+    this.lodParams = lodParams;
+    this.logicalBrickSize = logicalBrickSize;
     const initPromises: Promise<void>[] = [];
 
     for (let i = 0; i < this.poolSize; i++) {
       const worker = createWorker();
+      this.workerLastBytes[i] = 0;
+      this.workerLastRequests[i] = 0;
 
       worker.onmessage = (event: MessageEvent<ZarrWorkerResponse>) => {
-        const { type: msgType, id, error, data, min, max, avg, rawMin, rawMax, fetchMs, assemblyMs, queueMs, chunkHits, chunkTotal } = event.data;
+        const { type: msgType, id, error, data, min, max, avg, rawMin, rawMax, fetchMs, assemblyMs, queueMs, chunkHits, chunkTotal, chunkStoreBytes, chunkStoreRequests } = event.data;
         const pending = this.pendingRequests.get(id);
         if (!pending) return;
         this.pendingRequests.delete(id);
@@ -106,6 +127,17 @@ export class ZarrWorkerPool {
             this.chunkHitTotal += chunkHits;
             this.chunkReqTotal += chunkTotal;
           }
+          // Diff against this worker's last-seen cumulative store totals —
+          // the store counter is monotonic, so this is exact even if two
+          // loadBrick calls overlap on the same worker.
+          let chunkBytesFetched: number | undefined;
+          let chunkRequestsIssued: number | undefined;
+          if (chunkStoreBytes !== undefined && chunkStoreRequests !== undefined) {
+            chunkBytesFetched = Math.max(0, chunkStoreBytes - (this.workerLastBytes[i] ?? 0));
+            chunkRequestsIssued = Math.max(0, chunkStoreRequests - (this.workerLastRequests[i] ?? 0));
+            this.workerLastBytes[i] = chunkStoreBytes;
+            this.workerLastRequests[i] = chunkStoreRequests;
+          }
           const typedData = this.is16bit
             ? new Uint16Array(data)
             : new Uint8Array(data);
@@ -116,6 +148,8 @@ export class ZarrWorkerPool {
             avg: avg ?? 0,
             rawMin,
             rawMax,
+            chunkBytesFetched,
+            chunkRequestsIssued,
           } as BrickResult);
         } else {
           pending.reject(new Error('Empty brick response'));
@@ -141,6 +175,10 @@ export class ZarrWorkerPool {
           isFloat32: isFloat32 ?? false,
           floatMin: floatRange?.[0],
           floatMax: floatRange?.[1],
+          // ?p3=1 / ?p4=1 — read here (main thread), forwarded since a worker
+          // can't read the page URL itself. See docs/audits/kiln-render - fetch_patterns.md.
+          dynamicCacheBudget: isFlagEnabled('p3'),
+          refcountedAborts: isFlagEnabled('p4'),
         };
         worker.postMessage(req);
       });
@@ -175,18 +213,47 @@ export class ZarrWorkerPool {
     await Promise.all(promises);
   }
 
-  /** Load a 66³ brick in a round-robin worker. Supports AbortSignal cancellation. */
+  /**
+   * Deterministic worker index for a brick's spatial footprint (independent of
+   * channel), so all channels of one brick — and neighboring bricks sharing
+   * the same Zarr chunks — land on the same worker's cache. Falls back to -1
+   * (round-robin) if lodParams weren't provided at init time.
+   *
+   * minChunk mirrors the chunk-range math in zarr-chunk-worker.ts's
+   * assembleBrick (aStartX/minCx) so the routing key matches what the worker
+   * will actually fetch.
+   */
+  private workerIndexFor(lod: number, bx: number, by: number, bz: number): number {
+    const params = this.lodParams?.[lod];
+    if (!params || this.workers.length === 0) return -1;
+    const { scaleX, scaleY, scaleZ, csx, csy, csz } = params;
+    const minChunk = (b: number, scale: number, cs: number): number =>
+      Math.floor(Math.max(0, Math.floor(Math.max(0, b * this.logicalBrickSize - 1) * scale)) / cs);
+    const cx = minChunk(bx, scaleX, csx);
+    const cy = minChunk(by, scaleY, csy);
+    const cz = minChunk(bz, scaleZ, csz);
+    let h = (cx * 73856093) ^ (cy * 19349663) ^ (cz * 83492791) ^ ((lod + 1) * 2654435761);
+    h = ((h ^ (h >>> 13)) * 0x5bd1e995) >>> 0;
+    return h % this.workers.length;
+  }
+
+  /** Load a 66³ brick, routed to a worker by spatial footprint. Supports AbortSignal cancellation. */
   loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex = 0, signal?: AbortSignal): Promise<BrickResult> {
     return new Promise((resolve, reject) => {
       const id = this.requestId++;
-      const workerIdx = this.nextWorkerIndex;
-      this.nextWorkerIndex = (this.nextWorkerIndex + 1) % this.workers.length;
+      let workerIdx = this.workerIndexFor(lod, bx, by, bz);
+      if (workerIdx < 0) {
+        workerIdx = this.nextWorkerIndex;
+        this.nextWorkerIndex = (this.nextWorkerIndex + 1) % this.workers.length;
+      }
       const worker = this.workers[workerIdx]!;
 
       this.pendingRequests.set(id, { resolve, reject });
       this.requestToWorker.set(id, workerIdx);
 
-      const req: ZarrWorkerRequest = { type: 'loadBrick', id, lod, bx, by, bz, channelIndex, dispatchTime: performance.now() };
+      // Date.now(), not performance.now() — the worker diffs this against its
+      // own clock, and only Date.now() shares an epoch across the worker boundary.
+      const req: ZarrWorkerRequest = { type: 'loadBrick', id, lod, bx, by, bz, channelIndex, dispatchTime: Date.now() };
       worker.postMessage(req);
 
       if (signal) {

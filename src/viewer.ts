@@ -21,6 +21,8 @@ export interface ViewerOptions {
   windowCenter?: number;
   /** 16-bit window width (0–1) */
   windowWidth?: number;
+  /** DVR density / opacity scale (0.1–10, default 1) */
+  densityScale?: number;
   /** Isosurface threshold (0–1) */
   isoValue?: number;
   /** Render resolution scale (0.25–1) */
@@ -64,6 +66,7 @@ export interface ViewerState {
   mode: VolumeRenderMode;
   windowCenter: number;
   windowWidth: number;
+  densityScale: number;
   isoValue: number;
   /** User-intended render scale (not the 0.25 interaction override) */
   renderScale: number;
@@ -287,6 +290,10 @@ export class KilnViewer {
       renderer.windowWidth = options.windowWidth;
       renderer.resetAccumulation();
     }
+    if (options.densityScale !== undefined) {
+      renderer.densityScale = options.densityScale;
+      renderer.resetAccumulation();
+    }
     if (options.isoValue !== undefined) {
       renderer.isoValue = options.isoValue;
       renderer.resetAccumulation();
@@ -439,6 +446,7 @@ export class KilnViewer {
       mode: this.renderer.volumeRenderMode,
       windowCenter: this.renderer.windowCenter,
       windowWidth: this.renderer.windowWidth,
+      densityScale: this.renderer.densityScale,
       isoValue: this.renderer.isoValue,
       renderScale: this.userRenderScale,
       tfPreset: this.transferFunction.preset,
@@ -506,10 +514,10 @@ export class KilnViewer {
     }
 
     // Always run streaming (may trigger onDirty via resetAccumulation)
-    const streamingActive = this.streamingManager.update(this.camera, this.canvas);
+    this.streamingManager.update(this.camera, this.canvas);
 
     // Determine if we need to render
-    const needsRender = this.dirty || interacting || streamingActive || !this.renderer.isConverged;
+    const needsRender = this.dirty || interacting || !this.renderer.isConverged;
 
     if (needsRender) {
       this.dirty = false;

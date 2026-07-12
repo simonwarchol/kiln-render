@@ -9,7 +9,8 @@ import blosc from 'numcodecs/blosc';
 import lz4 from 'numcodecs/lz4';
 import zstd from 'numcodecs/zstd';
 import { TolerantFetchStore } from './tolerant-fetch-store.js';
-import { uint16ToFloat16, float32ToFloat16Bits } from '../utils/float16.js';
+import { float32ToFloat16Bits, getUint16ToFloat16Lut } from '../utils/float16.js';
+import { SharedFetchRegistry } from './shared-fetch.js';
 
 // Static codec imports — zarrita's dynamic imports fail in Vite dev workers.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -44,13 +45,34 @@ export interface ZarrWorkerRequest {
   }[];
   /** Channel index to load (for datasets with a channel axis) */
   channelIndex?: number;
-  /** Main-thread timestamp (performance.now) when request was dispatched — for queue wait measurement */
+  /**
+   * Main-thread timestamp (Date.now — NOT performance.now, which has a
+   * per-context time origin and can't be diffed across the worker boundary)
+   * when request was dispatched, for queue wait measurement.
+   */
   dispatchTime?: number;
   is16bit?: boolean;
   /** Target texture format: r8unorm (8-bit), r16unorm (16-bit uint), r16float (16-bit float) */
   targetFormat?: 'r8unorm' | 'r16unorm' | 'r16float';
   /** Whether source data is float32/float64 */
   isFloat32?: boolean;
+  /**
+   * Feature flag ?p3=1 (read on the main thread, forwarded here — a worker
+   * can't read the page URL itself). OFF → fixed 32MB cache (control). ON →
+   * budget scales with the largest chunk seen. See docs/audits/kiln-render -
+   * fetch_patterns.md and src/core/feature-flags.ts.
+   */
+  dynamicCacheBudget?: boolean;
+  /**
+   * Feature flag ?p4=1. OFF → the original in-flight dedup (control): a
+   * shared fetch runs under the FIRST caller's signal, so cancelling that
+   * caller kills the fetch for every other caller sharing it, and survivors
+   * retry without re-registering (up to N duplicate requests — bug B4). ON →
+   * refcounted dedup (fetchChunkShared): the shared fetch runs under its own
+   * AbortController, only aborted once every caller has released. See
+   * docs/audits/kiln-render - fetch_patterns.md and src/core/feature-flags.ts.
+   */
+  refcountedAborts?: boolean;
   /** Float normalisation range — voxel values are mapped from [floatMin, floatMax] → [0, 65535] */
   floatMin?: number;
   floatMax?: number;
@@ -78,6 +100,13 @@ export interface ZarrWorkerResponse {
   /** Chunk-cache hit ratio for this brick (hits / total chunks needed) */
   chunkHits?: number;
   chunkTotal?: number;
+  /**
+   * Cumulative real network bytes/requests fetched by this worker's store so
+   * far (never reset) — the pool diffs consecutive values per worker to get
+   * an exact delta without needing a shared/reset-able counter.
+   */
+  chunkStoreBytes?: number;
+  chunkStoreRequests?: number;
 }
 
 // Worker state
@@ -90,15 +119,51 @@ let targetFormat: 'r8unorm' | 'r16unorm' | 'r16float' = 'r16unorm';
 let isFloat32 = false;
 let floatMin = 0;
 let floatMax = 1;
+let dynamicCacheBudget = false; // ?p3=1
+let refcountedAborts = false; // ?p4=1
 
 // Per-worker chunk cache (LRU, bounded by byte count to prevent OOM)
 const chunkCache = new Map<string, { data: ArrayLike<number>; shape: number[]; bytes: number }>();
 let cacheBytes = 0;
-const MAX_CACHE_BYTES = 32 * 1024 * 1024; // 32 MB per worker
+let largestChunkBytes = 0;
+const FIXED_CACHE_BYTES = 32 * 1024 * 1024; // 32 MB per worker — the ?p3=1 control value
+const MIN_DYNAMIC_CACHE_BYTES = 64 * 1024 * 1024;
+const MAX_DYNAMIC_CACHE_BYTES = 256 * 1024 * 1024;
+
+/** Cache budget for this worker: fixed (control), or scaled to the largest chunk seen (?p3=1). */
+function cacheBudgetBytes(): number {
+  if (!dynamicCacheBudget) return FIXED_CACHE_BYTES;
+  return Math.min(MAX_DYNAMIC_CACHE_BYTES, Math.max(MIN_DYNAMIC_CACHE_BYTES, 8 * largestChunkBytes));
+}
 
 // In-flight chunk fetch promises — coalesces concurrent requests for the same chunk
-// so multiple assembleBrick calls that need the same chunk share one fetch+decompress
+// so multiple assembleBrick calls that need the same chunk share one fetch+decompress.
+// Used only when refcountedAborts (?p4=1) is OFF — see fetchChunkShared/sharedFetches
+// for the ON path. Kept as a separate map (rather than reusing one for both) so the
+// control path is byte-for-byte unchanged regardless of the flag.
 const inflightFetches = new Map<string, Promise<{ data: ArrayLike<number>; shape: number[] }>>();
+
+// ?p4=1 only — see fetchChunkShared / SharedFetchRegistry (shared-fetch.ts)
+// for the concurrency/abort semantics this fixes (bug B4).
+const sharedFetches = new SharedFetchRegistry<{ data: ArrayLike<number>; shape: number[] }>();
+
+/** Refcounted chunk fetch (?p4=1) — the zarr-specific fetch + cache wrapper around SharedFetchRegistry. */
+function fetchChunkShared(
+  arr: ZarrArray<DataType, Readable>,
+  coords: number[],
+  key: string,
+  signal?: AbortSignal,
+): Promise<{ data: ArrayLike<number>; shape: number[] }> {
+  return sharedFetches.run(
+    key,
+    (fetchSignal) => arr.getChunk(coords, { signal: fetchSignal } as RequestInit).then(chunk => {
+      const result = { data: chunk.data as unknown as ArrayLike<number>, shape: chunk.shape };
+      cacheSet(key, result.data, result.shape);
+      return result;
+    }),
+    signal,
+  );
+}
 
 // Store reference
 let workerStore: TolerantFetchStore | null = null;
@@ -121,11 +186,13 @@ function estimateBytes(data: ArrayLike<number>): number {
 
 function cacheSet(key: string, data: ArrayLike<number>, shape: number[]): void {
   const bytes = estimateBytes(data);
+  if (bytes > largestChunkBytes) largestChunkBytes = bytes;
   if (chunkCache.has(key)) {
     cacheBytes -= chunkCache.get(key)!.bytes;
     chunkCache.delete(key);
   }
-  while (cacheBytes + bytes > MAX_CACHE_BYTES && chunkCache.size > 0) {
+  const budget = cacheBudgetBytes();
+  while (cacheBytes + bytes > budget && chunkCache.size > 0) {
     const oldest = chunkCache.keys().next().value!;
     cacheBytes -= chunkCache.get(oldest)!.bytes;
     chunkCache.delete(oldest);
@@ -172,6 +239,8 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
         is16bit = event.data.is16bit ?? false;
         targetFormat = event.data.targetFormat ?? 'r16unorm';
         isFloat32 = event.data.isFloat32 ?? false;
+        dynamicCacheBudget = event.data.dynamicCacheBudget ?? false;
+        refcountedAborts = event.data.refcountedAborts ?? false;
         floatMin = event.data.floatMin ?? 0;
         floatMax = event.data.floatMax ?? 1;
         if (isFloat32) {
@@ -203,7 +272,9 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
   if (type === 'loadBrick') {
     const { lod, bx, by, bz, dispatchTime } = event.data;
     const channelIndex = event.data.channelIndex ?? 0;
-    const queueMs = dispatchTime !== undefined ? performance.now() - dispatchTime : undefined;
+    // dispatchTime is Date.now() from the main thread — Date.now() shares the
+    // same epoch across contexts, unlike performance.now() (per-context origin).
+    const queueMs = dispatchTime !== undefined ? Date.now() - dispatchTime : undefined;
 
     // Already cancelled before we started? Skip entirely.
     if (cancelledRequests.has(id)) {
@@ -236,6 +307,8 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
           queueMs,
           chunkHits: result.chunkHits,
           chunkTotal: result.chunkTotal,
+          chunkStoreBytes: workerStore?.bytesFetched,
+          chunkStoreRequests: workerStore?.requestCount,
         };
         (self as unknown as Worker).postMessage(resp, [result.buffer]);
       } catch (e) {
@@ -321,43 +394,54 @@ async function assembleBrick(
           setChunkEntry(fi, cached.data, cached.shape);
           chunkHits++;
         } else {
-          // In-flight dedup: if another assembleBrick is already fetching this
-          // chunk, share its promise instead of issuing a duplicate HTTP request
-          let chunkPromise = inflightFetches.get(key);
           const prefix = new Array(shapePrefixLength).fill(0);
           if (channelAxisIdx >= 0 && channelAxisIdx < shapePrefixLength) {
             prefix[channelAxisIdx] = channelIndex;
           }
           const coords = [...prefix, cz, cy, cx];
-          if (!chunkPromise) {
-            chunkPromise = arr.getChunk(coords, { signal } as RequestInit).then(chunk => {
-              const entry = { data: chunk.data as unknown as ArrayLike<number>, shape: chunk.shape };
-              cacheSet(key, entry.data, entry.shape);
-              return entry;
-            }).finally(() => {
-              inflightFetches.delete(key);
-            });
-            inflightFetches.set(key, chunkPromise);
-          }
-          fetchPromises.push(chunkPromise.then(entry => {
-            setChunkEntry(fi, entry.data, entry.shape);
-          }).catch(e => {
-            // Dedup conflict: the shared fetch was aborted by another brick's
-            // signal, but this brick is still active. Retry with our own signal.
-            if (e instanceof DOMException && e.name === 'AbortError' && !signal?.aborted) {
-              const cached = chunkCache.get(key);
-              if (cached) {
-                setChunkEntry(fi, cached.data, cached.shape);
-                return;
-              }
-              return arr.getChunk(coords, { signal } as RequestInit).then(chunk => {
+
+          if (refcountedAborts) {
+            // ?p4=1 — see fetchChunkShared.
+            fetchPromises.push(
+              fetchChunkShared(arr, coords, key, signal).then(entry => {
+                setChunkEntry(fi, entry.data, entry.shape);
+              }),
+            );
+          } else {
+            // Control (?p4 off) — original in-flight dedup, unchanged. If
+            // another assembleBrick is already fetching this chunk, share its
+            // promise instead of issuing a duplicate HTTP request.
+            let chunkPromise = inflightFetches.get(key);
+            if (!chunkPromise) {
+              chunkPromise = arr.getChunk(coords, { signal } as RequestInit).then(chunk => {
                 const entry = { data: chunk.data as unknown as ArrayLike<number>, shape: chunk.shape };
                 cacheSet(key, entry.data, entry.shape);
-                setChunkEntry(fi, entry.data, entry.shape);
+                return entry;
+              }).finally(() => {
+                inflightFetches.delete(key);
               });
+              inflightFetches.set(key, chunkPromise);
             }
-            throw e;
-          }));
+            fetchPromises.push(chunkPromise.then(entry => {
+              setChunkEntry(fi, entry.data, entry.shape);
+            }).catch(e => {
+              // Dedup conflict: the shared fetch was aborted by another brick's
+              // signal, but this brick is still active. Retry with our own signal.
+              if (e instanceof DOMException && e.name === 'AbortError' && !signal?.aborted) {
+                const cached = chunkCache.get(key);
+                if (cached) {
+                  setChunkEntry(fi, cached.data, cached.shape);
+                  return;
+                }
+                return arr.getChunk(coords, { signal } as RequestInit).then(chunk => {
+                  const entry = { data: chunk.data as unknown as ArrayLike<number>, shape: chunk.shape };
+                  cacheSet(key, entry.data, entry.shape);
+                  setChunkEntry(fi, entry.data, entry.shape);
+                });
+              }
+              throw e;
+            }));
+          }
         }
       }
     }
@@ -405,6 +489,11 @@ async function assembleBrick(
     ? new Uint16Array(physSize * physSize * physSize)
     : new Uint8Array(physSize * physSize * physSize);
 
+  // uint16 → r16float bricks write float16 bits directly via the encode LUT,
+  // in the same pass as the scatter — avoids a second full-brick conversion pass.
+  const writeFloat16 = is16bit && targetFormat === 'r16float' && !isFloat32;
+  const u16ToF16Lut = writeFloat16 ? getUint16ToFloat16Lut() : null;
+
   let min = Infinity;
   let max = -Infinity;
   let sum = 0;
@@ -430,7 +519,7 @@ async function assembleBrick(
         const data = chunkDataArr[fi];
         if (data) {
           const idx = lcz * chunkWH[fi]! + lcy * chunkW[fi]! + lutOffX[lx]!;
-          const raw = Number(data[idx]!);
+          const raw = data[idx]!;
 
           let brickVal: number;
           let statVal: number;
@@ -450,14 +539,18 @@ async function assembleBrick(
               if (raw < rawMinVal) rawMinVal = raw;
               if (raw > rawMaxVal) rawMaxVal = raw;
             }
+          } else if (u16ToF16Lut) {
+            // Stats stay in raw uint16 space; only the stored voxel is float16-encoded.
+            brickVal = u16ToF16Lut[raw]!;
+            statVal = raw;
           } else {
             brickVal = raw;
             statVal = raw;
           }
 
           brick[brickYZBase + lx] = brickVal;
-          min = Math.min(min, statVal);
-          max = Math.max(max, statVal);
+          if (statVal < min) min = statVal;
+          if (statVal > max) max = statVal;
           sum += statVal;
         }
       }
@@ -482,8 +575,8 @@ async function assembleBrick(
     for (let i = 0; i < uint16Brick.length; i++) {
       const val8 = (uint16Brick[i] ?? 0) >> 8;
       uint8Brick[i] = val8;
-      min8 = Math.min(min8, val8);
-      max8 = Math.max(max8, val8);
+      if (val8 < min8) min8 = val8;
+      if (val8 > max8) max8 = val8;
       sum8 += val8;
     }
 
@@ -491,15 +584,9 @@ async function assembleBrick(
     min = min8 === Infinity ? 0 : min8;
     max = max8 === -Infinity ? 0 : max8;
     sum = sum8;
-  } else if (is16bit && targetFormat === 'r16float' && !isFloat32) {
-    // uint16 data → float16 conversion: maps [0, 65535] → [0.0, 1.0] in float16 bits
-    // Skipped for float32 data — float16 bits already written per-voxel in the inner loop
-    const uint16Brick = brick as Uint16Array;
-    const float16Brick = uint16ToFloat16(uint16Brick);
-    outputBrick = float16Brick;
-    // Stats remain in original uint16 range (0-65535)
   }
-  // else: r16unorm or 8-bit source - no conversion needed
+  // else: r16unorm, 8-bit source, or uint16→r16float (float16 bits already written
+  // per-voxel in the scatter loop above) — no further conversion needed
 
   const assemblyMs = performance.now() - t1;
 

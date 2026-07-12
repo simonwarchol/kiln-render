@@ -27,6 +27,15 @@ export class TolerantFetchStore implements AsyncReadable<RequestInit> {
   private baseUrl: string | URL;
   private overrides?: RequestInit;
 
+  /**
+   * Cumulative real network activity for this store instance — every fetch
+   * attempt (including retries) counts as a request; bytes are counted only
+   * on successful body reads. Never reset, so callers can diff two snapshots
+   * to get an exact delta regardless of concurrent in-flight requests.
+   */
+  bytesFetched = 0;
+  requestCount = 0;
+
   constructor(url: string | URL, options?: { overrides?: RequestInit }) {
     this.inner = new FetchStore(url, options);
     this.baseUrl = url;
@@ -39,6 +48,7 @@ export class TolerantFetchStore implements AsyncReadable<RequestInit> {
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       let response: Response;
+      this.requestCount++;
       try {
         response = await fetch(href, init);
       } catch (e) {
@@ -58,7 +68,9 @@ export class TolerantFetchStore implements AsyncReadable<RequestInit> {
       if (response.status === 200 || response.status === 206) {
         const ct = response.headers.get('content-type') ?? '';
         if (ct.includes('text/html')) return undefined;
-        return new Uint8Array(await response.arrayBuffer());
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        this.bytesFetched += bytes.byteLength;
+        return bytes;
       }
 
       // 5xx or unexpected status — retry with backoff
@@ -74,8 +86,11 @@ export class TolerantFetchStore implements AsyncReadable<RequestInit> {
 
   async getRange(key: AbsolutePath, range: RangeQuery, options?: RequestInit): Promise<Uint8Array | undefined> {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      this.requestCount++;
       try {
-        return await this.inner.getRange!(key, range, options);
+        const result = await this.inner.getRange!(key, range, options);
+        if (result) this.bytesFetched += result.byteLength;
+        return result;
       } catch (e) {
         // AbortError — don't retry, rethrow immediately
         if (e instanceof DOMException && e.name === 'AbortError') throw e;

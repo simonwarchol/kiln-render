@@ -67,13 +67,37 @@ export function float16BitsToFloat32(bits: number): number {
   return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + mant / 1024);
 }
 
+// Encode LUT: uint16 intensity (0-65535, pre-normalised by /65535) → float16 bits. 128 KB.
+let _u16ToF16Lut: Uint16Array | null = null;
+
+/** Lazily-built LUT mapping a raw uint16 intensity directly to its float16 bit pattern. */
+export function getUint16ToFloat16Lut(): Uint16Array {
+  if (!_u16ToF16Lut) {
+    _u16ToF16Lut = new Uint16Array(65536);
+    for (let i = 0; i < 65536; i++) _u16ToF16Lut[i] = float32ToFloat16Bits(i / 65535);
+  }
+  return _u16ToF16Lut;
+}
+
+// Decode LUT: float16 bit pattern → float32. 256 KB.
+let _f16ToF32Lut: Float32Array | null = null;
+
+/** Lazily-built LUT mapping every float16 bit pattern to its decoded float32 value. */
+export function getFloat16ToFloat32Lut(): Float32Array {
+  if (!_f16ToF32Lut) {
+    _f16ToF32Lut = new Float32Array(65536);
+    for (let i = 0; i < 65536; i++) _f16ToF32Lut[i] = float16BitsToFloat32(i);
+  }
+  return _f16ToF32Lut;
+}
+
 /** Convert a Uint16Array (0-65535) to float16 binary format for r16float textures. */
 export function uint16ToFloat16(uint16Data: Uint16Array): Uint16Array {
+  const lut = getUint16ToFloat16Lut();
   const float16Data = new Uint16Array(uint16Data.length);
 
   for (let i = 0; i < uint16Data.length; i++) {
-    const normalized = uint16Data[i]! / 65535.0;
-    float16Data[i] = float32ToFloat16Bits(normalized);
+    float16Data[i] = lut[uint16Data[i]!]!;
   }
 
   return float16Data;

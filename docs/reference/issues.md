@@ -8,8 +8,6 @@
 
 **Fix:** Normalize the threshold to 0–1 and compare against `(stats.max - window.min) / (window.max - window.min)` using the dataset's actual value range from `metadata.window`.
 
----
-
 ## Empty brick culling does not work for Zarr datasets
 
 Brick stats (min/max) in the Zarr path are computed lazily during `assembleBrick()` in the worker and cached in `brickStatsCache`. The streaming manager calls `isBrickEmpty` **before** `loadBrick`, so `getBrickStats` always returns `null` on the first pass → `isBrickEmpty` returns `false` → all bricks are loaded regardless.
@@ -19,8 +17,6 @@ Culling only activates on re-visits via the CPU brick cache (i.e., after an evic
 **Fix options:**
 - Add a stats-only pre-pass for the coarsest Zarr LOD (fetch and scan without storing full brick data)
 - Or accept the limitation and document it — Zarr culling is a future optimization
-
----
 
 ## Empty brick threshold cannot be determined automatically without a pre-pass
 

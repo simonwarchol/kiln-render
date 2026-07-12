@@ -23,11 +23,33 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build
+      # Landing/gallery/docs at the site root (dist/), viewers under dist/app/.
+      # Repo-agnostic base so this is safe on BOTH remotes:
+      #   - kiln-render (production, custom apex domain): served at kilnrender.com
+      #     root, so VITE_BASE = '/'.
+      #   - kiln-render-private (staging) or any other: no custom domain, served
+      #     at <owner>.github.io/<repo>/, so VITE_BASE = '/<repo>/'.
+      # The viewer configs derive /app/ from VITE_BASE. (Branch previews use a
+      # repo-name base in deploy-preview.yml.)
+      #
+      # Build order matters: the VitePress site owns dist/ and empties it, so it
+      # runs FIRST; the viewer builds then repopulate dist/app/ (their own
+      # emptyOutDir is scoped to those subfolders). App before multichannel so
+      # the app build doesn't wipe dist/app/multichannel/.
+      - name: Build marketing site (landing / gallery / docs)
+        run: npm run build:site
+        env:
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && '/' || format('/{0}/', github.event.repository.name) }}
+
+      - name: Build viewer app
         run: npm run build
+        env:
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && '/' || format('/{0}/', github.event.repository.name) }}
 
       - name: Build multichannel viewer
         run: npm run build:multichannel
+        env:
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && '/' || format('/{0}/', github.event.repository.name) }}
 
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v3
@@ -35,3 +57,8 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./dist
           keep_files: true
+          # Custom apex domain ONLY on the production repo. Empty elsewhere so
+          # staging (kiln-render-private) never claims kilnrender.com — two repos
+          # claiming one domain breaks GitHub Pages' domain verification.
+          # peaceiris skips writing CNAME when this is empty.
+          cname: ${{ github.event.repository.name == 'kiln-render' && 'kilnrender.com' || '' }}

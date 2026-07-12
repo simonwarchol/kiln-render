@@ -1,25 +1,19 @@
 # Multichannel Rendering
 
-> **Beta** — Multichannel support is new in v0.4.0. The API and compositing behaviour may change in future releases.
+> **Beta** — Multichannel rendering is new in v0.4.0 and still stabilizing; the API and compositing behaviour may change. See [Known Issues](/reference/issues) for current limitations.
 
 Kiln can render OME-Zarr datasets with up to 4 channels simultaneously. Each channel is rendered with independent colour, window/level, and visibility controls. Compositing uses additive blending rather than transfer functions.
 
-See also: [Usage Guide](usage-guide.md) | [Data Guide](data-guide.md) | [Architecture](architecture.md) | [Examples](examples.md)
-
----
-
 ## Overview
 
-Single-channel rendering maps voxel intensity through a transfer function to produce colour and opacity. Multichannel rendering takes a different approach: each channel contributes a user-defined colour weighted by its intensity, and the contributions are summed additively. This is the standard approach for fluorescence microscopy, where each channel typically represents a different stain or marker.
+Single-channel rendering maps voxel intensity through a transfer function to produce colour and opacity. Multichannel rendering takes a different approach: each channel contributes a user-defined colour weighted by its intensity, and the contributions are summed additively. This is a common display approach for fluorescence microscopy, where each channel typically represents a different stain or marker.
 
 ```
 Single-channel:   intensity → transfer function → colour + opacity
 Multichannel:     per-channel intensity × per-channel colour → additive blend
 ```
 
----
-
-## Supported Formats
+## Supported formats
 
 Multichannel rendering works with OME-Zarr datasets that have a channel (`c`) axis:
 
@@ -30,9 +24,7 @@ Multichannel rendering works with OME-Zarr datasets that have a channel (`c`) ax
 
 The Kiln sharded binary format is single-channel only.
 
----
-
-## Per-Channel Controls
+## Per-channel controls
 
 Each channel has three independent controls:
 
@@ -58,8 +50,6 @@ When OMERO metadata is available in the OME-Zarr store, Kiln reads per-channel `
 
 Channels can be toggled on/off. A hidden channel (alpha = 0) contributes nothing to the composite — its data is still streamed but not rendered.
 
----
-
 ## Compositing
 
 Multichannel compositing is **additive**: each channel's colour is weighted by its windowed intensity and the results are summed. This applies to all supported render modes:
@@ -73,8 +63,6 @@ Multichannel compositing is **additive**: each channel's colour is weighted by i
 ISO (isosurface) mode is not supported for multichannel datasets.
 
 Transfer functions are **not used** in multichannel mode. Colour is determined entirely by the per-channel colour and intensity windowing.
-
----
 
 ## API
 
@@ -117,9 +105,7 @@ viewer.onChannelWindowsChanged = () => {
 };
 ```
 
----
-
-## Multichannel Demo
+## Multichannel demo
 
 A dedicated multichannel demo is included at `examples/multichannel-viewer/`:
 
@@ -129,7 +115,7 @@ npm run dev:multichannel   # http://localhost:3001
 
 The demo provides per-channel UI controls (colour picker, window sliders, visibility toggle) and supports URL-shareable state.
 
-### URL Parameters
+### URL parameters
 
 | Parameter | Format | Description |
 |-----------|--------|-------------|
@@ -147,13 +133,11 @@ Channel state encodes each channel as `r,g,b,a,visible,windowMin,windowMax` (0�
 ?channels=51,102,255,1.00,1,0.10,0.80;255,230,51,1.00,1,0.20,0.90;255,51,51,1.00,0,0.00,1.00
 ```
 
----
-
-## Known Limitations
+## Known limitations
 
 - **Max 4 channels** — GPU uniforms use `vec4f` for per-channel data, limiting to 4 channels. Datasets with more channels will use the first 4.
 - **No transfer function** — Multichannel mode uses additive compositing with direct per-channel colours. The transfer function editor is not available.
 - **No ISO mode** — Isosurface rendering is not supported for multichannel datasets.
-- **VRAM scales with channel count** — Each channel gets its own atlas texture, but the atlas grid shrinks as channels increase to stay within a VRAM budget (e.g. a 4-channel 16-bit dataset uses an ~528³ grid, ~1.2 GiB, instead of the full 660³ ~2.2 GiB).
+- **VRAM scales with channel count** — Each channel gets its own atlas texture, so the atlas grid shrinks as channels increase to stay within the VRAM budget. See [Architecture → Memory Budget](/architecture/memory-budget) for the exact grid sizes.
 - **Increased network load** — Each brick requires one fetch per channel, so a 4-channel dataset issues 4× the network requests of a single-channel dataset.
 - **Kiln binary format** — The sharded binary format is single-channel only. Multichannel requires OME-Zarr.

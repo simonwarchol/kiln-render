@@ -1,0 +1,699 @@
+/**
+ * Dependency-free control panel styling (Phase 3) — replaces Tweakpane's
+ * default skin for all user-facing UI. Built on the tokens from
+ * viewer-shell.css (--bg-panel, --stroke, --text, --text-dim, --ember,
+ * --ember-dim, --radius, --mono).
+ *
+ * Layout contract: every row is [label 76px][control 1fr][value 60px] so
+ * tracks, toggles, and values share the same left/right edges panel-wide.
+ * Slider tracks are painted on the wrapper (::before base + .ctl-slider-fill),
+ * never on the native input — the input's own track is transparent so stacked
+ * dual-range inputs can't occlude the fill or each other's thumbs.
+ */
+
+.ctl-panel {
+  width: 280px;
+  max-height: calc(100vh - 44px - 36px - 16px);
+  max-height: calc(100dvh - 44px - 36px - 16px);
+  overflow-y: auto;
+  background: var(--bg-panel);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-lg, 8px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+  color: var(--text);
+  scrollbar-width: thin;
+  scrollbar-color: var(--stroke) transparent;
+}
+
+.ctl-panel::-webkit-scrollbar {
+  width: 6px;
+}
+
+.ctl-panel::-webkit-scrollbar-thumb {
+  background: var(--stroke);
+  border-radius: 3px;
+}
+
+.ctl-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* The header is a button: clicking it collapses the panel to a title bar. */
+.ctl-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  border: none;
+  background: transparent;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--stroke);
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.ctl-panel-header:hover {
+  color: var(--text);
+}
+
+.ctl-panel-header:focus {
+  outline: none;
+}
+
+.ctl-panel-header:focus-visible {
+  outline: 1px solid var(--ember);
+  outline-offset: -1px;
+}
+
+.ctl-panel-arrow {
+  flex-shrink: 0;
+  transform: rotate(90deg);
+  transition: transform 0.15s;
+}
+
+.ctl-panel.collapsed .ctl-panel-arrow {
+  transform: rotate(0deg);
+}
+
+.ctl-panel.collapsed .ctl-panel-header {
+  border-bottom: none;
+}
+
+.ctl-panel.collapsed .ctl-panel-body {
+  display: none;
+}
+
+/* Collapsed, the panel shrinks to a compact title chip instead of a
+   full-width empty bar. */
+.ctl-panel.collapsed {
+  width: max-content;
+}
+
+.ctl-panel-body {
+  padding: 6px 12px 14px;
+}
+
+.ctl-swap-region {
+  min-height: 40px;
+}
+
+.ctl-section {
+  padding-top: 12px;
+  border-top: 1px solid var(--stroke);
+  margin-top: 12px;
+}
+
+.ctl-panel-body > :first-child.ctl-section,
+.ctl-swap-region > :first-child {
+  border-top: none;
+  margin-top: 0;
+  padding-top: 0;
+}
+
+.ctl-eyebrow {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.ctl-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.ctl-row-label {
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ctl-row-value {
+  color: var(--text);
+  text-align: right;
+}
+
+.ctl-mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+/* --- Toggle switch --- */
+.ctl-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 0;
+  cursor: pointer;
+}
+
+/* Channel-rack toggles and level sliders are created with an empty label;
+   don't let the empty span claim its 76px grid column. */
+.ctl-toggle-label:empty,
+.ctl-slider-label:empty {
+  display: none;
+}
+
+.ctl-toggle-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.ctl-toggle-track {
+  position: relative;
+  flex-shrink: 0;
+  width: 28px;
+  height: 16px;
+  border-radius: 8px;
+  background: rgba(187, 188, 196, 0.15);
+  transition: background 0.15s;
+  cursor: pointer;
+}
+
+.ctl-toggle-row:hover .ctl-toggle-track {
+  background: rgba(187, 188, 196, 0.25);
+}
+
+.ctl-toggle-track::before {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform 0.15s, background 0.15s;
+}
+
+.ctl-toggle-input:checked + .ctl-toggle-track {
+  background: var(--ember);
+}
+
+.ctl-toggle-row:hover .ctl-toggle-input:checked + .ctl-toggle-track {
+  background: var(--ember);
+}
+
+.ctl-toggle-input:checked + .ctl-toggle-track::before {
+  transform: translateX(12px);
+  background: #fff;
+}
+
+.ctl-toggle-input:focus-visible + .ctl-toggle-track {
+  outline: 2px solid var(--ember);
+  outline-offset: 2px;
+}
+
+/* --- Slider: label, track, value on one line, all rows on the same grid --- */
+.ctl-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+}
+
+.ctl-slider-label,
+.ctl-toggle-label,
+.ctl-select-label,
+.ctl-slider-toggle-label {
+  flex: 0 0 76px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Fixed value column so every track in the panel ends on the same edge. */
+.ctl-slider-value {
+  flex: 0 0 60px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* --- Track wrappers: base track + fill are painted here, not on the input --- */
+.ctl-slider-track,
+.ctl-range-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 16px;
+}
+
+/* Base track. Inset by half a thumb so thumbs never overhang the ends. */
+.ctl-slider-track::before,
+.ctl-range-track::before {
+  content: '';
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 3px;
+  border-radius: 2px;
+  background: var(--stroke);
+}
+
+/* The filled segment marks the current value at a glance (state), while the
+   thumb stays neutral (hardware) — accent marks state, not every knob. */
+.ctl-slider-fill {
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 3px;
+  border-radius: 2px;
+  background: var(--ember);
+  pointer-events: none;
+}
+
+/* Native inputs are positioned only inside a track wrapper (a bare
+   .ctl-slider-input outside a wrapper once escaped to the panel corner). */
+.ctl-slider-track input[type='range'],
+.ctl-range-track input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 16px;
+  margin: 0;
+  background: transparent;
+}
+
+.ctl-slider-track input[type='range']::-webkit-slider-runnable-track,
+.ctl-range-track input[type='range']::-webkit-slider-runnable-track {
+  height: 16px;
+  background: transparent;
+}
+
+.ctl-slider-track input[type='range']::-webkit-slider-thumb,
+.ctl-range-track input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: 2px;
+  border-radius: 50%;
+  background: var(--text);
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.ctl-slider-track input[type='range']::-moz-range-track,
+.ctl-range-track input[type='range']::-moz-range-track {
+  height: 3px;
+  background: transparent;
+}
+
+.ctl-slider-track input[type='range']::-moz-range-thumb,
+.ctl-range-track input[type='range']::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text);
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.ctl-slider-track input[type='range']:hover::-webkit-slider-thumb,
+.ctl-range-track input[type='range']:hover::-webkit-slider-thumb {
+  background: #fff;
+}
+
+.ctl-slider-track input[type='range']:active::-webkit-slider-thumb,
+.ctl-range-track input[type='range']:active::-webkit-slider-thumb {
+  background: var(--ember);
+}
+
+.ctl-slider-track input[type='range']:hover::-moz-range-thumb,
+.ctl-range-track input[type='range']:hover::-moz-range-thumb {
+  background: #fff;
+}
+
+.ctl-slider-track input[type='range']:active::-moz-range-thumb,
+.ctl-range-track input[type='range']:active::-moz-range-thumb {
+  background: var(--ember);
+}
+
+.ctl-slider-track input[type='range']:focus-visible,
+.ctl-range-track input[type='range']:focus-visible {
+  outline: 2px solid var(--ember);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* --- Dual-thumb range slider: two overlapping inputs, thumbs-only hit area --- */
+.ctl-range-track input[type='range'] {
+  pointer-events: none;
+}
+
+.ctl-range-track input[type='range']::-webkit-slider-thumb {
+  pointer-events: auto;
+}
+
+.ctl-range-track input[type='range']::-moz-range-thumb {
+  pointer-events: auto;
+}
+
+/* --- Select --- */
+.ctl-select-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 12px;
+}
+
+.ctl-select-input {
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(187, 188, 196, 0.08);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  padding: 4px 22px 4px 8px;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%238a8a90'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 7px center;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+
+.ctl-select-input:hover {
+  background-color: rgba(187, 188, 196, 0.14);
+  border-color: rgba(187, 188, 196, 0.3);
+}
+
+.ctl-select-input:focus-visible {
+  outline: 2px solid var(--ember);
+  outline-offset: 1px;
+}
+
+/* --- Segmented control --- */
+.ctl-segmented {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: var(--radius);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  margin: 2px 0 6px;
+}
+
+.ctl-segment {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 5px 0;
+  border-radius: calc(var(--radius) - 2px);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.ctl-segment:hover {
+  background: rgba(187, 188, 196, 0.08);
+  color: var(--text);
+}
+
+.ctl-segment.active {
+  background: var(--ember);
+  color: #fff;
+}
+
+.ctl-segment.active:hover {
+  background: var(--ember);
+}
+
+.ctl-segment:focus-visible {
+  outline: 1px solid var(--ember);
+  outline-offset: -2px;
+}
+
+/* --- Collapsible (Scene / Advanced) --- */
+.ctl-collapsible {
+  border-top: 1px solid var(--stroke);
+  margin-top: 12px;
+  padding-top: 4px;
+}
+
+.ctl-collapsible-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 5px 0;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.ctl-collapsible-header:hover .ctl-eyebrow {
+  color: var(--text);
+}
+
+.ctl-collapsible-header .ctl-eyebrow {
+  margin-bottom: 0;
+  transition: color 0.15s;
+}
+
+.ctl-collapsible-arrow {
+  display: inline-block;
+  flex-shrink: 0;
+  color: var(--text-dim);
+  transition: transform 0.15s;
+}
+
+.ctl-collapsible.open .ctl-collapsible-arrow {
+  transform: rotate(90deg);
+}
+
+/* Keep the ring for keyboard users but inset and tight — and never show it
+   for plain mouse clicks (overrides the global button:focus-visible rule). */
+.ctl-collapsible-header:focus {
+  outline: none;
+}
+
+.ctl-collapsible-header:focus-visible {
+  outline: 1px solid var(--ember);
+  outline-offset: -1px;
+  border-radius: 4px;
+}
+
+.ctl-collapsible-body {
+  display: none;
+  padding-top: 4px;
+}
+
+.ctl-collapsible.open .ctl-collapsible-body {
+  display: block;
+}
+
+/* --- Slice position + visibility row: same grid, toggle sits in the value column --- */
+.ctl-slider-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+}
+
+/* Right edge of the toggle aligns with the right edge of the value column:
+   8px gap + 32px margin + 28px toggle = the 60px value column + its gap. */
+.ctl-slider-toggle-row .ctl-toggle-track {
+  margin-left: 32px;
+}
+
+/* Wraps toggle + track so clicks forward to the checkbox (label semantics),
+   without becoming a flex item itself — keeps the margin math above intact. */
+.ctl-slider-toggle-switch {
+  display: contents;
+}
+
+/* --- Color swatch --- */
+.ctl-color-swatch {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: border-color 0.15s;
+}
+
+.ctl-color-swatch:hover {
+  border-color: rgba(255, 255, 255, 0.45);
+}
+
+.ctl-color-swatch::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.ctl-color-swatch::-webkit-color-swatch {
+  border: none;
+  border-radius: 3px;
+}
+
+.ctl-color-swatch::-moz-color-swatch {
+  border: none;
+  border-radius: 3px;
+}
+
+/* --- Channel rack (multichannel): one card ("strip") per channel ---
+   [swatch][name……][toggle] on top, unlabeled full-width level slider below.
+   The card background is what visually binds a channel's rows together. */
+.ctl-channel-group {
+  background: rgba(255, 255, 255, 0.035);
+  border-radius: var(--radius);
+  padding: 5px 8px 3px;
+  margin-bottom: 6px;
+}
+
+.ctl-channel-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.ctl-channel-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: opacity 0.15s;
+}
+
+.ctl-channel-row .ctl-toggle-row {
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+.ctl-channel-level {
+  padding-top: 1px;
+}
+
+/* A disabled channel dims its identity and level — the toggle stays at full
+   strength so the way back is obvious. */
+.ctl-channel-group.off .ctl-channel-name,
+.ctl-channel-group.off .ctl-color-swatch,
+.ctl-channel-group.off .ctl-channel-level {
+  opacity: 0.4;
+}
+
+.ctl-channel-group .ctl-color-swatch,
+.ctl-channel-group .ctl-channel-level {
+  transition: opacity 0.15s;
+}
+
+/* --- Transfer function canvas (histogram + opacity curve editor) --- */
+.ctl-tf-canvas-container {
+  padding: 4px 0;
+}
+
+.ctl-tf-canvas {
+  width: 100%;
+  height: 80px;
+  display: block;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  cursor: crosshair;
+  box-sizing: border-box;
+  transition: border-color 0.15s;
+}
+
+.ctl-tf-canvas:hover {
+  border-color: rgba(187, 188, 196, 0.35);
+}
+
+.ctl-tf-help {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.ctl-tf-canvas-container:hover .ctl-tf-help {
+  opacity: 1;
+}
+
+/* --- Mobile --- */
+
+/* Never let the panel exceed the viewport (it is positioned 8px from the edge). */
+@media (max-width: 480px) {
+  .ctl-panel {
+    width: min(280px, calc(100vw - 16px));
+  }
+}
+
+/* Touch: taller hit areas without changing the visual weight. The track
+   graphics stay vertically centered, so only the input/row heights grow. */
+@media (pointer: coarse) {
+  .ctl-slider-track,
+  .ctl-range-track {
+    height: 28px;
+  }
+
+  .ctl-slider-track input[type='range'],
+  .ctl-range-track input[type='range'] {
+    height: 28px;
+  }
+
+  .ctl-slider-track input[type='range']::-webkit-slider-runnable-track,
+  .ctl-range-track input[type='range']::-webkit-slider-runnable-track {
+    height: 28px;
+  }
+
+  .ctl-slider-track input[type='range']::-webkit-slider-thumb,
+  .ctl-range-track input[type='range']::-webkit-slider-thumb {
+    margin-top: 8px;
+  }
+
+  .ctl-toggle-row,
+  .ctl-select-row {
+    padding: 8px 0;
+  }
+
+  .ctl-panel-header {
+    padding: 12px;
+  }
+}

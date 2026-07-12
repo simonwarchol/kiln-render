@@ -1,12 +1,14 @@
 {
   "name": "kiln-render",
-  "version": "0.4.0-beta",
+  "version": "0.4.0",
   "description": "A WebGPU-native out-of-core renderer for large virtualized volumetric data",
   "author": {
-    "name": "Martin Panknin",
-    "email": "martinpanknin@gmail.com"
+    "name": "mpanknin",
+    "email": "martinpanknin@gmail.com",
+    "url": "https://github.com/MPanknin"
   },
   "license": "Apache-2.0",
+  "homepage": "https://kilnrender.com",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mpanknin/kiln-render.git"
@@ -38,8 +40,12 @@
   "scripts": {
     "dev": "vite",
     "dev:multichannel": "vite --config vite.multichannel.config.ts",
+    "dev:site": "vitepress dev docs",
     "build": "tsc && vite build",
     "build:multichannel": "vite build --config vite.multichannel.config.ts",
+    "build:site": "vitepress build docs",
+    "preview:site": "vitepress preview docs",
+    "build:all": "npm run build:site && npm run build && npm run build:multichannel",
     "build:lib": "vite build --config vite.lib.config.ts && tsc -p tsconfig.lib.json && rm -rf lib/assets",
     "preview": "vite preview",
     "test": "vitest",
@@ -48,11 +54,11 @@
   "devDependencies": {
     "@webgpu/types": "^0.1.69",
     "fflate": "^0.8.2",
-    "@tweakpane/plugin-essentials": "^0.2.1",
-    "tweakpane": "^4.0.5",
     "typescript": "^5.7.2",
     "vite": "^6.0.5",
+    "vitepress": "^1.6.4",
     "vitest": "^4.0.18",
+    "vue": "^3.5.39",
     "wgpu-matrix": "^3.4.0",
     "zarrita": "^0.6.1"
   }

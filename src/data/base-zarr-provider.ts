@@ -80,6 +80,10 @@ export async function detectCompression(
  * Abstract base class for Zarr providers
  */
 export abstract class BaseZarrProvider implements DataProvider {
+  // Bounds long panning sessions on multi-gigabyte datasets — otherwise one
+  // entry accumulates per brick ever touched, cleared only on dispose().
+  private static readonly MAX_STATS_ENTRIES = 100_000;
+
   protected metadata: VolumeMetadata | null = null;
   protected brickStatsCache = new Map<string, BrickStats>();
   private networkTracker = new NetworkTracker();
@@ -126,7 +130,13 @@ export abstract class BaseZarrProvider implements DataProvider {
    */
   async getBrickStats(lod: number, bx: number, by: number, bz: number): Promise<BrickStats | null> {
     const key = `${lod}:${bx}/${by}/${bz}`;
-    return this.brickStatsCache.get(key) ?? null;
+    const stats = this.brickStatsCache.get(key);
+    if (stats) {
+      // Move to end (most recently used) — Maps preserve insertion order.
+      this.brickStatsCache.delete(key);
+      this.brickStatsCache.set(key, stats);
+    }
+    return stats ?? null;
   }
 
   /**
@@ -139,8 +149,8 @@ export abstract class BaseZarrProvider implements DataProvider {
   /**
    * Record download/read for statistics tracking
    */
-  protected recordDownload(bytes: number): void {
-    this.networkTracker.record(bytes);
+  protected recordDownload(bytes: number, requests = 1): void {
+    this.networkTracker.record(bytes, requests);
   }
 
   /**
@@ -153,6 +163,7 @@ export abstract class BaseZarrProvider implements DataProvider {
       // Multiple channels update the same key — keep the max across all channels.
       // isBrickEmpty should return true only if ALL channels are below the threshold,
       // not just whichever channel happened to write last.
+      this.brickStatsCache.delete(key);
       this.brickStatsCache.set(key, {
         min: Math.min(existing.min, stats.min),
         max: Math.max(existing.max, stats.max),
@@ -160,6 +171,12 @@ export abstract class BaseZarrProvider implements DataProvider {
       });
     } else {
       this.brickStatsCache.set(key, stats);
+    }
+
+    // Evict oldest (least recently used/inserted) entries once over the cap.
+    while (this.brickStatsCache.size > BaseZarrProvider.MAX_STATS_ENTRIES) {
+      const oldest = this.brickStatsCache.keys().next().value!;
+      this.brickStatsCache.delete(oldest);
     }
   }
 
@@ -232,6 +249,9 @@ export abstract class BaseZarrProvider implements DataProvider {
     ];
 
     const lodParams: LodParams[] = [];
+    // Chunk size along the channel axis per LOD — diagnostic-only (see P1
+    // below), not part of LodParams since workers don't need it.
+    const cChunkSizes: number[] = [];
     const levels: LodLevel[] = arrays.map((arr, i) => {
       const shape = arr.shape;
       const actualDimX = shape[shape.length - 1]!;
@@ -243,6 +263,10 @@ export abstract class BaseZarrProvider implements DataProvider {
       const virtualDimZ = Math.ceil(lod0Dims[2] / (1 << i));
 
       const chunkShape = arr.chunks;
+      const shapePrefixLength = shape.length - 3;
+      cChunkSizes.push(
+        channelAxisIdx >= 0 && channelAxisIdx < shapePrefixLength ? (chunkShape[channelAxisIdx] ?? 1) : 1,
+      );
       lodParams.push({
         scaleX: actualDimX / virtualDimX,
         scaleY: actualDimY / virtualDimY,
@@ -253,7 +277,7 @@ export abstract class BaseZarrProvider implements DataProvider {
         csx: chunkShape[chunkShape.length - 1]!,
         csy: chunkShape[chunkShape.length - 2]!,
         csz: chunkShape[chunkShape.length - 3]!,
-        shapePrefixLength: shape.length - 3,
+        shapePrefixLength,
         channelAxisIdx,
       });
 
@@ -304,6 +328,44 @@ export abstract class BaseZarrProvider implements DataProvider {
       isFloat,
       dataRange,
     };
+
+    // --- P1 diagnostic (zero behavior change) ---------------------------------
+    // Confirms the fetch-fanout hypothesis from the audit before any patch
+    // touches real behavior: for each LOD, estimate how many Zarr chunks one
+    // brick footprint can touch (worst case, independent of brick position),
+    // per channel. See docs/audits/kiln-render - fetch_patterns.md.
+    lodParams.forEach((p, lod) => {
+      const span = (dim: number, cs: number, scale: number) =>
+        Math.max(1, Math.min(Math.ceil(dim / cs), Math.floor(((PHYSICAL_BRICK_SIZE - 1) * scale) / cs) + 1));
+      const spanX = span(p.actualDimX, p.csx, p.scaleX);
+      const spanY = span(p.actualDimY, p.csy, p.scaleY);
+      const spanZ = span(p.actualDimZ, p.csz, p.scaleZ);
+      const fanout = spanX * spanY * spanZ;
+      console.log(
+        `[Kiln] LOD ${lod}: chunk shape ${p.csx}×${p.csy}×${p.csz}, fanout ${spanX}×${spanY}×${spanZ} ` +
+        `= ${fanout} chunks/brick/channel (×${numChannels}ch = ${fanout * numChannels} chunk fetches/brick)`,
+      );
+      if (lod === 0 && fanout * numChannels > 16) {
+        console.warn(
+          `[Kiln] LOD 0 fanout×channels = ${fanout * numChannels} — each brick may require this many ` +
+          `chunk fetches. If load times are a problem, consider re-chunking the source dataset to ` +
+          `≥64 per axis (or Zarr v3 sharding).`,
+        );
+      }
+      // B3 (latent correctness bug): chunk-coordinate math assumes channel
+      // chunk size 1 (prefix[channelAxisIdx] = channelIndex). If a chunk packs
+      // more than one channel, this reads the wrong voxels for channels
+      // beyond the first in each chunk — silently, with no error thrown.
+      const cChunkSize = cChunkSizes[lod] ?? 1;
+      if (cChunkSize > 1) {
+        console.error(
+          `[Kiln] LOD ${lod}: channel chunk size is ${cChunkSize} (>1) — this dataset packs multiple ` +
+          `channels per chunk. Kiln's chunk-coordinate calculation assumes channel chunk size 1 and ` +
+          `will read the WRONG voxels for channels beyond the first in each chunk. Do not trust ` +
+          `rendered output for non-first channels on this dataset (known limitation, audit bug B3).`,
+        );
+      }
+    });
 
     return { metadata, lodParams };
   }

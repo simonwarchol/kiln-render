@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { float32ToFloat16Bits, uint16ToFloat16 } from '../src/utils/float16.js';
+import {
+  float32ToFloat16Bits,
+  uint16ToFloat16,
+  getUint16ToFloat16Lut,
+  getFloat16ToFloat32Lut,
+} from '../src/utils/float16.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -119,5 +124,32 @@ describe('uint16ToFloat16', () => {
   it('handles an empty array', () => {
     const out = uint16ToFloat16(new Uint16Array(0));
     expect(out.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LUTs — must be bit-identical to the scalar conversion path
+// ---------------------------------------------------------------------------
+
+describe('getUint16ToFloat16Lut', () => {
+  it('matches float32ToFloat16Bits(i / 65535) for all 65536 values', () => {
+    const lut = getUint16ToFloat16Lut();
+    for (let i = 0; i < 65536; i++) {
+      expect(lut[i]).toBe(float32ToFloat16Bits(i / 65535));
+    }
+  });
+});
+
+describe('getFloat16ToFloat32Lut', () => {
+  it('matches float16BitsToFloat32(i) for all 65536 bit patterns', () => {
+    const lut = getFloat16ToFloat32Lut();
+    for (let i = 0; i < 65536; i++) {
+      const expected = float16BitsToFloat32(i);
+      if (Number.isNaN(expected)) {
+        expect(Number.isNaN(lut[i]!)).toBe(true);
+      } else {
+        expect(lut[i]).toBe(expected);
+      }
+    }
   });
 });

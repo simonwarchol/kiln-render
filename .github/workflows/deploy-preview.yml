@@ -34,15 +34,36 @@ jobs:
         run: echo "sanitized=$(echo '${{ steps.extract_branch.outputs.branch }}' | sed 's/[^a-zA-Z0-9-]/-/g' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
         id: sanitize
 
-      - name: Build with branch-specific base
+      # VITE_BASE is the site-root prefix; the viewer configs derive /app/ from
+      # it, so the same prefix drives all three builds (site at the preview
+      # root, viewers under <preview>/app/). The VitePress site owns dist/ and
+      # empties it, so it builds FIRST; the viewers then repopulate dist/app/
+      # (app before multichannel — see deploy.yml).
+      #
+      # Base is domain-aware, mirroring deploy.yml:
+      #   - kiln-render (custom apex domain): the gh-pages root is served at
+      #     kilnrender.com, so a preview lives at kilnrender.com/preview/<b>/ —
+      #     base = /preview/<b>/ (NO repo prefix).
+      #   - any other repo (e.g. kiln-render-private): served at
+      #     <owner>.github.io/<repo>/, so base = /<repo>/preview/<b>/.
+      # VITE_PREVIEW marks the VitePress build so it emits <meta robots=noindex>
+      # — public-repo previews sit under the production domain and must not be
+      # indexed alongside the real site.
+      - name: Build marketing site with branch-specific base
+        run: npm run build:site
+        env:
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
+          VITE_PREVIEW: '1'
+
+      - name: Build viewer app with branch-specific base
         run: npm run build
         env:
-          VITE_BASE: /kiln-render/preview/${{ steps.sanitize.outputs.sanitized }}/
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
 
       - name: Build multichannel viewer with branch-specific base
         run: npm run build:multichannel
         env:
-          VITE_BASE: /kiln-render/preview/${{ steps.sanitize.outputs.sanitized }}/
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
 
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v3
@@ -58,7 +79,11 @@ jobs:
         with:
           script: |
             const branchName = '${{ steps.sanitize.outputs.sanitized }}';
-            const previewUrl = `https://${{ github.repository_owner }}.github.io/kiln-render/preview/${branchName}/`;
+            const repo = '${{ github.event.repository.name }}';
+            // Production repo is served at the custom apex domain root; others at github.io/<repo>/.
+            const previewUrl = repo === 'kiln-render'
+              ? `https://kilnrender.com/preview/${branchName}/`
+              : `https://${{ github.repository_owner }}.github.io/${repo}/preview/${branchName}/`;
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,

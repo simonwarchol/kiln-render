@@ -11,14 +11,26 @@ fn rayMarchDVR(
     let windowWidth = uniforms.windowWidth;
     let numCh = uniforms.numChannels;
 
-    // precompute per-channel windowing constants 
+    // precompute per-channel windowing constants, a local copy of the channel
+    // colors, and a compacted list of visible channels (alpha > 0) — hidden
+    // channels then cost nothing in the per-sample loop below instead of a
+    // dynamically-indexed uniform read + branch per channel per sample.
     var chLower: array<f32, 4>;
     var chInvWidth: array<f32, 4>;
+    var chColorLocal: array<vec4f, 4>;
+    var visibleCh: array<u32, 4>;
+    var numVisible = 0u;
     if (numCh > 1u) {
         for (var ch = 0u; ch < numCh; ch++) {
             let ww = max(uniforms.channelWindowWidth[ch], 0.0001);
             chLower[ch] = uniforms.channelWindowCenter[ch] - ww * 0.5;
             chInvWidth[ch] = 1.0 / ww;
+            let c = uniforms.channelColors[ch];
+            chColorLocal[ch] = c;
+            if (c.a > 0.0) {
+                visibleCh[numVisible] = ch;
+                numVisible++;
+            }
         }
     }
 
@@ -27,7 +39,11 @@ fn rayMarchDVR(
     let floatInvRange = 1.0 / max(uniforms.floatMax - uniforms.floatMin, 0.0001);
 
     // compute jitter fraction once for the whole ray
-    let jitterFrac = select(0.0, rand(rayToSeed(rayDir) + uniforms.frameIndex), uniforms.jitter != 0u);
+    // select() is not short-circuiting in WGSL — rand() would run even with jitter off.
+    var jitterFrac = 0.0;
+    if (uniforms.jitter != 0u) {
+        jitterFrac = rand(rayToSeed(rayDir) + uniforms.frameIndex);
+    }
 
     var color = vec3f(0.0);
     var alpha = 0.0;
@@ -68,13 +84,9 @@ fn rayMarchDVR(
                 // Multi-channel: per-channel windowing + additive composite
                 var weightedColor = vec3f(0.0);
                 var maxDensity = 0.0;
-                for (var ch = 0u; ch < numCh; ch++) {
-                    let chColor = uniforms.channelColors[ch];
-                    // Hidden channels (alpha 0) must contribute NOTHING —
-                    // previously they still drove maxDensity (extinction) and
-                    // diluted the hue normalisation, so toggling a dense
-                    // channel off darkened/blacked out the composite.
-                    if (chColor.a <= 0.0) { continue; }
+                for (var vi = 0u; vi < numVisible; vi++) {
+                    let ch = visibleCh[vi];
+                    let chColor = chColorLocal[ch];
                     let raw = sampleAtlasChAffine(ch, voxel, brick.atlasOffset, brick.atlasScale);
                     // Normalise raw float range to [0,1] BEFORE per-channel
                     // windowing (identity for uint data). Without this,

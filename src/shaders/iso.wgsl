@@ -14,7 +14,11 @@ fn rayMarchISO(
     let floatInvRange = 1.0 / max(uniforms.floatMax - uniforms.floatMin, 0.0001);
 
     // compute jitter fraction once for the whole ray
-    let jitterFrac = select(0.0, rand(rayToSeed(rayDir) + uniforms.frameIndex), uniforms.jitter != 0u);
+    // select() is not short-circuiting in WGSL — rand() would run even with jitter off.
+    var jitterFrac = 0.0;
+    if (uniforms.jitter != 0u) {
+        jitterFrac = rand(rayToSeed(rayDir) + uniforms.frameIndex);
+    }
 
     var prevDensity = 0.0;
     var prevT = tStart;

@@ -8,7 +8,11 @@ fn rayMarchLOD(
     let invDir = 1.0 / rayDir;
 
     // compute jitter fraction once for the whole ray
-    let jitterFrac = select(0.0, rand(rayToSeed(rayDir) + uniforms.frameIndex), uniforms.jitter != 0u);
+    // select() is not short-circuiting in WGSL — rand() would run even with jitter off.
+    var jitterFrac = 0.0;
+    if (uniforms.jitter != 0u) {
+        jitterFrac = rand(rayToSeed(rayDir) + uniforms.frameIndex);
+    }
 
     var color = vec3f(0.0);
     var alpha = 0.0;

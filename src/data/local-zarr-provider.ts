@@ -7,7 +7,7 @@ import { open, root, Array as ZarrArray } from 'zarrita';
 import type { DataType } from 'zarrita';
 import { FileSystemStore } from './filesystem-store.js';
 import { BaseZarrProvider, detectCompression, type LodParams } from './base-zarr-provider.js';
-import { float32ToFloat16Bits, uint16ToFloat16 } from '../utils/float16.js';
+import { float32ToFloat16Bits, getUint16ToFloat16Lut } from '../utils/float16.js';
 import type { VolumeMetadata, BrickData, BrickLoadResult, BrickStats, PipelineTimings } from './data-provider.js';
 import { UnsupportedDatasetError } from './data-provider.js';
 import { extractMultiscales } from './zarr-validator.js';
@@ -228,6 +228,11 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
       ? new Uint16Array(physSize * physSize * physSize)
       : new Uint8Array(physSize * physSize * physSize);
 
+    // uint16 → r16float bricks write float16 bits directly via the encode LUT,
+    // in the same pass as the scatter — avoids a second full-brick conversion pass.
+    const writeFloat16 = is16bit && !isFloat && !downsampleTo8;
+    const u16ToF16Lut = writeFloat16 ? getUint16ToFloat16Lut() : null;
+
     let min = Infinity;
     let max = -Infinity;
     let sum = 0;
@@ -251,7 +256,7 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
           const data = chunkDataArr[fi];
           if (data) {
             const idx = lcz * chunkStZ[fi]! + lcy * chunkStY[fi]! + lutOffX[lx]!;
-            const raw = Number(data[idx]!);
+            const raw = data[idx]!;
 
             let brickVal: number;
             let statVal: number;
@@ -270,14 +275,18 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
             } else if (downsampleTo8) {
               brickVal = raw >> 8;
               statVal = raw;
+            } else if (u16ToF16Lut) {
+              // Stats stay in raw uint16 space; only the stored voxel is float16-encoded.
+              brickVal = u16ToF16Lut[raw]!;
+              statVal = raw;
             } else {
               brickVal = raw;
               statVal = raw;
             }
 
             brick[brickYZBase + lx] = brickVal;
-            min = Math.min(min, statVal);
-            max = Math.max(max, statVal);
+            if (statVal < min) min = statVal;
+            if (statVal > max) max = statVal;
             sum += statVal;
           }
         }
@@ -285,15 +294,11 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
     }
     this.assemblyAvg.add(performance.now() - t1);
 
-    // Convert raw uint16 intensities to float16 bit patterns for r16float textures
-    const finalBrick = (is16bit && !isFloat && !downsampleTo8)
-      ? uint16ToFloat16(brick as Uint16Array)
-      : brick;
-
+    // uint16 → r16float bricks already have float16 bits written per-voxel above.
     const voxelCount = physSize * physSize * physSize;
 
     return {
-      data: finalBrick,
+      data: brick,
       stats: {
         min: min === Infinity ? 0 : min,
         max: max === -Infinity ? 0 : max,

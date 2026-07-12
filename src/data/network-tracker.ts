@@ -29,9 +29,9 @@ export class NetworkTracker {
   private requestCount = 0;
   private recentDownloads: { timestamp: number; bytes: number }[] = [];
 
-  record(bytes: number): void {
+  record(bytes: number, requests = 1): void {
     this.totalBytesDownloaded += bytes;
-    this.requestCount++;
+    this.requestCount += requests;
     this.recentDownloads.push({ timestamp: performance.now(), bytes });
   }
 

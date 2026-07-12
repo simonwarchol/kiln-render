@@ -1,10 +1,14 @@
 import { defineConfig } from 'vite';
 import { resolve } from 'path';
+import { copyFavicons } from './vite.favicons';
 
 export default defineConfig({
   root: 'examples/multichannel-viewer',
-  base: (process.env.VITE_BASE ?? '/kiln-render/') + 'multichannel/',
+  // See vite.config.ts — VITE_BASE is the site-root prefix; this viewer lives
+  // under <root>/app/multichannel/.
+  base: (process.env.VITE_BASE ?? '/kiln-render/') + 'app/multichannel/',
   publicDir: resolve(__dirname, 'public'),
+  plugins: [copyFavicons()],
   server: {
     port: 3001,
     open: true,
@@ -12,8 +16,11 @@ export default defineConfig({
   build: {
     target: 'esnext',
     minify: 'esbuild',
-    outDir: resolve(__dirname, 'dist/multichannel'),
+    outDir: resolve(__dirname, 'dist/app/multichannel'),
     emptyOutDir: true,
+    // public/ holds ~15 GB of dev-only test datasets — don't copy them into
+    // the build (see vite.favicons.ts). Dev serving is unaffected.
+    copyPublicDir: false,
   },
   worker: {
     format: 'es',

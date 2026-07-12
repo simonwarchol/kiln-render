@@ -1,12 +1,8 @@
 # References & Background
 
-Kiln is an implementation-focused project that builds on well-established ideas in volume rendering, sparse streaming, and real-time graphics. It does not introduce new rendering algorithms, but adapts proven techniques to a modern WebGPU context.
+Kiln is an implementation-focused project that builds on well-established ideas in volume rendering, sparse streaming, and real-time graphics. It adapts proven techniques to a modern WebGPU context.
 
-See also: [Architecture](architecture.md) | [Rendering Pipeline](rendering.md) | [Data Guide](data-guide.md) | [Usage Guide](usage-guide.md)
-
----
-
-## Academic & Technical References
+## Academic & technical references
 
 The following works were particularly influential during development:
 
@@ -43,12 +39,6 @@ The following works were particularly influential during development:
 - **IDR. (2024).** *OME-NGFF Samples Directory*. Image Data Resource.
   [https://idr.github.io/ome-ngff-samples/](https://idr.github.io/ome-ngff-samples/)
 
----
+## Dataset credits
 
-## Dataset Credits
-
-Sample datasets used in Kiln demos are from the [Open SciVis Datasets](https://github.com/sci-visus/open-scivis-datasets) collection:
-
-- **Chameleon** - CT scan of *Chamaeleo calyptratus*. Digital Morphology, 2003.
-- **Beechnut** - MicroCT scan of a dried beechnut. Computer-Assisted Paleoanthropology group and Visualization and MultiMedia Lab, University of Zurich.
-- **Stag Beetle** - Industrial CT scan. Meister Eduard Gröller, Georg Glaeser, Johannes Kastner, 2005.
+Dataset attributions live alongside the demos in the [Gallery](/gallery#dataset-credits).

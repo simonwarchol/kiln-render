@@ -6,13 +6,13 @@
 import { mat4 } from 'wgpu-matrix';
 import { Camera, extractFrustumPlanes, isAABBInFrustum } from '../core/camera.js';
 import type { VolumeResources } from '../core/volume-resources.js';
-import type { DataProvider, VolumeMetadata, BrickLoadResult } from '../data/data-provider.js';
+import type { DataProvider, VolumeMetadata, BrickLoadResult, LodLevel } from '../data/data-provider.js';
 import { AtlasSlot } from './atlas-allocator.js';
 import { BrickCache } from './brick-cache.js';
 import { PHYSICAL_BRICK_SIZE } from '../core/config.js';
 import type { DatasetConfig } from '../core/config.js';
 import { writeToCanvas } from '../core/volume.js';
-import { float16BitsToFloat32 } from '../utils/float16.js';
+import { getFloat16ToFloat32Lut } from '../utils/float16.js';
 import type { PipelineTimings } from '../data/data-provider.js';
 import { RollingAvg } from '../data/network-tracker.js';
 
@@ -191,6 +191,11 @@ export class StreamingManager {
   private cameraMovementThreshold = 0.001; // Min movement to consider "moving"
   private cameraStillThreshold = 5; // Frames of stillness before re-prioritizing
 
+  // Constant for the dataset — cached to avoid Math.max(...levels.map()) per call
+  private readonly maxLod: number;
+  // lod -> LodLevel, indexed — avoids a linear .find() per visited octree node
+  private readonly levelsByLod: LodLevel[];
+
   constructor(
     resources: VolumeResources,
     dataProvider: DataProvider,
@@ -206,6 +211,10 @@ export class StreamingManager {
     this.metadata = metadata;
     this.device = device;
     this.config = config;
+
+    this.maxLod = metadata.maxLod;
+    this.levelsByLod = [];
+    for (const level of metadata.levels) this.levelsByLod[level.lod] = level;
 
     // Scale concurrent requests and cache budget for multichannel
     const numChannels = resources.numChannels;
@@ -255,9 +264,7 @@ export class StreamingManager {
     const range = rawMax - rawMin;
     if (!(range > 0) || bricks.length === 0) return [rawMin, rawMax];
 
-    // Decode LUT: every possible float16 bit pattern → float32
-    const lut = new Float32Array(65536);
-    for (let i = 0; i < 65536; i++) lut[i] = float16BitsToFloat32(i);
+    const lut = getFloat16ToFloat32Lut();
 
     const BINS = 65536;
     const histogram = new Uint32Array(BINS);
@@ -300,8 +307,8 @@ export class StreamingManager {
   /** Load and pin the coarsest LOD level with bounded concurrency. */
   private async loadBaseLod(): Promise<void> {
     const t0 = performance.now();
-    const maxLod = Math.max(...this.metadata.levels.map(l => l.lod));
-    const level = this.metadata.levels.find(l => l.lod === maxLod);
+    const maxLod = this.maxLod;
+    const level = this.levelsByLod[maxLod];
     if (!level) return;
 
     const [gridX, gridY, gridZ] = level.brickGrid;
@@ -545,7 +552,7 @@ export class StreamingManager {
    * Main update loop - call every frame
    * Returns true if any work was done
    */
-  update(camera: Camera, canvas: HTMLCanvasElement): boolean {
+  update(camera: Camera, canvas: HTMLCanvasElement): void {
     this.frameCount++;
 
     const cameraPos: [number, number, number] = [
@@ -564,11 +571,12 @@ export class StreamingManager {
       this.cameraStillFrames++;
     }
 
-    // Recompute every frame while moving, immediately on rest, and
-    // periodically as a fallback when still.
-    const regularUpdate = cameraMoved
-      ? true
-      : (this.frameCount - this.lastUpdateFrame) >= this.updateInterval;
+    // Throttled to every updateInterval frames, both while moving and while
+    // still — dispatch is gated during interaction anyway (see below), and
+    // cancellation has its own grace period, so per-frame recompute during
+    // movement bought nothing but full octree traversals at the tightest
+    // frame budget. Recompute immediately the instant the camera stops.
+    const regularUpdate = (this.frameCount - this.lastUpdateFrame) >= this.updateInterval;
     const cameraJustStopped = this.cameraStillFrames === this.cameraStillThreshold;
 
     // Don't start streaming finer LODs until base LOD is fully loaded.
@@ -576,7 +584,7 @@ export class StreamingManager {
     // have no parent in loadedBricks, so eviction calls clearBrick without a
     // fallback and permanently holes the indirection table.
     if (!this.baseLodLoaded) {
-      return false;
+      return;
     }
 
     if (regularUpdate || cameraJustStopped) {
@@ -590,8 +598,6 @@ export class StreamingManager {
     if (!camera.isInteracting()) {
       this.processLoadQueue();
     }
-
-    return this.inFlightRequests.size > 0 || this.loadQueue.length > 0;
   }
 
   /**
@@ -702,14 +708,14 @@ export class StreamingManager {
     this.projectionFactor = canvas.height / (2 * Math.tan(this.cameraFovRad / 2));
 
     // Get LOD range from metadata
-    const maxLod = Math.max(...this.metadata.levels.map(l => l.lod));
+    const maxLod = this.maxLod;
 
     // Desired bricks from traversal
     const desiredBricks: BrickRequest[] = [];
 
     // Recursive traversal function
     const traverse = (bx: number, by: number, bz: number, lod: number): void => {
-      const level = this.metadata.levels.find(l => l.lod === lod);
+      const level = this.levelsByLod[lod];
       if (!level) return;
 
       const [gridX, gridY, gridZ] = level.brickGrid;
@@ -749,7 +755,7 @@ export class StreamingManager {
 
       if (shouldSplit) {
         // Check if finer LOD exists
-        const finerLevel = this.metadata.levels.find(l => l.lod === lod - 1);
+        const finerLevel = this.levelsByLod[lod - 1];
         if (!finerLevel) {
           // No finer LOD available, use current
           this.addDesiredBrick(desiredBricks, bx, by, bz, lod, dist);
@@ -794,7 +800,7 @@ export class StreamingManager {
     };
 
     // Start from coarsest LOD
-    const rootLevel = this.metadata.levels.find(l => l.lod === maxLod);
+    const rootLevel = this.levelsByLod[maxLod];
     if (rootLevel) {
       const [gridX, gridY, gridZ] = rootLevel.brickGrid;
       for (let bz = 0; bz < gridZ; bz++) {
@@ -958,6 +964,9 @@ export class StreamingManager {
     if (isEmpty) {
       this.emptyBricks.add(key);
       this.resources.indirection.setEmpty(bx, by, bz, lod);
+      // This may overwrite a coarse parent fallback that was already on screen —
+      // the region needs to redraw as empty rather than staying on the stale frame.
+      this.scheduleAccumulationReset();
       return;
     }
 
@@ -991,6 +1000,8 @@ export class StreamingManager {
       if (maxAcrossChannels < threshold) {
         this.emptyBricks.add(key);
         this.resources.indirection.setEmpty(bx, by, bz, lod);
+        // Same as above: may overwrite a coarse parent fallback already on screen.
+        this.scheduleAccumulationReset();
         return;
       }
     }
@@ -1122,7 +1133,7 @@ export class StreamingManager {
     bz: number,
     lod: number
   ): { min: [number, number, number]; max: [number, number, number] } {
-    const level = this.metadata.levels.find(l => l.lod === lod);
+    const level = this.levelsByLod[lod];
     if (!level) return { min: [0, 0, 0], max: [0, 0, 0] };
 
     const normalizedSize = this.config.normalizedSize;
@@ -1192,7 +1203,7 @@ export class StreamingManager {
     bz: number,
     lod: number
   ): { slot: AtlasSlot; lod: number } | null {
-    const maxLod = Math.max(...this.metadata.levels.map(l => l.lod));
+    const maxLod = this.maxLod;
 
     // Walk up the LOD hierarchy to find a loaded parent
     for (let parentLod = lod + 1; parentLod <= maxLod; parentLod++) {
@@ -1232,7 +1243,7 @@ export class StreamingManager {
 
   /** Check if any ancestor brick is known-empty (for eviction fallback). */
   private hasEmptyAncestor(bx: number, by: number, bz: number, lod: number): boolean {
-    const maxLod = Math.max(...this.metadata.levels.map(l => l.lod));
+    const maxLod = this.maxLod;
     for (let parentLod = lod + 1; parentLod <= maxLod; parentLod++) {
       const scale = 1 << (parentLod - lod);
       const parentKey = `lod${parentLod}:${Math.floor(bz / scale)}/${Math.floor(by / scale)}/${Math.floor(bx / scale)}`;

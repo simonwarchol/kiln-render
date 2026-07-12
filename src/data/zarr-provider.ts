@@ -91,6 +91,10 @@ export class ZarrDataProvider extends BaseZarrProvider {
 
     metadata.compression = await detectCompression(store, arrayPaths[0] ?? '');
 
+    // Backfill the metadata reads made above (group/array opens, compression
+    // probe) — small, but real network activity that should count too.
+    this.recordDownload(store.bytesFetched, store.requestCount);
+
     this.metadata = metadata;
 
     // Initialize worker pool — all heavy lifting happens there
@@ -133,8 +137,13 @@ export class ZarrDataProvider extends BaseZarrProvider {
         avg: result.avg,
       });
 
-      // Track approximate download size
-      this.recordDownload(result.data.byteLength);
+      // Real network bytes/requests for this brick's chunks, reported by the
+      // worker's store. Falls back to the assembled-buffer size only if a
+      // worker didn't report it (shouldn't happen once initialized).
+      this.recordDownload(
+        result.chunkBytesFetched ?? result.data.byteLength,
+        result.chunkRequestsIssued ?? 1,
+      );
 
       return result;
     } catch (e) {
