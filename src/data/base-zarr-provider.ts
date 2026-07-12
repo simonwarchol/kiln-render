@@ -180,7 +180,12 @@ export abstract class BaseZarrProvider implements DataProvider {
     }
   }
 
-  /** Parse OME-Zarr metadata and build VolumeMetadata. */
+  /**
+   * Parse OME-Zarr metadata and build VolumeMetadata.
+   * @internal — takes zarrita `Array` types; not part of the public API surface.
+   *   Stripped from emitted .d.ts (stripInternal) so `zarrita` doesn't leak into
+   *   published types (consumers don't install it — it's bundled).
+   */
   protected parseOmeMetadata(
     attrs: Record<string, unknown>,
     arrays: ZarrArray<DataType, any>[],

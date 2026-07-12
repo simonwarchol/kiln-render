@@ -1,3 +1,4 @@
+/// <reference types="@webgpu/types" />
 /** kiln-render — public API */
 
 // Viewer

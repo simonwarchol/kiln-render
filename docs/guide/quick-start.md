@@ -4,6 +4,14 @@ This guide takes you from an empty page to an interactive viewer streaming a rem
 
 Kiln's API is a single entry point: `KilnViewer.create()` returns a viewer whose behaviour — render mode, windowing, channels, camera — is driven through plain properties.
 
+## Installation
+
+```bash
+npm install kiln-render
+```
+
+Kiln ships as an ES module with bundled dependencies and TypeScript types — no peer packages to install. Types for the WebGPU API (`@webgpu/types`) are included automatically.
+
 ## Basic usage
 
 ```typescript

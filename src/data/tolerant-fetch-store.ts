@@ -22,6 +22,11 @@ function delay(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+/**
+ * @internal — internal zarrita store wrapper; uses zarrita types on its surface
+ *   but is not part of the public API. Stripped from emitted .d.ts so `zarrita`
+ *   doesn't leak into published types.
+ */
 export class TolerantFetchStore implements AsyncReadable<RequestInit> {
   private inner: FetchStore;
   private baseUrl: string | URL;

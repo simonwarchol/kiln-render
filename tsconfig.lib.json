@@ -5,6 +5,7 @@
     "declaration": true,
     "declarationDir": "lib",
     "emitDeclarationOnly": true,
+    "stripInternal": true,
     "baseUrl": ".",
     "paths": {
       "@kiln/*": ["./src/*"]
