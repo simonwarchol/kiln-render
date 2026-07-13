@@ -17,7 +17,7 @@ export default {
           h('span', [h('b', 'Apache-2.0')]),
           h('span', ['OME-Zarr ', h('b', '& sharded binary')]),
           h('span', ['uint8 / uint16 / ', h('b', 'float32')]),
-          h('span', 'v0.4.0'),
+          h('span', 'v0.4.1'),
           // Third-party trust signal — a verifiable listing, not an endorsement
           // claim. "Listed in", linked to the registry so anyone can check.
           h('span', [
