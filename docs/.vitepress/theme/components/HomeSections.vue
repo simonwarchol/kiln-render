@@ -45,11 +45,22 @@ const pipeline = [
   { n: '05', title: 'March', body: 'One compute thread per pixel traverses the resident bricks.' },
 ];
 
-const snippet = `import { KilnViewer } from 'kiln-render'
+const snippet = `import { KilnViewer } from 'kiln-render';
 
-const canvas = document.querySelector('canvas')!
-const viewer = await KilnViewer.create(canvas, 'https://example.org/data.ome.zarr')
-viewer.mode = 'mip'`;
+const canvas = document.querySelector('canvas');
+const status = document.querySelector('#status');
+
+try {
+  const viewer = await KilnViewer.create(
+    canvas,
+    'https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/beechnut.ome.zarr',
+  );
+  status.textContent = \`rendering — mode: \${viewer.mode}\`;
+  window.viewer = viewer;
+} catch (err) {
+  status.textContent = \`failed: \${err.message}\`;
+  console.error(err);
+}`;
 </script>
 
 <template>

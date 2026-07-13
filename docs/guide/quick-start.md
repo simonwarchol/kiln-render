@@ -14,14 +14,23 @@ Kiln ships as an ES module with bundled dependencies and TypeScript types — no
 
 ## Basic usage
 
-```typescript
+```js
 import { KilnViewer } from 'kiln-render';
 
-const canvas = document.querySelector('canvas')!;
-const viewer = await KilnViewer.create(
-  canvas,
-  'https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/beechnut.ome.zarr',
-);
+const canvas = document.querySelector('canvas');
+const status = document.querySelector('#status');
+
+try {
+  const viewer = await KilnViewer.create(
+    canvas,
+    'https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/beechnut.ome.zarr',
+  );
+  status.textContent = `rendering — mode: ${viewer.mode}`;
+  window.viewer = viewer;
+} catch (err) {
+  status.textContent = `failed: ${err.message}`;
+  console.error(err);
+}
 ```
 
 `KilnViewer.create()` handles WebGPU initialisation, data provider setup, and starts the render loop. It accepts a URL string (OME-Zarr or Kiln sharded binary) or a pre-constructed `DataProvider` instance.
