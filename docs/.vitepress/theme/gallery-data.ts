@@ -100,25 +100,65 @@ export const gallery: GalleryItem[] = [
       url: 'https://cryoetdataportal.czscience.com/runs/33757?table-tab=Tomograms',
     },
   },
+  // {
+  //   title: 'Zebrafish lateral line',
+  //   meta: 'Fluorescence · 8-bit · 2 channels · 1584 × 788 × 142',
+  //   href: 'app/multichannel/?dataset=https%3A%2F%2Flivingobjects.ebi.ac.uk%2Fidr%2Fzarr%2Fv0.4%2Fidr0079A%2Fidr0079_images.zarr&up=-z&mode=mip&scale=0.50&cam=0.450%2C0.770%2C1.144%2C0.031%2C-0.021%2C0.070&channels=0%2C0%2C255%2C1.00%2C1%2C0.02%2C0.46%3B255%2C255%2C0%2C1.00%2C1%2C0.01%2C0.38&slice=792%2C394%2C71%2C1%2C1%2C1',
+  //   thumb: 'gallery/zebrafish.webp',
+  //   alt: 'Zebrafish lateral line, 2-channel fluorescence',
+  //   description:
+  //     'AiryScan confocal fluorescence of the zebrafish posterior lateral line primordium. lynEGFP (membrane) + NLStdTomato (nuclear). Shown in MIP mode.',
+  //   source: { label: 'IDR0079 · Hartmann et al., 2020', url: 'https://doi.org/10.7554/eLife.55913' },
+  // },
+  // {
+  //   title: 'Human fibroblast (IDR0101)',
+  //   meta: 'Fluorescence · 16-bit · 4 channels · 2048 × 2048 × 35',
+  //   href: 'app/multichannel/?dataset=https%3A%2F%2Fd39zu0xtgv0613.cloudfront.net%2Fmultichannel%2F13457227.zarr%2F13457227.zarr&up=-y&mode=mip&scale=0.50&cam=-0.430%2C3.140%2C1.276%2C-0.001%2C0.048%2C0.022&channels=0%2C0%2C255%2C1.00%2C1%2C0.00%2C0.01%3B255%2C255%2C0%2C1.00%2C1%2C0.00%2C0.01%3B255%2C0%2C0%2C1.00%2C1%2C0.00%2C0.01%3B255%2C255%2C255%2C1.00%2C1%2C0.00%2C0.02&slice=1024%2C1024%2C18%2C1%2C1%2C1',
+  //   thumb: 'gallery/fibroplast.webp',
+  //   alt: 'Human fibroblast, 4-channel in situ genome sequencing',
+  //   description:
+  //     'Confocal microscopy of human fibroblasts (PGP1) from an in situ genome sequencing study. Four channels across 35 z-slices, shown in MIP mode.',
+  //   source: { label: 'IDR0101 · Payne et al., 2021', url: 'https://doi.org/10.1126/science.aay3446' },
+  // },
+  // {
+  //   title: 'Zebrafish embryo · IM2',
+  //   meta: 'Fluorescence · 16-bit · 4 channels · 512 × 512 × 94',
+  //   href: 'app/multichannel/?dataset=https%3A%2F%2Fuk1s3.embassy.ebi.ac.uk%2Fbia-integrator-data%2FS-BSST410%2FIM2%2FIM2.zarr%2F0&up=-z&mode=mip&scale=0.50&cam=0.550%2C1.400%2C1.691%2C0.002%2C0.059%2C0.083&channels=0%2C0%2C255%2C1.00%2C1%2C0.00%2C0.06%3B255%2C255%2C0%2C1.00%2C1%2C0.00%2C0.01%3B255%2C0%2C0%2C1.00%2C1%2C0.00%2C0.03%3B255%2C255%2C255%2C1.00%2C1%2C0.00%2C0.03&slice=256%2C256%2C47%2C1%2C1%2C1',
+  //   thumb: 'gallery/zebrafish-embryo-im2.webp',
+  //   alt: 'Zebrafish embryo, 4-channel fluorescence',
+  //   description:
+  //     'Four-channel fluorescence of a zebrafish (Danio rerio) embryo, from a study of axis specification and pattern formation. Shown in MIP mode.',
+  //   source: { label: 'BioImage Archive · S-BSST410 (IM2)', url: 'https://uk1s3.embassy.ebi.ac.uk/bia-integrator-data/pages/S-BSST410/IM2.html' },
+  // },
   {
-    title: 'Zebrafish lateral line',
-    meta: 'Fluorescence · 8-bit · 2 channels · 1584 × 788 × 142',
-    href: 'app/multichannel/?dataset=https%3A%2F%2Flivingobjects.ebi.ac.uk%2Fidr%2Fzarr%2Fv0.4%2Fidr0079A%2Fidr0079_images.zarr&up=-z&mode=mip&scale=0.50&cam=0.450%2C0.770%2C1.144%2C0.031%2C-0.021%2C0.070&channels=0%2C0%2C255%2C1.00%2C1%2C0.02%2C0.46%3B255%2C255%2C0%2C1.00%2C1%2C0.01%2C0.38&slice=792%2C394%2C71%2C1%2C1%2C1',
-    thumb: 'gallery/zebrafish.webp',
-    alt: 'Zebrafish lateral line, 2-channel fluorescence',
+    title: 'Zebrafish embryo · IM4',
+    meta: 'Fluorescence · 16-bit · 4 channels · 512 × 512 × 103',
+    href: 'app/multichannel/?dataset=https%3A%2F%2Fuk1s3.embassy.ebi.ac.uk%2Fbia-integrator-data%2FS-BSST410%2FIM4%2FIM4.zarr%2F0&up=-z&mode=mip&scale=0.50&cam=0.740%2C2.700%2C1.489%2C0.003%2C0.039%2C0.037&channels=0%2C0%2C255%2C1.00%2C1%2C0.00%2C0.04%3B255%2C255%2C0%2C1.00%2C1%2C0.00%2C0.06%3B255%2C0%2C0%2C1.00%2C1%2C0.00%2C0.01%3B255%2C255%2C255%2C1.00%2C1%2C0.00%2C0.02&slice=256%2C256%2C52%2C1%2C1%2C1',
+    thumb: 'gallery/zebrafish-embryo-im4.webp',
+    alt: 'Zebrafish embryo, 4-channel fluorescence',
     description:
-      'AiryScan confocal fluorescence of the zebrafish posterior lateral line primordium. lynEGFP (membrane) + NLStdTomato (nuclear). Shown in MIP mode.',
-    source: { label: 'IDR0079 · Hartmann et al., 2020', url: 'https://doi.org/10.7554/eLife.55913' },
+      'Four-channel fluorescence of a zebrafish embryo. Shown in MIP mode.',
+    source: { label: 'BioImage Archive · S-BSST410 (IM4)', url: 'https://uk1s3.embassy.ebi.ac.uk/bia-integrator-data/pages/S-BSST410/IM4.html' },
   },
+  // {
+  //   title: 'Arabidopsis FLC · IM1',
+  //   meta: 'Fluorescence · 16-bit · 2 channels · 968 × 728 × 45',
+  //   href: 'app/multichannel/?dataset=https%3A%2F%2Fuk1s3.embassy.ebi.ac.uk%2Fbia-integrator-data%2FS-BIAD425%2FIM1%2FIM1.zarr%2F0&up=-z&mode=mip&scale=0.50&cam=0.880%2C1.410%2C1.601%2C-0.000%2C0.033%2C0.039&channels=0%2C0%2C255%2C1.00%2C1%2C0.00%2C0.18%3B255%2C255%2C0%2C1.00%2C1%2C0.03%2C0.23&slice=484%2C364%2C23%2C1%2C1%2C1',
+  //   thumb: 'gallery/arabidopsis-flc-im1.webp',
+  //   alt: 'Arabidopsis FLC smFISH, DAPI + Cy3',
+  //   description:
+  //     'Two-channel fluorescence (DAPI + Cy3) from a single-molecule FISH study of FLC gene expression in Arabidopsis. Shown in MIP mode.',
+  //   source: { label: 'BioImage Archive · S-BIAD425 (IM1)', url: 'https://uk1s3.embassy.ebi.ac.uk/bia-integrator-data/pages/S-BIAD425/IM1.html' },
+  // },
   {
-    title: 'Human fibroblast (IDR0101)',
-    meta: 'Fluorescence · 16-bit · 4 channels · 2048 × 2048 × 35',
-    href: 'app/multichannel/?dataset=https%3A%2F%2Fd39zu0xtgv0613.cloudfront.net%2Fmultichannel%2F13457227.zarr%2F13457227.zarr&up=-y&mode=mip&scale=0.50&cam=-0.430%2C3.140%2C1.276%2C-0.001%2C0.048%2C0.022&channels=0%2C0%2C255%2C1.00%2C1%2C0.00%2C0.01%3B255%2C255%2C0%2C1.00%2C1%2C0.00%2C0.01%3B255%2C0%2C0%2C1.00%2C1%2C0.00%2C0.01%3B255%2C255%2C255%2C1.00%2C1%2C0.00%2C0.02&slice=1024%2C1024%2C18%2C1%2C1%2C1',
-    thumb: 'gallery/fibroplast.webp',
-    alt: 'Human fibroblast, 4-channel in situ genome sequencing',
+    title: 'Arabidopsis FLC · IM500',
+    meta: 'Fluorescence · 8-bit · 2 channels · 1024 × 512 × 46',
+    href: 'app/multichannel/?dataset=https%3A%2F%2Fuk1s3.embassy.ebi.ac.uk%2Fbia-integrator-data%2FS-BIAD425%2FIM500%2FIM500.zarr%2F0&up=-z&mode=mip&scale=0.50&cam=1.090%2C1.350%2C1.027%2C0.005%2C0.010%2C0.030&channels=30%2C255%2C0%2C1.00%2C1%2C0.00%2C0.05%3B30%2C0%2C255%2C1.00%2C1%2C0.45%2C1.00&slice=512%2C256%2C23%2C1%2C1%2C1',
+    thumb: 'gallery/arabidopsis-flc-im500.webp',
+    alt: 'Arabidopsis FLC smFISH, 2-channel fluorescence',
     description:
-      'Confocal microscopy of human fibroblasts (PGP1) from an in situ genome sequencing study. Four channels across 35 z-slices, shown in MIP mode.',
-    source: { label: 'IDR0101 · Payne et al., 2021', url: 'https://doi.org/10.1126/science.aay3446' },
+      'Two-channel fluorescence from the Arabidopsis FLC gene-expression study (8-bit). Shown in MIP mode.',
+    source: { label: 'BioImage Archive · S-BIAD425 (IM500)', url: 'https://uk1s3.embassy.ebi.ac.uk/bia-integrator-data/pages/S-BIAD425/IM500.html' },
   },
   {
     title: 'Yeast smFISH (IDR0047)',
@@ -129,5 +169,14 @@ export const gallery: GalleryItem[] = [
     description:
       'Single-molecule mRNA FISH in Saccharomyces cerevisiae. Channels: CY5, TMR, DAPI, and transmitted light. Shown in slice mode.',
     source: { label: 'IDR0047 · Li & Neuert, 2019', url: 'https://doi.org/10.1038/s41597-019-0106-6' },
+  },
+  {
+    title: 'Drosophila brain (Fly-eFISH)',
+    meta: 'Fluorescence · 16-bit · 4 channels · 1920 × 1920 × 752',
+    href: 'app/multichannel/?dataset=https%3A%2F%2Fd39zu0xtgv0613.cloudfront.net%2FFly-eFISH%2FNP01_1_1_SS00790_AstA546_CCHa1_647_1x_LOL.chunked.zarr%2F&up=-z&mode=mip&scale=0.50&cam=0.390%2C4.230%2C2.087%2C-0.013%2C-0.016%2C0.060&channels=0%2C0%2C255%2C1.00%2C1%2C0.00%2C0.41%3B255%2C255%2C0%2C1.00%2C1%2C0.00%2C0.19%3B255%2C0%2C0%2C1.00%2C1%2C0.00%2C0.41%3B255%2C255%2C255%2C1.00%2C1%2C0.00%2C0.11&slice=960%2C960%2C376%2C1%2C1%2C1',
+    thumb: 'gallery/fly-efish.webp',
+    alt: 'Drosophila brain, 4-channel fluorescence FISH',
+    description:
+      'Drosophila brain multiplexed FISH (Fly-eFISH) — four fluorescence channels including AstA (546 nm) and CCHa1 (647 nm) markers. Large volume, shown in MIP mode. Note: this is a heavy dataset and may take longer to stream in.',
   },
 ];

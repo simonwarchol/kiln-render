@@ -21,6 +21,9 @@ function thumbSrc(src: string): string {
     <div v-for="item in gallery" :key="item.title" class="gallery-item">
       <a class="gallery-open" :href="item.href" target="_blank" rel="noopener">
         <div class="gallery-thumb">
+          <!-- Multichannel rendering is beta — flag it on the cards that open the
+               multichannel viewer (detected from the href). -->
+          <span v-if="item.href.includes('app/multichannel/')" class="gallery-beta">beta</span>
           <img v-if="item.thumb" :src="thumbSrc(item.thumb)" :alt="item.alt || item.title" loading="lazy" />
           <span v-else class="gallery-placeholder">{{ item.placeholder }}</span>
         </div>
@@ -63,6 +66,7 @@ function thumbSrc(src: string): string {
 }
 
 .gallery-thumb {
+  position: relative;
   aspect-ratio: 16 / 10;
   background: var(--vp-c-bg-alt);
   border: 1px solid var(--vp-c-divider);
@@ -73,6 +77,23 @@ function thumbSrc(src: string): string {
   justify-content: center;
   margin-bottom: 14px;
   transition: border-color 0.15s;
+}
+.gallery-beta {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  padding: 2px 7px;
+  font-family: var(--vp-font-family-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #fff;
+  background: var(--vp-c-brand-1);
+  border-radius: 999px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
 }
 .gallery-open:hover .gallery-thumb {
   border-color: var(--vp-c-brand-1);
