@@ -13,8 +13,10 @@
   --stroke: #3a3a3e;
   --text: #e8e6e3;
   --text-dim: #8a8a90;
-  --ember: #ff7a2f;
-  --ember-dim: #b35a2a;
+  --accent: #2f81f7;
+  --accent-dim: #1f6feb;
+  --accent-live: #3fb950;
+  --accent-live-dim: #2ea043;
   --radius: 6px;
   --radius-lg: 8px;
   --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', monospace;
@@ -50,11 +52,11 @@ canvas {
   font-family: system-ui, -apple-system, sans-serif;
 }
 
-/* --- Focus ring: the one interactive-state signal besides --ember fills --- */
+/* --- Focus ring: the one interactive-state signal besides --accent fills --- */
 button:focus-visible,
 input:focus-visible,
 a:focus-visible {
-  outline: 2px solid var(--ember);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -99,11 +101,11 @@ a:focus-visible {
 }
 
 .wordmark:hover {
-  color: var(--ember);
+  color: var(--accent);
 }
 
 .wordmark sup {
-  color: var(--ember-dim);
+  color: var(--accent-dim);
   font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -163,7 +165,7 @@ a:focus-visible {
 }
 
 .status-dot.active {
-  background: var(--ember);
+  background: var(--accent-live);
   animation: status-pulse 1.2s ease-in-out infinite;
 }
 
@@ -200,7 +202,7 @@ a:focus-visible {
 }
 
 .toolbar-btn.copied {
-  background: var(--ember);
+  background: var(--accent-live);
   color: #fff;
 }
 
@@ -236,7 +238,7 @@ a:focus-visible {
   position: fixed;
   top: 44px;
   right: 8px;
-  background: var(--ember);
+  background: var(--accent);
   color: #fff;
   font-family: system-ui, -apple-system, sans-serif;
   font-size: 13px;
@@ -276,7 +278,7 @@ a:focus-visible {
   width: 24px;
   height: 24px;
   border: 3px solid rgba(187, 188, 196, 0.15);
-  border-top-color: var(--ember);
+  border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
@@ -363,7 +365,7 @@ a:focus-visible {
   padding: 8px 16px;
   border: none;
   border-radius: var(--radius);
-  background: var(--ember);
+  background: var(--accent-live);
   color: #fff;
   font-family: inherit;
   font-size: 13px;
@@ -373,7 +375,7 @@ a:focus-visible {
 }
 
 .load-btn:hover:not(:disabled) {
-  background: var(--ember-dim);
+  background: var(--accent-live-dim);
 }
 
 .load-btn:disabled {
@@ -399,7 +401,7 @@ a:focus-visible {
 
 .remote-input:focus {
   outline: none;
-  border-color: var(--ember);
+  border-color: var(--accent);
   background: rgba(0, 0, 0, 0.3);
 }
 

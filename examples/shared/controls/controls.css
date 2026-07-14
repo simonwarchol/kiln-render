@@ -1,8 +1,8 @@
 /**
  * Dependency-free control panel styling (Phase 3) — replaces Tweakpane's
  * default skin for all user-facing UI. Built on the tokens from
- * viewer-shell.css (--bg-panel, --stroke, --text, --text-dim, --ember,
- * --ember-dim, --radius, --mono).
+ * viewer-shell.css (--bg-panel, --stroke, --text, --text-dim, --accent,
+ * --accent-dim, --accent-live, --radius, --mono).
  *
  * Layout contract: every row is [label 76px][control 1fr][value 60px] so
  * tracks, toggles, and values share the same left/right edges panel-wide.
@@ -71,7 +71,7 @@
 }
 
 .ctl-panel-header:focus-visible {
-  outline: 1px solid var(--ember);
+  outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
 
@@ -208,11 +208,11 @@
 }
 
 .ctl-toggle-input:checked + .ctl-toggle-track {
-  background: var(--ember);
+  background: var(--accent-live);
 }
 
 .ctl-toggle-row:hover .ctl-toggle-input:checked + .ctl-toggle-track {
-  background: var(--ember);
+  background: var(--accent-live);
 }
 
 .ctl-toggle-input:checked + .ctl-toggle-track::before {
@@ -221,7 +221,7 @@
 }
 
 .ctl-toggle-input:focus-visible + .ctl-toggle-track {
-  outline: 2px solid var(--ember);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -283,7 +283,7 @@
   transform: translateY(-50%);
   height: 3px;
   border-radius: 2px;
-  background: var(--ember);
+  background: var(--accent);
   pointer-events: none;
 }
 
@@ -346,7 +346,7 @@
 
 .ctl-slider-track input[type='range']:active::-webkit-slider-thumb,
 .ctl-range-track input[type='range']:active::-webkit-slider-thumb {
-  background: var(--ember);
+  background: var(--accent);
 }
 
 .ctl-slider-track input[type='range']:hover::-moz-range-thumb,
@@ -356,12 +356,12 @@
 
 .ctl-slider-track input[type='range']:active::-moz-range-thumb,
 .ctl-range-track input[type='range']:active::-moz-range-thumb {
-  background: var(--ember);
+  background: var(--accent);
 }
 
 .ctl-slider-track input[type='range']:focus-visible,
 .ctl-range-track input[type='range']:focus-visible {
-  outline: 2px solid var(--ember);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: 4px;
 }
@@ -412,7 +412,7 @@
 }
 
 .ctl-select-input:focus-visible {
-  outline: 2px solid var(--ember);
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
@@ -447,16 +447,16 @@
 }
 
 .ctl-segment.active {
-  background: var(--ember);
+  background: var(--accent);
   color: #fff;
 }
 
 .ctl-segment.active:hover {
-  background: var(--ember);
+  background: var(--accent);
 }
 
 .ctl-segment:focus-visible {
-  outline: 1px solid var(--ember);
+  outline: 1px solid var(--accent);
   outline-offset: -2px;
 }
 
@@ -507,7 +507,7 @@
 }
 
 .ctl-collapsible-header:focus-visible {
-  outline: 1px solid var(--ember);
+  outline: 1px solid var(--accent);
   outline-offset: -1px;
   border-radius: 4px;
 }
