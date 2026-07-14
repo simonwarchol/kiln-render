@@ -8,6 +8,7 @@ import { withBase } from 'vitepress';
   <main class="kiln-landing">
     <div class="kiln-landing-inner">
       <h1 class="kiln-wordmark">Kiln</h1>
+      <p class="kiln-tagline">WebGPU-native out-of-core volume rendering system</p>
       <nav class="kiln-links">
         <a :href="withBase('/gallery')">Examples</a>
         <a :href="withBase('/guide/introduction')">Documentation</a>
@@ -43,7 +44,7 @@ import { withBase } from 'vitepress';
 }
 
 .kiln-wordmark {
-  margin: 0 0 2.75rem;
+  margin: 0 0 1.25rem;
   font-weight: 300;
   font-size: clamp(3.25rem, 13vw, 8rem);
   line-height: 1;
@@ -51,6 +52,14 @@ import { withBase } from 'vitepress';
   text-transform: uppercase;
   color: var(--vp-c-text-1);
   text-indent: 0.16em;
+}
+
+.kiln-tagline {
+  margin: 0 0 2.75rem;
+  font-size: 0.95rem;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  color: var(--vp-c-text-2);
 }
 
 .kiln-links {
