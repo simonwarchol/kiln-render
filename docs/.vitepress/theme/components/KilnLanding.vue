@@ -17,12 +17,7 @@ import { withBase } from 'vitepress';
     </div>
 
     <footer class="kiln-footer">
-      <p class="kiln-meta">
-        <span><b>Apache-2.0</b></span>
-        <span>OME-Zarr <b>&amp; sharded binary</b></span>
-        <span>uint8 / uint16 / <b>float32</b></span>
-        <span>v0.4.1</span>
-      </p>
+      <p class="kiln-version">v0.4.1</p>
       <p class="kiln-copyright">© 2026 mpanknin</p>
     </footer>
   </main>
@@ -89,25 +84,16 @@ import { withBase } from 'vitepress';
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0.7rem;
+  gap: 0.35rem;
   padding: 0 24px;
 }
 
-.kiln-meta {
+.kiln-version {
   margin: 0;
-  display: flex;
-  justify-content: center;
-  flex-wrap: wrap;
-  gap: 1.75rem;
   font-family: var(--vp-font-family-mono);
   font-size: 0.76rem;
   letter-spacing: 0.02em;
   color: var(--vp-c-text-3);
-}
-
-.kiln-meta b {
-  font-weight: 500;
-  color: var(--vp-c-text-2);
 }
 
 .kiln-copyright {
@@ -118,6 +104,5 @@ import { withBase } from 'vitepress';
 
 @media (max-width: 480px) {
   .kiln-links { gap: 1.5rem; }
-  .kiln-meta { gap: 1rem; }
 }
 </style>
