@@ -56,6 +56,7 @@
   },
   "devDependencies": {
     "fflate": "^0.8.2",
+    "numcodecs": "^0.3.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.5",
     "vitepress": "^1.6.4",

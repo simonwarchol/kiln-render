@@ -15,6 +15,9 @@ importers:
       fflate:
         specifier: ^0.8.2
         version: 0.8.3
+      numcodecs:
+        specifier: ^0.3.2
+        version: 0.3.2
       typescript:
         specifier: ^5.7.2
         version: 5.9.3
