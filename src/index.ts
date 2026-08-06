@@ -27,7 +27,7 @@ export { UnsupportedDatasetError } from './data/data-provider.js';
 export { LocalZarrDataProvider } from './data/local-zarr-provider.js';
 
 // Validation utilities
-export { preValidateRemoteZarr, preValidateLocalZarr } from './data/zarr-validator.js';
+export { isRemoteZarr, preValidateRemoteZarr, preValidateLocalZarr } from './data/zarr-validator.js';
 
 // Local file loader utilities (File System Access API)
 export { promptForZarrDirectory, getStoredHandle, requestPermission } from './data/local-loader.js';

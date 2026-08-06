@@ -13,6 +13,80 @@ interface MultiscalesEntry {
   version?: string;
 }
 
+/** Root metadata keys that identify a Zarr store (v2 group/array or v3 node). */
+const ZARR_ROOT_KEYS = ['/zarr.json', '/.zgroup', '/.zarray'] as const;
+
+/** True if parsed JSON looks like Zarr root metadata for the given key. */
+function isZarrRootMetadata(key: string, data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false;
+  const obj = data as Record<string, unknown>;
+  if (key === '/zarr.json') {
+    // Zarr v3 requires zarr_format: 3; node_type alone is not sufficient.
+    return obj.zarr_format === 3
+      && (obj.node_type === 'group' || obj.node_type === 'array');
+  }
+  if (key === '/.zgroup') {
+    return obj.zarr_format === 2;
+  }
+  if (key === '/.zarray') {
+    return obj.zarr_format === 2 && ('shape' in obj || 'chunks' in obj);
+  }
+  return false;
+}
+
+type ProbeResult =
+  | { status: 'hit' }
+  | { status: 'absent' }
+  | { status: 'error'; error: unknown };
+
+/**
+ * Lightweight probe of one root metadata key.
+ * Mirrors TolerantFetchStore's 403/404/HTML→absent semantics, without retry backoff
+ * (format detection should fail fast).
+ */
+async function probeZarrRootKey(baseUrl: string, key: string): Promise<ProbeResult> {
+  try {
+    const response = await fetch(`${baseUrl}${key}`);
+    // 403/404 are intentional "not found" (CloudFront OAI, missing keys)
+    if (response.status === 404 || response.status === 403) return { status: 'absent' };
+    if (!response.ok) {
+      return { status: 'error', error: new Error(`HTTP ${response.status} probing ${key}`) };
+    }
+    const ct = response.headers.get('content-type') ?? '';
+    if (ct.includes('text/html')) return { status: 'absent' };
+    try {
+      const json: unknown = JSON.parse(await response.text());
+      return { status: isZarrRootMetadata(key, json) ? 'hit' : 'absent' };
+    } catch (error) {
+      if (error instanceof SyntaxError) return { status: 'absent' };
+      return { status: 'error', error };
+    }
+  } catch (error) {
+    return { status: 'error', error };
+  }
+}
+
+/**
+ * Probe a remote URL for Zarr root metadata (v2 `.zgroup`/`.zarray` or v3 `zarr.json`).
+ * Used to choose between Zarr and Kiln sharded providers without relying on the URL path.
+ *
+ * Returns `true` when valid root metadata is found, `false` when all candidates are
+ * clearly absent (404/403). Throws if the store is unreachable so callers can surface
+ * a network error instead of silently falling back to the sharded provider.
+ */
+export async function isRemoteZarr(url: string): Promise<boolean> {
+  const baseUrl = url.replace(/\/$/, '');
+  const results = await Promise.all(
+    ZARR_ROOT_KEYS.map(key => probeZarrRootKey(baseUrl, key)),
+  );
+
+  if (results.some(r => r.status === 'hit')) return true;
+  if (results.every(r => r.status === 'absent')) return false;
+
+  const first = results.find((r): r is Extract<ProbeResult, { status: 'error' }> => r.status === 'error');
+  throw first?.error ?? new Error('Failed to probe zarr metadata');
+}
+
 /** Normalised axis descriptor used internally */
 export interface NormalizedAxis {
   name: string;

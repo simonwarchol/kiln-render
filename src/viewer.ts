@@ -13,6 +13,7 @@ import { detectBest16BitFormat } from './core/volume.js';
 import type { DataProvider, VolumeMetadata } from './data/data-provider.js';
 import { ShardedDataProvider } from './data/sharded-provider.js';
 import { ZarrDataProvider } from './data/zarr-provider.js';
+import { isRemoteZarr } from './data/zarr-validator.js';
 
 export interface ViewerOptions {
   /** Initial render mode */
@@ -179,7 +180,7 @@ export class KilnViewer {
     if (isExternalProvider) {
       dataProvider = dataset as DataProvider;
     } else {
-      const isZarr = (dataset as string).includes('.zarr');
+      const isZarr = await isRemoteZarr(dataset as string);
       dataProvider = isZarr
         ? new ZarrDataProvider(dataset as string)
         : new ShardedDataProvider(dataset as string);
@@ -207,9 +208,8 @@ export class KilnViewer {
 
     // Configure worker target format (string-URL providers only)
     if (!isExternalProvider) {
-      const isHttpZarr = (dataset as string).includes('.zarr');
-      if (isHttpZarr) {
-        await (dataProvider as ZarrDataProvider).setTargetFormat(
+      if (dataProvider instanceof ZarrDataProvider) {
+        await dataProvider.setTargetFormat(
           textureFormat as 'r8unorm' | 'r16float',
         );
       } else if (textureFormat !== 'r16unorm' || sourceBitDepth !== 16) {

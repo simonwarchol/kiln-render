@@ -33,7 +33,7 @@ import { KilnViewer } from 'kiln-render';
 const viewer = await KilnViewer.create(canvas, 'https://example.com/data/scan.ome.zarr');
 ```
 
-Kiln auto-detects the format from the URL. Brick assembly (fetching Zarr chunks, decompressing, and re-chunking into 66³ bricks with ghost borders) runs in a Web Worker pool off the main thread.
+Kiln auto-detects Zarr by probing root metadata (`zarr.json` for v3, `.zgroup`/`.zarray` for v2) rather than the URL path. Brick assembly (fetching Zarr chunks, decompressing, and re-chunking into 66³ bricks with ghost borders) runs in a Web Worker pool off the main thread.
 
 ## Public OME-Zarr datasets
 

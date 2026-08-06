@@ -1,6 +1,7 @@
 /** Shared dataset-loading dialog — markup injection, local/remote load wiring, error display. */
 
 import {
+  isRemoteZarr,
   preValidateRemoteZarr,
   preValidateLocalZarr,
   promptForZarrDirectory,
@@ -131,23 +132,29 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
       if (!url) return;
       clearError();
 
-      if (url.includes('.zarr')) {
-        const origText = remoteLoadBtn.textContent ?? 'Load';
-        remoteLoadBtn.disabled = true;
-        remoteLoadBtn.textContent = 'Checking…';
-        try {
+      const origText = remoteLoadBtn.textContent ?? 'Load';
+      remoteLoadBtn.disabled = true;
+      remoteLoadBtn.textContent = 'Checking…';
+      try {
+        const isZarr = await isRemoteZarr(url);
+        if (isZarr) {
           const reasons = await preValidateRemoteZarr(url);
           if (reasons.length > 0) {
             showDialogError(reasons);
             return;
           }
-        } catch (_) {
-          showDialogError(['Could not reach dataset — check the URL is correct and publicly accessible']);
+        } else if (url.includes('.zarr')) {
+          // Path suggests Zarr but root metadata is missing — fail here rather than
+          // falling through to the sharded provider with a confusing error later.
+          showDialogError(['No Zarr metadata found at this URL (expected zarr.json or .zgroup)']);
           return;
-        } finally {
-          remoteLoadBtn.disabled = false;
-          remoteLoadBtn.textContent = origText;
         }
+      } catch (_) {
+        showDialogError(['Could not reach dataset — check the URL is correct and publicly accessible']);
+        return;
+      } finally {
+        remoteLoadBtn.disabled = false;
+        remoteLoadBtn.textContent = origText;
       }
 
       window.location.href = window.location.pathname + '?dataset=' + encodeURIComponent(url);

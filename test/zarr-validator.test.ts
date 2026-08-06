@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { normalizeAxes, extractMultiscales, validateZarrSupport } from '../src/data/zarr-validator.js';
+import { normalizeAxes, extractMultiscales, validateZarrSupport, isRemoteZarr } from '../src/data/zarr-validator.js';
 
 // ---------------------------------------------------------------------------
 // normalizeAxes
@@ -241,5 +241,105 @@ describe('validateZarrSupport', () => {
     expect(reasons).toEqual([]);
     expect(warnSpy).not.toHaveBeenCalledWith(expect.stringMatching(/channels/));
     warnSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isRemoteZarr
+// ---------------------------------------------------------------------------
+
+describe('isRemoteZarr', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function stubFetch(handler: (url: string) => Response | Promise<Response>) {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      return handler(href);
+    }));
+  }
+
+  function jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  it('detects Zarr v3 via zarr.json', async () => {
+    stubFetch(url => {
+      if (url.endsWith('/zarr.json')) {
+        return jsonResponse({ zarr_format: 3, node_type: 'group', attributes: {} });
+      }
+      return new Response(null, { status: 404 });
+    });
+    await expect(isRemoteZarr('https://example.com/volume')).resolves.toBe(true);
+  });
+
+  it('detects Zarr v2 via .zgroup', async () => {
+    stubFetch(url => {
+      if (url.endsWith('/.zgroup')) return jsonResponse({ zarr_format: 2 });
+      return new Response(null, { status: 404 });
+    });
+    await expect(isRemoteZarr('https://example.com/volume/')).resolves.toBe(true);
+  });
+
+  it('detects Zarr v2 array root via .zarray', async () => {
+    stubFetch(url => {
+      if (url.endsWith('/.zarray')) {
+        return jsonResponse({ zarr_format: 2, shape: [1, 2, 3], chunks: [1, 1, 1], dtype: '|u1' });
+      }
+      return new Response(null, { status: 404 });
+    });
+    await expect(isRemoteZarr('https://example.com/arr')).resolves.toBe(true);
+  });
+
+  it('returns false when no zarr root metadata exists (e.g. sharded binary)', async () => {
+    stubFetch(() => new Response(null, { status: 404 }));
+    await expect(isRemoteZarr('https://example.com/sharded')).resolves.toBe(false);
+  });
+
+  it('ignores non-zarr JSON at candidate keys', async () => {
+    stubFetch(url => {
+      if (url.endsWith('/zarr.json')) return jsonResponse({ foo: 'bar' });
+      return new Response(null, { status: 404 });
+    });
+    await expect(isRemoteZarr('https://example.com/not-zarr')).resolves.toBe(false);
+  });
+
+  it('rejects zarr.json with node_type but no zarr_format', async () => {
+    stubFetch(url => {
+      if (url.endsWith('/zarr.json')) return jsonResponse({ node_type: 'group', attributes: {} });
+      return new Response(null, { status: 404 });
+    });
+    await expect(isRemoteZarr('https://example.com/not-zarr')).resolves.toBe(false);
+  });
+
+  it('rejects zarr.json with zarr_format 3 but no node_type', async () => {
+    stubFetch(url => {
+      if (url.endsWith('/zarr.json')) return jsonResponse({ zarr_format: 3 });
+      return new Response(null, { status: 404 });
+    });
+    await expect(isRemoteZarr('https://example.com/not-zarr')).resolves.toBe(false);
+  });
+
+  it('treats HTML 200 responses as absent', async () => {
+    stubFetch(() => new Response('<html>nope</html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    }));
+    await expect(isRemoteZarr('https://example.com/missing')).resolves.toBe(false);
+  });
+
+  it('does not require .zarr in the URL path', async () => {
+    stubFetch(url => {
+      if (url.endsWith('/zarr.json')) {
+        return jsonResponse({ zarr_format: 3, node_type: 'group' });
+      }
+      return new Response(null, { status: 404 });
+    });
+    await expect(isRemoteZarr('https://cdn.example.com/datasets/beechnut')).resolves.toBe(true);
   });
 });
