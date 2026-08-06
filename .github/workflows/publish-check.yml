@@ -31,8 +31,8 @@ jobs:
         run: npm run build:lib
 
       - name: Validate package (publint)
-        run: npx --yes publint
+        run: npx --yes publint --pack npm
 
       - name: Validate types against a consumer (are-the-types-wrong)
-        # --pack packs the tarball and type-checks it the way an installer sees it.
-        run: npx --yes @arethetypeswrong/cli --pack .
+        # --pack checks the packed tarball as installed; esm-only matches this package's ESM-only support.
+        run: npx --yes @arethetypeswrong/cli --pack . --profile esm-only
