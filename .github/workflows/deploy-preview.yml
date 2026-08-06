@@ -15,14 +15,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
+          cache: 'pnpm'
 
       - name: Install dependencies
-        run: npm install
+        run: pnpm install
 
       - name: Extract branch name
         shell: bash
@@ -41,29 +46,29 @@ jobs:
       # (app before multichannel — see deploy.yml).
       #
       # Base is domain-aware, mirroring deploy.yml:
-      #   - kiln-render (custom apex domain): the gh-pages root is served at
-      #     kilnrender.com, so a preview lives at kilnrender.com/preview/<b>/ —
-      #     base = /preview/<b>/ (NO repo prefix).
-      #   - any other repo (e.g. kiln-render-private): served at
+      #   - canonical kiln-render (custom apex domain, not a fork): the gh-pages
+      #     root is served at kilnrender.com, so a preview lives at
+      #     kilnrender.com/preview/<b>/ — base = /preview/<b>/ (NO repo prefix).
+      #   - forks / any other repo (e.g. kiln-render-private): served at
       #     <owner>.github.io/<repo>/, so base = /<repo>/preview/<b>/.
       # VITE_PREVIEW marks the VitePress build so it emits <meta robots=noindex>
       # — public-repo previews sit under the production domain and must not be
       # indexed alongside the real site.
       - name: Build marketing site with branch-specific base
-        run: npm run build:site
+        run: pnpm run build:site
         env:
-          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
           VITE_PREVIEW: '1'
 
       - name: Build viewer app with branch-specific base
-        run: npm run build
+        run: pnpm run build
         env:
-          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
 
       - name: Build multichannel viewer with branch-specific base
-        run: npm run build:multichannel
+        run: pnpm run build:multichannel
         env:
-          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
 
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v3
@@ -80,8 +85,9 @@ jobs:
           script: |
             const branchName = '${{ steps.sanitize.outputs.sanitized }}';
             const repo = '${{ github.event.repository.name }}';
+            const isProd = repo === 'kiln-render' && ${{ github.event.repository.fork == false }};
             // Production repo is served at the custom apex domain root; others at github.io/<repo>/.
-            const previewUrl = repo === 'kiln-render'
+            const previewUrl = isProd
               ? `https://kilnrender.com/preview/${branchName}/`
               : `https://${{ github.repository_owner }}.github.io/${repo}/preview/${branchName}/`;
             github.rest.issues.createComment({

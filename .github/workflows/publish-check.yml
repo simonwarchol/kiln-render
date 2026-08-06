@@ -18,21 +18,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
+          cache: 'pnpm'
 
       - name: Install dependencies
-        run: npm install
+        run: pnpm install
 
       - name: Build library
-        run: npm run build:lib
+        run: pnpm run build:lib
 
       - name: Validate package (publint)
-        run: npx --yes publint
+        # --pack pnpm matches the repo package manager (auto can misfire in CI).
+        run: pnpm dlx publint --pack pnpm
 
       - name: Validate types against a consumer (are-the-types-wrong)
         # --pack packs the tarball and type-checks it the way an installer sees it.
-        run: npx --yes @arethetypeswrong/cli --pack .
+        run: pnpm dlx @arethetypeswrong/cli --pack .

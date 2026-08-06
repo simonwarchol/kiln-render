@@ -14,21 +14,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
+          cache: 'pnpm'
 
       - name: Install dependencies
-        run: npm install
+        run: pnpm install
 
       # Landing/gallery/docs at the site root (dist/), viewers under dist/app/.
       # Repo-agnostic base so this is safe on BOTH remotes:
-      #   - kiln-render (production, custom apex domain): served at kilnrender.com
-      #     root, so VITE_BASE = '/'.
-      #   - kiln-render-private (staging) or any other: no custom domain, served
-      #     at <owner>.github.io/<repo>/, so VITE_BASE = '/<repo>/'.
+      #   - kiln-render (production, custom apex domain, not a fork): served at
+      #     kilnrender.com root, so VITE_BASE = '/'.
+      #   - forks / kiln-render-private (staging) / any other: no custom domain,
+      #     served at <owner>.github.io/<repo>/, so VITE_BASE = '/<repo>/'.
       # The viewer configs derive /app/ from VITE_BASE. (Branch previews use a
       # repo-name base in deploy-preview.yml.)
       #
@@ -37,19 +42,19 @@ jobs:
       # emptyOutDir is scoped to those subfolders). App before multichannel so
       # the app build doesn't wipe dist/app/multichannel/.
       - name: Build marketing site (landing / gallery / docs)
-        run: npm run build:site
+        run: pnpm run build:site
         env:
-          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && '/' || format('/{0}/', github.event.repository.name) }}
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && '/' || format('/{0}/', github.event.repository.name) }}
 
       - name: Build viewer app
-        run: npm run build
+        run: pnpm run build
         env:
-          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && '/' || format('/{0}/', github.event.repository.name) }}
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && '/' || format('/{0}/', github.event.repository.name) }}
 
       - name: Build multichannel viewer
-        run: npm run build:multichannel
+        run: pnpm run build:multichannel
         env:
-          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && '/' || format('/{0}/', github.event.repository.name) }}
+          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && '/' || format('/{0}/', github.event.repository.name) }}
 
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v3
@@ -57,8 +62,8 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./dist
           keep_files: true
-          # Custom apex domain ONLY on the production repo. Empty elsewhere so
-          # staging (kiln-render-private) never claims kilnrender.com — two repos
-          # claiming one domain breaks GitHub Pages' domain verification.
+          # Custom apex domain ONLY on the canonical non-fork production repo.
+          # Forks named kiln-render must not publish a CNAME — that claims
+          # kilnrender.com and breaks Pages domain verification / deploy.
           # peaceiris skips writing CNAME when this is empty.
-          cname: ${{ github.event.repository.name == 'kiln-render' && 'kilnrender.com' || '' }}
+          cname: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && 'kilnrender.com' || '' }}

@@ -2,11 +2,16 @@
 
 import {
   isRemoteZarr,
-  preValidateRemoteZarr,
-  preValidateLocalZarr,
+  probeRemoteZarr,
+  probeLocalZarr,
   promptForZarrDirectory,
   clearHandle,
 } from 'kiln-render';
+import {
+  tryKilnViewerHref,
+  datasetViewerHref,
+  localViewerHref,
+} from './dataset-routing.js';
 
 // Inline SVGs matching the toolbar icon style (V-3 — replaces emoji).
 const FOLDER_ICON_SVG = '<svg viewBox="0 0 16 16"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.764c.958 0 1.76.56 2.311 1.184C7.985 3.648 8.48 4 9 4h4.5A1.5 1.5 0 0 1 15 5.5v.64c.57.265.94.876.856 1.546l-.64 5.124A2.5 2.5 0 0 1 12.733 15H3.266a2.5 2.5 0 0 1-2.481-2.19l-.64-5.124A1.5 1.5 0 0 1 1 6.14V3.5zM2 6h12v-.5a.5.5 0 0 0-.5-.5H9c-.964 0-1.71-.629-2.174-1.154C6.374 3.334 5.82 3 5.264 3H2.5a.5.5 0 0 0-.5.5V6z"/></svg>';
@@ -18,6 +23,13 @@ export interface DatasetDialogOptions {
   /** Optional "Supported formats ↗" link in the dialog header. */
   docsLink?: string;
 }
+
+export {
+  viewerSiteRoot,
+  tryKilnViewerHref,
+  datasetViewerHref,
+  localViewerHref,
+} from './dataset-routing.js';
 
 /** Injects the dialog markup into the document and wires up all its handlers. */
 export function mountDatasetDialog(opts: DatasetDialogOptions): void {
@@ -105,13 +117,15 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
         const orig = localBtn.textContent ?? '';
         localBtn.disabled = true;
         localBtn.textContent = 'Checking…';
+        let numChannels: number | null = null;
         try {
-          const reasons = await preValidateLocalZarr(handle);
-          if (reasons.length > 0) {
+          const probe = await probeLocalZarr(handle);
+          if (probe.reasons.length > 0) {
             await clearHandle();
-            showDialogError(reasons);
+            showDialogError(probe.reasons);
             return;
           }
+          numChannels = probe.numChannels;
         } catch (_) {
           showDialogError(['Could not read dataset metadata — is this a valid .zarr directory?']);
           await clearHandle();
@@ -121,7 +135,10 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
           localBtn.textContent = orig;
         }
 
-        window.location.href = window.location.pathname + '?local=true';
+        window.location.href = localViewerHref(numChannels, {
+          baseUrl: import.meta.env.BASE_URL,
+          currentPathname: window.location.pathname,
+        });
       });
     }
   }
@@ -132,17 +149,26 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
       if (!url) return;
       clearError();
 
+      // Full Kiln share link → open that viewer URL as-is (preserves channels/cam/etc.)
+      const kilnHref = tryKilnViewerHref(url, window.location.origin);
+      if (kilnHref) {
+        window.location.href = kilnHref;
+        return;
+      }
+
       const origText = remoteLoadBtn.textContent ?? 'Load';
       remoteLoadBtn.disabled = true;
       remoteLoadBtn.textContent = 'Checking…';
+      let numChannels: number | null = null;
       try {
         const isZarr = await isRemoteZarr(url);
         if (isZarr) {
-          const reasons = await preValidateRemoteZarr(url);
-          if (reasons.length > 0) {
-            showDialogError(reasons);
+          const probe = await probeRemoteZarr(url);
+          if (probe.reasons.length > 0) {
+            showDialogError(probe.reasons);
             return;
           }
+          numChannels = probe.numChannels;
         } else if (url.includes('.zarr')) {
           // Path suggests Zarr but root metadata is missing — fail here rather than
           // falling through to the sharded provider with a confusing error later.
@@ -157,7 +183,10 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
         remoteLoadBtn.textContent = origText;
       }
 
-      window.location.href = window.location.pathname + '?dataset=' + encodeURIComponent(url);
+      window.location.href = datasetViewerHref(url, numChannels, {
+        baseUrl: import.meta.env.BASE_URL,
+        currentPathname: window.location.pathname,
+      });
     };
 
     remoteLoadBtn.addEventListener('click', loadRemote);

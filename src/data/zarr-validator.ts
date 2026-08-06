@@ -164,10 +164,24 @@ export function validateZarrSupport(
   return reasons;
 }
 
-/** Pre-validate a remote zarr URL (metadata only, no volume data fetched). */
-export async function preValidateRemoteZarr(url: string): Promise<string[]> {
-  const store = new TolerantFetchStore(url.replace(/\/$/, ''));
-  const rootGroup = await open(root(store), { kind: 'group' });
+/** Result of probing an OME-Zarr store for support + channel count. */
+export interface ZarrProbeResult {
+  /** Human-readable rejection reasons; empty means supported. */
+  reasons: string[];
+  /** Channel axis length (1 when absent). Used to pick basic vs multichannel viewer. */
+  numChannels: number;
+}
+
+/** Channel count from multiscales axes + array shape (defaults to 1). */
+export function countChannels(ms: MultiscalesEntry, shape: number[]): number {
+  const axes = normalizeAxes(ms.axes);
+  const channelIdx = axes.findIndex(a => a.type === 'channel');
+  if (channelIdx < 0) return 1;
+  return Math.max(1, shape[channelIdx] ?? 1);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function probeZarrGroup(rootGroup: any): Promise<ZarrProbeResult> {
   const attrs = rootGroup.attrs as Record<string, unknown>;
 
   // Try root attrs first; fall back to bioformats2raw sub-group "0"
@@ -185,15 +199,40 @@ export async function preValidateRemoteZarr(url: string): Promise<string[]> {
   }
 
   if (!ms) {
-    return ['No OME-NGFF multiscales metadata found'];
+    return { reasons: ['No OME-NGFF multiscales metadata found'], numChannels: 1 };
   }
 
   const firstPath = ms.datasets[0]?.path;
-  if (!firstPath) return ['Dataset has no array entries'];
+  if (!firstPath) {
+    return { reasons: ['Dataset has no array entries'], numChannels: 1 };
+  }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const arr = await open(group.resolve(firstPath), { kind: 'array' }) as any;
-  return validateZarrSupport(ms, arr.shape, String(arr.dtype));
+  const shape = arr.shape as number[];
+  return {
+    reasons: validateZarrSupport(ms, shape, String(arr.dtype)),
+    numChannels: countChannels(ms, shape),
+  };
+}
+
+/** Probe a remote zarr URL (metadata only) — support reasons + channel count. */
+export async function probeRemoteZarr(url: string): Promise<ZarrProbeResult> {
+  const store = new TolerantFetchStore(url.replace(/\/$/, ''));
+  const rootGroup = await open(root(store), { kind: 'group' });
+  return probeZarrGroup(rootGroup);
+}
+
+/** Pre-validate a remote zarr URL (metadata only, no volume data fetched). */
+export async function preValidateRemoteZarr(url: string): Promise<string[]> {
+  return (await probeRemoteZarr(url)).reasons;
+}
+
+/** Probe a local zarr directory — support reasons + channel count. */
+export async function probeLocalZarr(handle: FileSystemDirectoryHandle): Promise<ZarrProbeResult> {
+  const store = new FileSystemStore(handle);
+  const rootGroup = await open(root(store), { kind: 'group' });
+  return probeZarrGroup(rootGroup);
 }
 
 /**
@@ -201,32 +240,5 @@ export async function preValidateRemoteZarr(url: string): Promise<string[]> {
  * Same logic as preValidateRemoteZarr but reads from the local filesystem.
  */
 export async function preValidateLocalZarr(handle: FileSystemDirectoryHandle): Promise<string[]> {
-  const store = new FileSystemStore(handle);
-  const rootGroup = await open(root(store), { kind: 'group' });
-  const attrs = rootGroup.attrs as Record<string, unknown>;
-
-  // Try root attrs first; fall back to bioformats2raw sub-group "0"
-  let ms = extractMultiscales(attrs);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let group: any = rootGroup;
-  if (!ms) {
-    try {
-      const subGroup = await open(rootGroup.resolve('0'), { kind: 'group' });
-      ms = extractMultiscales(subGroup.attrs as Record<string, unknown>);
-      if (ms) group = subGroup;
-    } catch {
-      // sub-group doesn't exist
-    }
-  }
-
-  if (!ms) {
-    return ['No OME-NGFF multiscales metadata found'];
-  }
-
-  const firstPath = ms.datasets[0]?.path;
-  if (!firstPath) return ['Dataset has no array entries'];
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const arr = await open(group.resolve(firstPath), { kind: 'array' }) as any;
-  return validateZarrSupport(ms, arr.shape, String(arr.dtype));
+  return (await probeLocalZarr(handle)).reasons;
 }
