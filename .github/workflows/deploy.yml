@@ -61,4 +61,6 @@ jobs:
           # staging (kiln-render-private) never claims kilnrender.com — two repos
           # claiming one domain breaks GitHub Pages' domain verification.
           # peaceiris skips writing CNAME when this is empty.
-          cname: ${{ github.event.repository.name == 'kiln-render' && 'kilnrender.com' || '' }}
+          # Only the canonical, non-fork production repo should claim the custom
+          # domain; forks named kiln-render must not publish a CNAME.
+          cname: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && 'kilnrender.com' || '' }}
