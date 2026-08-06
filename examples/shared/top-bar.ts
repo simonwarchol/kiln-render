@@ -12,14 +12,16 @@ export interface TopBarOptions {
 
 export interface TopBar {
   setDatasetName(name: string): void;
+  /** Show/hide the beta tag on the wordmark (e.g. after detecting multichannel). */
+  setBeta(enabled: boolean): void;
 }
 
 export function mountTopBar(opts: TopBarOptions = {}): TopBar {
   const githubUrl = opts.githubUrl ?? 'https://github.com/MPanknin/kiln-render';
 
   // The wordmark links back to the gallery. Derive its URL from this viewer's
-  // base (/app/ or /app/multichannel/, plus any preview prefix) by stripping
-  // the app segment — base-agnostic across production, staging, and previews.
+  // base (/app/ or legacy /app/multichannel/, plus any preview prefix) by
+  // stripping the app segment — base-agnostic across production and previews.
   const galleryUrl =
     import.meta.env.BASE_URL.replace(/app\/(multichannel\/)?$/, '') + 'gallery.html';
 
@@ -41,12 +43,18 @@ export function mountTopBar(opts: TopBarOptions = {}): TopBar {
   document.body.appendChild(bar);
 
   const nameEl = document.getElementById('dataset-name');
+  const wordmark = bar.querySelector('.wordmark') as HTMLAnchorElement | null;
   return {
     setDatasetName(name: string) {
       if (nameEl) {
         nameEl.textContent = name;
         nameEl.title = name;
       }
+    },
+    setBeta(enabled: boolean) {
+      if (!wordmark) return;
+      const label = enabled ? 'Kiln<sup>beta</sup>' : 'Kiln';
+      if (wordmark.innerHTML !== label) wordmark.innerHTML = label;
     },
   };
 }

@@ -13,7 +13,7 @@ describe('viewerSiteRoot', () => {
     expect(viewerSiteRoot('/app/')).toBe('/');
   });
 
-  it('strips /app/multichannel/ suffix', () => {
+  it('strips legacy /app/multichannel/ suffix', () => {
     expect(viewerSiteRoot('/kiln-render/app/multichannel/')).toBe('/kiln-render/');
     expect(viewerSiteRoot('/app/multichannel/')).toBe('/');
   });
@@ -22,11 +22,11 @@ describe('viewerSiteRoot', () => {
 describe('tryKilnViewerHref', () => {
   const origin = 'https://kilnrender.com';
 
-  it('recognises a multichannel share link on the same origin', () => {
+  it('rewrites legacy multichannel share links onto /app/', () => {
     const input =
       'https://kilnrender.com/app/multichannel/?dataset=https%3A%2F%2Fexample.com%2Fim.zarr%2F0&up=-z&mode=mip&channels=0%2C0%2C255%2C1.00%2C1%2C0.00%2C0.04';
     expect(tryKilnViewerHref(input, origin)).toBe(
-      '/app/multichannel/?dataset=https%3A%2F%2Fexample.com%2Fim.zarr%2F0&up=-z&mode=mip&channels=0%2C0%2C255%2C1.00%2C1%2C0.00%2C0.04',
+      '/app/?dataset=https%3A%2F%2Fexample.com%2Fim.zarr%2F0&up=-z&mode=mip&channels=0%2C0%2C255%2C1.00%2C1%2C0.00%2C0.04',
     );
   });
 
@@ -37,9 +37,11 @@ describe('tryKilnViewerHref', () => {
     );
   });
 
-  it('returns a full href for cross-origin kiln links', () => {
+  it('normalises cross-origin kiln links onto /app/', () => {
     const input = 'https://kilnrender.com/app/multichannel/?dataset=https://example.com/x.zarr';
-    expect(tryKilnViewerHref(input, 'https://preview.example.com')).toBe(input);
+    expect(tryKilnViewerHref(input, 'https://preview.example.com')).toBe(
+      'https://kilnrender.com/app/?dataset=https://example.com/x.zarr',
+    );
   });
 
   it('rejects plain zarr dataset URLs', () => {
@@ -56,39 +58,30 @@ describe('tryKilnViewerHref', () => {
 describe('datasetViewerHref', () => {
   const zarr = 'https://example.com/multi.zarr';
 
-  it('routes multi-channel datasets to /app/multichannel/', () => {
+  it('always routes to the unified /app/ viewer', () => {
     expect(
-      datasetViewerHref(zarr, 4, {
+      datasetViewerHref(zarr, {
         baseUrl: '/app/',
         currentPathname: '/app/',
       }),
-    ).toBe(`/app/multichannel/?dataset=${encodeURIComponent(zarr)}`);
+    ).toBe(`/app/?dataset=${encodeURIComponent(zarr)}`);
   });
 
-  it('routes single-channel datasets to /app/', () => {
+  it('rewrites legacy multichannel base onto /app/', () => {
     expect(
-      datasetViewerHref(zarr, 1, {
+      datasetViewerHref(zarr, {
         baseUrl: '/app/multichannel/',
         currentPathname: '/app/multichannel/',
       }),
     ).toBe(`/app/?dataset=${encodeURIComponent(zarr)}`);
   });
-
-  it('keeps the current path when channel count is unknown (sharded)', () => {
-    expect(
-      datasetViewerHref('https://example.com/sharded', null, {
-        baseUrl: '/app/',
-        currentPathname: '/app/',
-      }),
-    ).toBe(`/app/?dataset=${encodeURIComponent('https://example.com/sharded')}`);
-  });
 });
 
 describe('localViewerHref', () => {
-  it('routes multi-channel local loads to /app/multichannel/', () => {
+  it('loads local datasets on /app/', () => {
     expect(
-      localViewerHref(4, { baseUrl: '/app/', currentPathname: '/app/' }),
-    ).toBe('/app/multichannel/?local=true');
+      localViewerHref({ baseUrl: '/app/', currentPathname: '/app/' }),
+    ).toBe('/app/?local=true');
   });
 });
 

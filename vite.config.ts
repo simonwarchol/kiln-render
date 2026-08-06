@@ -1,15 +1,16 @@
 import { defineConfig } from 'vite';
 import { resolve } from 'path';
-import { copyFavicons } from './vite.favicons';
+import { copyFavicons, legacyMultichannelRedirect } from './vite.favicons';
 
 export default defineConfig({
   root: 'examples/basic-viewer',
-  // VITE_BASE is the site-root prefix (default /kiln-render/); the viewer app
-  // always lives under <root>/app/. The site build uses the bare root; CI
-  // preview overrides VITE_BASE with a branch-specific prefix.
+  // VITE_BASE is the site-root prefix (default /kiln-render/); the unified
+  // viewer (single- + multi-channel) lives under <root>/app/. The site build
+  // uses the bare root; CI preview overrides VITE_BASE with a branch-specific
+  // prefix.
   base: (process.env.VITE_BASE || '/kiln-render/') + 'app/',
   publicDir: resolve(__dirname, 'public'),
-  plugins: [copyFavicons()],
+  plugins: [copyFavicons(), legacyMultichannelRedirect()],
   server: {
     port: 3000,
     open: true,

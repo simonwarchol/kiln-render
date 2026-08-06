@@ -19,9 +19,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up pnpm
+        # Version comes from package.json "packageManager" — don't also pass `version` here.
         uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -41,4 +40,5 @@ jobs:
 
       - name: Validate types against a consumer (are-the-types-wrong)
         # --pack packs the tarball and type-checks it the way an installer sees it.
-        run: pnpm dlx @arethetypeswrong/cli --pack .
+        # esm-only: package is "type":"module" with no CJS export — ignore false-CJS noise.
+        run: pnpm dlx @arethetypeswrong/cli --pack . --profile esm-only

@@ -21,9 +21,8 @@ function thumbSrc(src: string): string {
     <div v-for="item in gallery" :key="item.title" class="gallery-item">
       <a class="gallery-open" :href="item.href" target="_blank" rel="noopener">
         <div class="gallery-thumb">
-          <!-- Multichannel rendering is beta — flag it on the cards that open the
-               multichannel viewer (detected from the href). -->
-          <span v-if="item.href.includes('app/multichannel/')" class="gallery-beta">beta</span>
+          <!-- Multichannel rendering is beta — flag cards with per-channel share params. -->
+          <span v-if="item.href.includes('channels=')" class="gallery-beta">beta</span>
           <img v-if="item.thumb" :src="thumbSrc(item.thumb)" :alt="item.alt || item.title" loading="lazy" />
           <span v-else class="gallery-placeholder">{{ item.placeholder }}</span>
         </div>

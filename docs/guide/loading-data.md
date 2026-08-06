@@ -64,7 +64,7 @@ viewer.onChannelWindowsChanged = () => {
 };
 ```
 
-See the [Multichannel documentation](/rendering/multichannel) for compositing details, the multichannel demo, and known limitations.
+See the [Multichannel documentation](/rendering/multichannel) for compositing details, the demo viewer, and known limitations.
 
 ## Pre-validating remote datasets
 

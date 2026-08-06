@@ -105,15 +105,13 @@ viewer.onChannelWindowsChanged = () => {
 };
 ```
 
-## Multichannel demo
+## Demo viewer
 
-A dedicated multichannel demo is included at `examples/multichannel-viewer/`:
+The unified demo at `/app/` detects channel count after load and shows per-channel controls (colour, window, visibility) when `numChannels > 1`. Shareable state uses the URL parameters below.
 
 ```bash
-npm run dev:multichannel   # http://localhost:3001
+pnpm dev   # http://localhost:3000
 ```
-
-The demo provides per-channel UI controls (colour picker, window sliders, visibility toggle) and supports URL-shareable state.
 
 ### URL parameters
 

@@ -2,8 +2,8 @@
 
 import {
   isRemoteZarr,
-  probeRemoteZarr,
-  probeLocalZarr,
+  preValidateRemoteZarr,
+  preValidateLocalZarr,
   promptForZarrDirectory,
   clearHandle,
 } from 'kiln-render';
@@ -117,15 +117,13 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
         const orig = localBtn.textContent ?? '';
         localBtn.disabled = true;
         localBtn.textContent = 'Checking…';
-        let numChannels: number | null = null;
         try {
-          const probe = await probeLocalZarr(handle);
-          if (probe.reasons.length > 0) {
+          const reasons = await preValidateLocalZarr(handle);
+          if (reasons.length > 0) {
             await clearHandle();
-            showDialogError(probe.reasons);
+            showDialogError(reasons);
             return;
           }
-          numChannels = probe.numChannels;
         } catch (_) {
           showDialogError(['Could not read dataset metadata — is this a valid .zarr directory?']);
           await clearHandle();
@@ -135,7 +133,7 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
           localBtn.textContent = orig;
         }
 
-        window.location.href = localViewerHref(numChannels, {
+        window.location.href = localViewerHref({
           baseUrl: import.meta.env.BASE_URL,
           currentPathname: window.location.pathname,
         });
@@ -149,7 +147,7 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
       if (!url) return;
       clearError();
 
-      // Full Kiln share link → open that viewer URL as-is (preserves channels/cam/etc.)
+      // Full Kiln share link → open unified /app/ (rewrites legacy /app/multichannel/)
       const kilnHref = tryKilnViewerHref(url, window.location.origin);
       if (kilnHref) {
         window.location.href = kilnHref;
@@ -159,19 +157,15 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
       const origText = remoteLoadBtn.textContent ?? 'Load';
       remoteLoadBtn.disabled = true;
       remoteLoadBtn.textContent = 'Checking…';
-      let numChannels: number | null = null;
       try {
         const isZarr = await isRemoteZarr(url);
         if (isZarr) {
-          const probe = await probeRemoteZarr(url);
-          if (probe.reasons.length > 0) {
-            showDialogError(probe.reasons);
+          const reasons = await preValidateRemoteZarr(url);
+          if (reasons.length > 0) {
+            showDialogError(reasons);
             return;
           }
-          numChannels = probe.numChannels;
         } else if (url.includes('.zarr')) {
-          // Path suggests Zarr but root metadata is missing — fail here rather than
-          // falling through to the sharded provider with a confusing error later.
           showDialogError(['No Zarr metadata found at this URL (expected zarr.json or .zgroup)']);
           return;
         }
@@ -183,7 +177,7 @@ export function mountDatasetDialog(opts: DatasetDialogOptions): void {
         remoteLoadBtn.textContent = origText;
       }
 
-      window.location.href = datasetViewerHref(url, numChannels, {
+      window.location.href = datasetViewerHref(url, {
         baseUrl: import.meta.env.BASE_URL,
         currentPathname: window.location.pathname,
       });

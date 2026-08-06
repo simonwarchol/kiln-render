@@ -1,6 +1,9 @@
 /**
  * Kiln — application entry point. URL parsing, data provider selection,
  * dataset dialog, and share button. Rendering lives in KilnViewer.
+ *
+ * Single- and multi-channel datasets share this app: after create(), the UI
+ * is chosen from viewer.renderer.numChannels (VolumeUI vs MultichannelUI).
  */
 
 import {
@@ -13,6 +16,8 @@ import {
 } from 'kiln-render';
 import type { ViewerOptions, DataProvider, TFPreset, UpAxis } from 'kiln-render';
 import { VolumeUI } from './ui/volume-ui.js';
+import { MultichannelUI } from './ui/multichannel-ui.js';
+import type { ChannelState } from './ui/multichannel-ui.js';
 import { mountDatasetDialog, showDialogError } from '../../shared/dataset-dialog.js';
 import { mountToast } from '../../shared/toast.js';
 import { setupShareButton } from '../../shared/share-button.js';
@@ -30,7 +35,16 @@ const DEFAULT_VOLUME_SOURCE = 'https://d39zu0xtgv0613.cloudfront.net/chameleon-1
 // onto the canvas by the Camera class, independent of any of this example's UI.
 const IS_EMBED = new URLSearchParams(window.location.search).get('embed') === '1';
 
-/** Parse URL parameters for per-dataset configuration */
+interface MultiSliceParams {
+  x: number;
+  y: number;
+  z: number;
+  showX: boolean;
+  showY: boolean;
+  showZ: boolean;
+}
+
+/** Parse URL parameters for per-dataset configuration (single- + multi-channel schemas). */
 function parseURLParams(): {
   dataset: string;
   mode?: VolumeRenderMode;
@@ -50,6 +64,9 @@ function parseURLParams(): {
   tfPoints?: Array<{ x: number; y: number }>;
   wireframe?: boolean;
   axis?: boolean;
+  /** Multichannel share schema */
+  channels?: ChannelState[];
+  multiSlice?: MultiSliceParams;
 } {
   const params = new URLSearchParams(window.location.search);
   let cam: [number, number, number] | [number, number, number, number, number, number] | undefined;
@@ -108,6 +125,42 @@ function parseURLParams(): {
     }
   }
 
+  let channels: ChannelState[] | undefined;
+  const channelsStr = params.get('channels');
+  if (channelsStr) {
+    const parsed = channelsStr.split(';').map(part => {
+      const nums = part.split(',').map(Number);
+      return {
+        r: (nums[0] ?? NaN) | 0,
+        g: (nums[1] ?? NaN) | 0,
+        b: (nums[2] ?? NaN) | 0,
+        a: nums[3] ?? NaN,
+        visible: (nums[4] ?? 0) !== 0,
+        min: nums[5] ?? 0,
+        max: nums[6] ?? 1,
+      };
+    });
+    if (parsed.every(ch => !isNaN(ch.r) && !isNaN(ch.g) && !isNaN(ch.b) && !isNaN(ch.a))) {
+      channels = parsed;
+    }
+  }
+
+  let multiSlice: MultiSliceParams | undefined;
+  const sliceStr = params.get('slice');
+  if (sliceStr) {
+    const parts = sliceStr.split(',').map(Number);
+    if (parts.length === 6 && parts.every(n => !isNaN(n))) {
+      multiSlice = {
+        x: parts[0]!,
+        y: parts[1]!,
+        z: parts[2]!,
+        showX: parts[3]! !== 0,
+        showY: parts[4]! !== 0,
+        showZ: parts[5]! !== 0,
+      };
+    }
+  }
+
   return {
     dataset: params.get('dataset') ?? DEFAULT_VOLUME_SOURCE,
     mode: (params.get('mode') as VolumeRenderMode) ?? undefined,
@@ -127,6 +180,8 @@ function parseURLParams(): {
     tfPoints,
     wireframe: params.get('wireframe') === '1' ? true : undefined,
     axis: params.get('axis') === '1' ? true : undefined,
+    channels,
+    multiSlice,
   };
 }
 
@@ -196,7 +251,18 @@ async function main() {
   document.getElementById('spinner')?.classList.add('active');
   const viewer = await KilnViewer.create(canvas, dataset, options);
   document.getElementById('spinner')?.classList.remove('active');
+
+  const isMultichannel = viewer.renderer.numChannels > 1;
   topBar?.setDatasetName(viewer.metadata.name);
+  if (isMultichannel) topBar?.setBeta(true);
+
+  // Multichannel share links often set mode after create (ISO unsupported).
+  if (
+    isMultichannel &&
+    (urlParams.mode === 'dvr' || urlParams.mode === 'mip' || urlParams.mode === 'slice')
+  ) {
+    viewer.mode = urlParams.mode;
+  }
 
   trackEvent('webgpu-ok', 'WebGPU initialized');
   trackDataset(viewer.metadata.name);
@@ -208,51 +274,99 @@ async function main() {
   // ── UI (skipped in embed mode — rendering + camera interaction only) ───────
 
   if (!IS_EMBED) {
-    const ui = new VolumeUI(viewer);
-    viewer.onBeforeFrame = () => ui.recordFrame();
-    ui.syncFromState();
-
     const toast = mountToast();
-    setupShareButton({
-      isLocalZarr,
-      toast,
-      buildShareUrl: () => {
-        const state = viewer.getState();
-        const p = new URLSearchParams();
-        if (volumeSource !== DEFAULT_VOLUME_SOURCE) p.set('dataset', volumeSource);
-        p.set('mode', state.mode);
-        p.set('wc', state.windowCenter.toFixed(2));
-        p.set('ww', state.windowWidth.toFixed(2));
-        p.set('density', state.densityScale.toFixed(2));
-        p.set('iso', state.isoValue.toFixed(2));
-        p.set('tf', state.tfPreset);
-        p.set('tfpts', state.tfPoints.map(pt => `${pt.x.toFixed(2)},${pt.y.toFixed(2)}`).join(','));
-        p.set('up', state.upAxis);
-        p.set('scale', state.renderScale.toFixed(2));
-        const [rx, ry, dist, tx, ty, tz] = state.cam;
-        p.set('cam', `${rx.toFixed(3)},${ry.toFixed(3)},${dist.toFixed(3)},${tx.toFixed(3)},${ty.toFixed(3)},${tz.toFixed(3)}`);
 
-        if (state.clipMin[0] !== 0 || state.clipMin[1] !== 0 || state.clipMin[2] !== 0) {
-          p.set('clipMin', state.clipMin.map(v => v.toFixed(2)).join(','));
-        }
-        if (state.clipMax[0] !== 1 || state.clipMax[1] !== 1 || state.clipMax[2] !== 1) {
-          p.set('clipMax', state.clipMax.map(v => v.toFixed(2)).join(','));
-        }
+    if (isMultichannel) {
+      const ui = new MultichannelUI(viewer, urlParams.channels, urlParams.multiSlice);
+      viewer.onBeforeFrame = () => ui.recordFrame();
+      viewer.onChannelWindowsChanged = () => ui.refreshChannelWindows();
 
-        // Overlays — only emit when non-default (both default to false)
-        if (state.showWireframe) p.set('wireframe', '1');
-        if (state.showAxis) p.set('axis', '1');
+      setupShareButton({
+        isLocalZarr,
+        toast,
+        buildShareUrl: () => {
+          const state = viewer.getState();
+          const p = new URLSearchParams();
+          if (volumeSource !== DEFAULT_VOLUME_SOURCE) p.set('dataset', volumeSource);
+          p.set('up', state.upAxis);
+          p.set('mode', state.mode);
+          p.set('scale', state.renderScale.toFixed(2));
+          const [rx, ry, dist, tx, ty, tz] = state.cam;
+          p.set(
+            'cam',
+            `${rx.toFixed(3)},${ry.toFixed(3)},${dist.toFixed(3)},${tx.toFixed(3)},${ty.toFixed(3)},${tz.toFixed(3)}`,
+          );
+          const channelState = ui.getChannelState();
+          if (channelState.length > 0) {
+            p.set(
+              'channels',
+              channelState
+                .map(
+                  ch =>
+                    `${ch.r},${ch.g},${ch.b},${ch.a.toFixed(2)},${ch.visible ? 1 : 0},${ch.min.toFixed(2)},${ch.max.toFixed(2)}`,
+                )
+                .join(';'),
+            );
+          }
+          const sliceState = ui.getSliceState();
+          p.set(
+            'slice',
+            `${sliceState.x},${sliceState.y},${sliceState.z},${sliceState.showX ? 1 : 0},${sliceState.showY ? 1 : 0},${sliceState.showZ ? 1 : 0}`,
+          );
+          return `${window.location.origin}${window.location.pathname}?${p.toString()}`;
+        },
+      });
+    } else {
+      const ui = new VolumeUI(viewer);
+      viewer.onBeforeFrame = () => ui.recordFrame();
+      ui.syncFromState();
 
-        // Slice planes — only emit when in slice mode
-        if (state.mode === 'slice') {
-          p.set('slices', `${state.sliceX.toFixed(2)},${state.sliceY.toFixed(2)},${state.sliceZ.toFixed(2)}`);
-          const visMask = (state.showSliceX ? 1 : 0) | (state.showSliceY ? 2 : 0) | (state.showSliceZ ? 4 : 0);
-          if (visMask !== 7) p.set('sliceVis', String(visMask)); // omit when all visible
-        }
+      setupShareButton({
+        isLocalZarr,
+        toast,
+        buildShareUrl: () => {
+          const state = viewer.getState();
+          const p = new URLSearchParams();
+          if (volumeSource !== DEFAULT_VOLUME_SOURCE) p.set('dataset', volumeSource);
+          p.set('mode', state.mode);
+          p.set('wc', state.windowCenter.toFixed(2));
+          p.set('ww', state.windowWidth.toFixed(2));
+          p.set('density', state.densityScale.toFixed(2));
+          p.set('iso', state.isoValue.toFixed(2));
+          p.set('tf', state.tfPreset);
+          p.set('tfpts', state.tfPoints.map(pt => `${pt.x.toFixed(2)},${pt.y.toFixed(2)}`).join(','));
+          p.set('up', state.upAxis);
+          p.set('scale', state.renderScale.toFixed(2));
+          const [rx, ry, dist, tx, ty, tz] = state.cam;
+          p.set(
+            'cam',
+            `${rx.toFixed(3)},${ry.toFixed(3)},${dist.toFixed(3)},${tx.toFixed(3)},${ty.toFixed(3)},${tz.toFixed(3)}`,
+          );
 
-        return `${window.location.origin}${window.location.pathname}?${p.toString()}`;
-      },
-    });
+          if (state.clipMin[0] !== 0 || state.clipMin[1] !== 0 || state.clipMin[2] !== 0) {
+            p.set('clipMin', state.clipMin.map(v => v.toFixed(2)).join(','));
+          }
+          if (state.clipMax[0] !== 1 || state.clipMax[1] !== 1 || state.clipMax[2] !== 1) {
+            p.set('clipMax', state.clipMax.map(v => v.toFixed(2)).join(','));
+          }
+
+          if (state.showWireframe) p.set('wireframe', '1');
+          if (state.showAxis) p.set('axis', '1');
+
+          if (state.mode === 'slice') {
+            p.set(
+              'slices',
+              `${state.sliceX.toFixed(2)},${state.sliceY.toFixed(2)},${state.sliceZ.toFixed(2)}`,
+            );
+            const visMask =
+              (state.showSliceX ? 1 : 0) | (state.showSliceY ? 2 : 0) | (state.showSliceZ ? 4 : 0);
+            if (visMask !== 7) p.set('sliceVis', String(visMask));
+          }
+
+          return `${window.location.origin}${window.location.pathname}?${p.toString()}`;
+        },
+      });
+    }
   }
 
   // ── Cleanup ────────────────────────────────────────────────────────────────
@@ -272,7 +386,7 @@ function showError(message: string) {
 }
 
 // Wire up the top bar (provides #load-dataset-btn / #share-btn) and dialog —
-// skipped entirely in embed mode.
+// skipped entirely in embed mode. Beta badge is enabled after load if multi-channel.
 const topBar = IS_EMBED ? null : mountTopBar();
 if (!IS_EMBED) {
   mountDatasetDialog({

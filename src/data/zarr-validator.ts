@@ -168,7 +168,7 @@ export function validateZarrSupport(
 export interface ZarrProbeResult {
   /** Human-readable rejection reasons; empty means supported. */
   reasons: string[];
-  /** Channel axis length (1 when absent). Used to pick basic vs multichannel viewer. */
+  /** Channel axis length (1 when absent). */
   numChannels: number;
 }
 

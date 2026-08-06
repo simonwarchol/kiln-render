@@ -40,18 +40,16 @@
   ],
   "scripts": {
     "dev": "vite",
-    "dev:multichannel": "vite --config vite.multichannel.config.ts",
     "dev:site": "vitepress dev docs",
     "build": "tsc && vite build",
-    "build:multichannel": "vite build --config vite.multichannel.config.ts",
     "build:site": "vitepress build docs",
     "preview:site": "vitepress preview docs",
-    "build:all": "pnpm run build:site && pnpm run build && pnpm run build:multichannel",
+    "build:all": "pnpm run build:site && pnpm run build",
     "build:lib": "vite build --config vite.lib.config.ts && tsc -p tsconfig.lib.json && rm -rf lib/assets && node scripts/postbuild-lib.mjs",
     "preview": "vite preview",
     "test": "vitest",
     "test:run": "vitest run",
-    "lint:publish": "pnpm run build:lib && pnpm dlx publint --pack pnpm && pnpm dlx @arethetypeswrong/cli --pack ."
+    "lint:publish": "pnpm run build:lib && pnpm dlx publint --pack pnpm && pnpm dlx @arethetypeswrong/cli --pack . --profile esm-only"
   },
   "dependencies": {
     "@webgpu/types": "^0.1.69"

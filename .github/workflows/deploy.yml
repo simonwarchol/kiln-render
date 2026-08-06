@@ -15,9 +15,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up pnpm
+        # Version comes from package.json "packageManager" — don't also pass `version` here.
         uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -28,19 +27,16 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      # Landing/gallery/docs at the site root (dist/), viewers under dist/app/.
+      # Landing/gallery/docs at the site root (dist/), unified viewer under dist/app/.
       # Repo-agnostic base so this is safe on BOTH remotes:
       #   - kiln-render (production, custom apex domain, not a fork): served at
       #     kilnrender.com root, so VITE_BASE = '/'.
       #   - forks / kiln-render-private (staging) / any other: no custom domain,
       #     served at <owner>.github.io/<repo>/, so VITE_BASE = '/<repo>/'.
-      # The viewer configs derive /app/ from VITE_BASE. (Branch previews use a
-      # repo-name base in deploy-preview.yml.)
       #
-      # Build order matters: the VitePress site owns dist/ and empties it, so it
-      # runs FIRST; the viewer builds then repopulate dist/app/ (their own
-      # emptyOutDir is scoped to those subfolders). App before multichannel so
-      # the app build doesn't wipe dist/app/multichannel/.
+      # Build order: VitePress site owns dist/ and empties it first; the viewer
+      # build then populates dist/app/ (and writes a legacy /app/multichannel/
+      # redirect stub).
       - name: Build marketing site (landing / gallery / docs)
         run: pnpm run build:site
         env:
@@ -48,11 +44,6 @@ jobs:
 
       - name: Build viewer app
         run: pnpm run build
-        env:
-          VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && '/' || format('/{0}/', github.event.repository.name) }}
-
-      - name: Build multichannel viewer
-        run: pnpm run build:multichannel
         env:
           VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && '/' || format('/{0}/', github.event.repository.name) }}
 

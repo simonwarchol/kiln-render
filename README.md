@@ -65,19 +65,16 @@ Clone the repo and install dev dependencies (this is for working on Kiln itself 
 
 ```bash
 # Install dependencies
-npm install
+pnpm install
 
-# Start development server (single-channel demo)
-npm run dev
-
-# Start multichannel demo
-npm run dev:multichannel
+# Start development server (single- + multi-channel; UI chosen by channel count)
+pnpm dev
 
 # Build demo for production
-npm run build
+pnpm run build
 
 # Build the library (outputs to lib/)
-npm run build:lib
+pnpm run build:lib
 ```
 
 The demo loads a sample dataset from S3. To load custom datasets, see [Loading data](docs/guide/loading-data.md).
