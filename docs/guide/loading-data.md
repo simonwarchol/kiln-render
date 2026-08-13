@@ -81,15 +81,16 @@ if (issues.length > 0) {
 
 ## Demo viewer — loading custom datasets
 
-Add the `dataset` URL parameter to load your own data:
+Add the `dataset` URL parameter to load your own data. Paths are relative to
+this site’s deploy root (e.g. `/` on production, `/kiln-render/` on a fork):
 
 ```
-https://kilnrender.com/app/?dataset=YOUR_DATASET_URL
+/app/?dataset=YOUR_DATASET_URL
 ```
 
 **Example:**
 ```
-?dataset=https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/kingsnake.ome.zarr
+/app/?dataset=https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/kingsnake.ome.zarr
 ```
 
 ### OME-Zarr

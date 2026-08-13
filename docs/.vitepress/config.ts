@@ -1,21 +1,33 @@
 import { defineConfig } from 'vitepress';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// The Kiln site is built by VitePress from this docs/ folder; the two demo
+// The Kiln site is built by VitePress from this docs/ folder; the unified
 // viewer is built via vite.config.ts into dist/app/. VitePress owns the site root
-// (dist/), so build order is: site first (it empties dist/), then the viewers
-// repopulate dist/app/. See package.json `build:all` and the deploy workflows.
-// Production serves at the apex domain root (kilnrender.com), so the base is
-// '/'. CI overrides VITE_BASE per branch for github.io previews
-// (/kiln-render-private/preview/<branch>/). The viewer configs derive /app/
-// from the same var.
-const base = process.env.VITE_BASE || '/';
-// Absolute production origin, used for sitemap, canonical, and og:image URLs
-// (social scrapers don't resolve relative paths). Branch previews override the
-// base but keep this origin, which is fine — previews aren't meant to be
-// indexed, and a canonical pointing at production is what we want anyway.
-const origin = 'https://kilnrender.com';
-const siteUrl = `${origin}${base}`;
+// (dist/), so build order is: site first (it empties dist/), then the viewer
+// repopulates dist/app/. See package.json `build:all` and the deploy workflows.
+//
+// VITE_BASE is the site-root prefix:
+//   - production (non-fork kiln-render): '/'  → kilnrender.com/
+//   - forks / staging: '/<repo>/'             → <owner>.github.io/<repo>/
+//   - branch previews: '/<repo>/preview/<b>/' (or '/preview/<b>/' on prod)
+// Default matches vite.config.ts so local `build:all` stays coherent on forks.
+const base = process.env.VITE_BASE || '/kiln-render/';
+// Absolute origin for sitemap / canonical / og:image. CI sets SITE_ORIGIN to
+// the deploy host (kilnrender.com or https://<owner>.github.io). Without it,
+// only apex production (`base === '/'`) assumes kilnrender.com — forks must
+// not invent that host or links/canonicals point at the wrong site.
+const origin = (
+  process.env.SITE_ORIGIN ||
+  (base === '/' ? 'https://kilnrender.com' : '')
+).replace(/\/$/, '');
+const siteUrl = origin ? `${origin}${base}` : '';
+const repoUrl =
+  process.env.VITE_REPO_URL ||
+  (process.env.GITHUB_REPOSITORY
+    ? `https://github.com/${process.env.GITHUB_REPOSITORY}`
+    : 'https://github.com/MPanknin/kiln-render');
 const description =
   'A WebGPU renderer that streams large volumetric datasets over HTTP into a bounded VRAM cache.';
 // Preview builds (deploy-preview.yml sets VITE_PREVIEW=1) sit under the
@@ -26,7 +38,7 @@ export default defineConfig({
   title: 'Kiln',
   description,
   lang: 'en-US',
-  sitemap: { hostname: siteUrl },
+  ...(siteUrl ? { sitemap: { hostname: siteUrl } } : {}),
   base,
   // Dark by default (still toggleable) to match the renderer's aesthetic.
   appearance: 'dark',
@@ -46,23 +58,28 @@ export default defineConfig({
     // <head> before the landing renders (no flash) and before analytics counts a
     // hit. A bare root URL (no viewer params) falls through to the landing page.
     // Viewer deep-links that land on the site root bounce into the unified /app/.
-    ['script', {}, `(function(){var b=${JSON.stringify(base)};var p=location.pathname;if(p!==b&&p!==b+'index.html')return;var k=['dataset','mode','cam','up','scale','wc','ww','iso','tf','tfpts','tfPreset','density','channels','slice','clipMin','clipMax','wireframe','renderScale'];var q=new URLSearchParams(location.search);for(var i=0;i<k.length;i++){if(q.has(k[i])){location.replace(b+'app/'+location.search+location.hash);return;}}})();`],
+    ['script', {}, `(function(){var b=${JSON.stringify(base)};var p=location.pathname;if(p!==b&&p!==b+'index.html')return;var k=['dataset','mode','cam','up','scale','lod','sse','wc','ww','iso','tf','tfpts','tfPreset','density','channels','slice','clipMin','clipMax','wireframe','renderScale'];var q=new URLSearchParams(location.search);for(var i=0;i<k.length;i++){if(q.has(k[i])){location.replace(b+'app/'+location.search+location.hash);return;}}})();`],
     ['link', { rel: 'icon', type: 'image/png', sizes: '32x32', href: `${base}favicon-32x32.png` }],
     ['link', { rel: 'apple-touch-icon', href: `${base}apple-touch-icon.png` }],
     // Open Graph / Twitter card — static site-level defaults. Per-page title
-    // and description are overridden in transformPageData below.
+    // and description are overridden in transformPageData below. Absolute
+    // og:url / og:image only when SITE_ORIGIN (or apex default) is known.
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:site_name', content: 'Kiln' }],
     ['meta', { property: 'og:title', content: 'Kiln' }],
     ['meta', { property: 'og:description', content: description }],
-    ['meta', { property: 'og:url', content: siteUrl }],
-    ['meta', { property: 'og:image', content: `${siteUrl}kiln_social.jpg` }],
+    ...(siteUrl
+      ? ([
+          ['meta', { property: 'og:url', content: siteUrl }],
+          ['meta', { property: 'og:image', content: `${siteUrl}kiln_social.jpg` }],
+          ['meta', { name: 'twitter:image', content: `${siteUrl}kiln_social.jpg` }],
+        ] as [string, Record<string, string>][])
+      : []),
     ['meta', { property: 'og:image:width', content: '1200' }],
     ['meta', { property: 'og:image:height', content: '630' }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
     ['meta', { name: 'twitter:title', content: 'Kiln' }],
     ['meta', { name: 'twitter:description', content: description }],
-    ['meta', { name: 'twitter:image', content: `${siteUrl}kiln_social.jpg` }],
     ['script', {}, "window.goatcounter = { path: function () { return location.pathname || '/'; } };"],
     ['script', { 'data-goatcounter': 'https://mpanknin.goatcounter.com/count', async: '', src: '//gc.zgo.at/count.js' }],
   ],
@@ -71,17 +88,30 @@ export default defineConfig({
   // frontmatter) instead of the site-level defaults.
   transformPageData(pageData) {
     const path = pageData.relativePath.replace(/(index)?\.md$/, '').replace(/\/$/, '');
-    const canonical = `${siteUrl}${path ? `${path}.html` : ''}`;
     const title = pageData.title ? `${pageData.title} | Kiln` : 'Kiln';
     const desc = pageData.description || pageData.frontmatter.description || description;
     pageData.frontmatter.head ??= [];
     pageData.frontmatter.head.push(
-      ['link', { rel: 'canonical', href: canonical }],
       ['meta', { property: 'og:title', content: title }],
       ['meta', { property: 'og:description', content: desc }],
-      ['meta', { property: 'og:url', content: canonical }],
       ['meta', { name: 'twitter:title', content: title }],
       ['meta', { name: 'twitter:description', content: desc }],
+    );
+    if (siteUrl) {
+      const canonical = `${siteUrl}${path ? `${path}.html` : ''}`;
+      pageData.frontmatter.head.push(
+        ['link', { rel: 'canonical', href: canonical }],
+        ['meta', { property: 'og:url', content: canonical }],
+      );
+    }
+  },
+  // Rewrite robots.txt Sitemap to this deploy's absolute URL (public/robots.txt
+  // is copied as-is otherwise and would keep pointing at kilnrender.com).
+  buildEnd(siteConfig) {
+    if (!siteUrl) return;
+    writeFileSync(
+      join(siteConfig.outDir, 'robots.txt'),
+      `User-agent: *\nAllow: /\n\nSitemap: ${siteUrl}sitemap.xml\n`,
     );
   },
   themeConfig: {
@@ -145,7 +175,7 @@ export default defineConfig({
       },
     ],
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/MPanknin/kiln-render' },
+      { icon: 'github', link: repoUrl },
     ],
     footer: {
       message: 'Apache-2.0',

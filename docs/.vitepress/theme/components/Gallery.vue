@@ -2,11 +2,18 @@
 import { withBase } from 'vitepress';
 import { gallery } from '../gallery-data';
 
-// Thumbnails live in docs/public/gallery/ and are referenced as relative paths
-// ('gallery/x.jpeg'); withBase() prepends the deploy base so they resolve under
-// /kiln-render/. Full http(s) URLs (if any) are passed through untouched.
+// Thumbnails live in docs/public/gallery/ and are referenced as site-root paths
+// ('/gallery/x.webp'); withBase() prepends the deploy base so they resolve under
+// /kiln-render/ (or / on production). Full http(s) URLs pass through untouched.
 function thumbSrc(src: string): string {
-  return /^https?:\/\//.test(src) ? src : withBase(src);
+  return /^https?:\/\//.test(src) ? src : withBase(src.startsWith('/') ? src : `/${src}`);
+}
+
+// Demo hrefs are site-root paths (`/app/?…`); withBase keeps them on this deploy
+// instead of resolving relative to /gallery.html (or a pretty /gallery/ URL).
+function demoHref(href: string): string {
+  if (/^https?:\/\//.test(href)) return href;
+  return withBase(href.startsWith('/') ? href : `/${href}`);
 }
 
 // The thumbnail+title block is the clickable demo link. target="_blank" opens
@@ -19,7 +26,7 @@ function thumbSrc(src: string): string {
 <template>
   <div class="gallery-grid">
     <div v-for="item in gallery" :key="item.title" class="gallery-item">
-      <a class="gallery-open" :href="item.href" target="_blank" rel="noopener">
+      <a class="gallery-open" :href="demoHref(item.href)" target="_blank" rel="noopener">
         <div class="gallery-thumb">
           <!-- Multichannel rendering is beta — flag cards with per-channel share params. -->
           <span v-if="item.href.includes('channels=')" class="gallery-beta">beta</span>

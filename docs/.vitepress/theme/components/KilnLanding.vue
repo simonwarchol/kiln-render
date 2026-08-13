@@ -2,6 +2,10 @@
 // Minimal landing: full-viewport, centered wordmark + three links, with an
 // understated meta line and copyright pinned to the bottom. No chrome.
 import { withBase } from 'vitepress';
+
+// CI sets VITE_REPO_URL to https://github.com/<this-fork>; local builds fall
+// back to upstream.
+const repoUrl = import.meta.env.VITE_REPO_URL || 'https://github.com/MPanknin/kiln-render';
 </script>
 
 <template>
@@ -12,7 +16,7 @@ import { withBase } from 'vitepress';
       <nav class="kiln-links">
         <a :href="withBase('/gallery')">Examples</a>
         <a :href="withBase('/guide/introduction')">Documentation</a>
-        <a href="https://github.com/MPanknin/kiln-render" target="_blank" rel="noreferrer">GitHub</a>
+        <a :href="repoUrl" target="_blank" rel="noreferrer">GitHub</a>
       </nav>
     </div>
 

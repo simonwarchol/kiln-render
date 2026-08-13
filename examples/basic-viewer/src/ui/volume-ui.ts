@@ -55,6 +55,9 @@ export class VolumeUI {
     windowWidth: 1.0,
     densityScale: 1.0,
     renderScale: 0.5,
+    /** Manual Data LOD override (toggle off = Auto SSE) */
+    dataLodManual: false,
+    dataLod: 0,
     enableJitter: true,
     enableTAA: true,
     clipX: { min: 0.0, max: 1.0 },
@@ -83,6 +86,8 @@ export class VolumeUI {
   private clipSliders!: [ReturnType<typeof createRangeSlider>, ReturnType<typeof createRangeSlider>, ReturnType<typeof createRangeSlider>];
   private clipSection!: HTMLElement;
   private renderScaleSlider!: ReturnType<typeof createSlider>;
+  private dataLodToggle!: ReturnType<typeof createToggle>;
+  private dataLodSlider!: ReturnType<typeof createSlider>;
   private jitterToggle!: ReturnType<typeof createToggle>;
   private taaToggle!: ReturnType<typeof createToggle>;
   private indirectionToggle!: ReturnType<typeof createToggle>;
@@ -114,6 +119,9 @@ export class VolumeUI {
     this.params.windowCenter = this.renderer.windowCenter;
     this.params.windowWidth = this.renderer.windowWidth;
     this.params.renderScale = this.renderer.renderScale;
+    const initialForced = this.viewer.forcedLod;
+    this.params.dataLodManual = initialForced !== null;
+    this.params.dataLod = initialForced ?? this.viewer.finestStreamLod;
 
     const controlsContainer = document.createElement('div');
     controlsContainer.style.cssText = 'position: fixed; left: 8px; top: 44px; z-index: 1000;';
@@ -267,6 +275,46 @@ export class VolumeUI {
       onChange: (v) => { this.viewer.renderScale = v; },
     });
     advancedBody.appendChild(this.renderScaleSlider.el);
+
+    const maxLod = this.viewer.metadata.maxLod;
+    const formatDataLod = (v: number) => {
+      if (v === 0) return 'L0 (finest)';
+      if (v === maxLod) return `L${v} (coarsest)`;
+      return `L${v}`;
+    };
+    this.dataLodToggle = createToggle({
+      label: 'Data LOD',
+      value: this.params.dataLodManual,
+      onChange: (on) => {
+        this.params.dataLodManual = on;
+        if (on) {
+          const seed = this.viewer.finestStreamLod;
+          this.params.dataLod = seed;
+          this.dataLodSlider.setValue(seed);
+          this.viewer.forcedLod = seed;
+          this.dataLodSlider.el.style.display = '';
+        } else {
+          this.viewer.forcedLod = null;
+          this.dataLodSlider.el.style.display = 'none';
+        }
+      },
+    });
+    advancedBody.appendChild(this.dataLodToggle.el);
+
+    this.dataLodSlider = createSlider({
+      label: 'Level',
+      min: 0,
+      max: maxLod,
+      step: 1,
+      value: this.params.dataLod,
+      format: formatDataLod,
+      onChange: (v) => {
+        this.params.dataLod = v;
+        this.viewer.forcedLod = v;
+      },
+    });
+    this.dataLodSlider.el.style.display = this.params.dataLodManual ? '' : 'none';
+    advancedBody.appendChild(this.dataLodSlider.el);
 
     this.lodLevelsToggle = createToggle({
       label: 'LOD Levels',
@@ -528,6 +576,8 @@ export class VolumeUI {
     this.params.windowWidth = this.renderer.windowWidth;
     this.params.densityScale = this.renderer.densityScale;
     this.params.renderScale = this.viewer.renderScale;
+    this.params.dataLodManual = this.viewer.forcedLod !== null;
+    this.params.dataLod = this.viewer.forcedLod ?? this.viewer.finestStreamLod;
     this.params.upAxis = this.camera.getUpAxis();
     this.params.tfPreset = this.transferFunction.preset;
     const syncDims = this.viewer.metadata.dimensions;
@@ -550,6 +600,9 @@ export class VolumeUI {
     this.windowWidthSlider.setValue(this.params.windowWidth);
     this.densitySlider.setValue(this.params.densityScale);
     this.renderScaleSlider.setValue(this.params.renderScale);
+    this.dataLodToggle.setValue(this.params.dataLodManual);
+    this.dataLodSlider.setValue(this.params.dataLod);
+    this.dataLodSlider.el.style.display = this.params.dataLodManual ? '' : 'none';
     this.upAxisSelect.setValue(this.params.upAxis);
     this.tfPresetSelect.setValue(this.params.tfPreset);
     this.clipSliders[0].setValue(this.params.clipX.min, this.params.clipX.max);

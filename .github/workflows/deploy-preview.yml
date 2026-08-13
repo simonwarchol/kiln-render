@@ -51,12 +51,15 @@ jobs:
         run: pnpm run build:site
         env:
           VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
+          SITE_ORIGIN: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && 'https://kilnrender.com' || format('https://{0}.github.io', github.repository_owner) }}
+          VITE_REPO_URL: ${{ format('https://github.com/{0}', github.repository) }}
           VITE_PREVIEW: '1'
 
       - name: Build viewer app with branch-specific base
         run: pnpm run build
         env:
           VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && format('/preview/{0}/', steps.sanitize.outputs.sanitized) || format('/{0}/preview/{1}/', github.event.repository.name, steps.sanitize.outputs.sanitized) }}
+          VITE_REPO_URL: ${{ format('https://github.com/{0}', github.repository) }}
 
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v3

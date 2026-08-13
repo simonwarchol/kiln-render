@@ -8,10 +8,10 @@
     "url": "https://github.com/MPanknin"
   },
   "license": "Apache-2.0",
-  "homepage": "https://kilnrender.com",
+  "homepage": "https://simonwarchol.com/kiln-render/",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mpanknin/kiln-render.git"
+    "url": "git+https://github.com/simonwarchol/kiln-render.git"
   },
   "packageManager": "pnpm@10.27.0",
   "type": "module",

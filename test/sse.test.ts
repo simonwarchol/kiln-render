@@ -131,6 +131,48 @@ describe('SSE — LOD selection vs. camera distance', () => {
   });
 });
 
+describe('finest stream LOD', () => {
+  it('reports the finest desired LOD after a forceUpdate', async () => {
+    const sm = await freshSM();
+    sm.forcedLod = 1;
+    sm.forceUpdate(stubCamera([0, 0, 0.6]), canvas);
+    expect(sm.getFinestStreamLod()).toBe(1);
+  });
+});
+
+describe('forced LOD override', () => {
+  it('forces the finest level when forcedLod = 0', async () => {
+    const sm = await freshSM();
+    sm.forcedLod = 0;
+    // Far camera would normally stay at maxLod under SSE
+    sm.forceUpdate(stubCamera([0, 0, 8]), canvas);
+    const lods = desiredLods(sm);
+    expect(Math.min(...lods)).toBe(0);
+    expect(lods.every(l => l === 0)).toBe(true);
+  });
+
+  it('forces the coarsest level when forcedLod = maxLod', async () => {
+    const sm = await freshSM();
+    sm.forcedLod = 3;
+    // Near camera would normally refine under SSE
+    sm.forceUpdate(stubCamera([0, 0, 0.6]), canvas);
+    const lods = desiredLods(sm);
+    expect(Math.max(...lods)).toBe(3);
+    expect(lods.every(l => l === 3)).toBe(true);
+  });
+
+  it('restores SSE selection when forcedLod is cleared', async () => {
+    const sm = await freshSM();
+    sm.forcedLod = 0;
+    sm.forceUpdate(stubCamera([0, 0, 8]), canvas);
+    expect(Math.min(...desiredLods(sm))).toBe(0);
+
+    sm.forcedLod = null;
+    sm.forceUpdate(stubCamera([0, 0, 8]), canvas);
+    expect(Math.min(...desiredLods(sm))).toBe(3);
+  });
+});
+
 describe('SSE — hysteresis band', () => {
   it('detects resident children (real hasResidentChildren)', async () => {
     const sm = await freshSM();

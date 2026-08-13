@@ -141,6 +141,12 @@ export class StreamingManager {
   // Higher = lower quality, fewer bricks loaded
   public maxPixelError = 8.0;
 
+  /**
+   * When non-null, force the desired set to this pyramid level (0 = finest,
+   * metadata.maxLod = coarsest). `null` restores automatic SSE selection.
+   */
+  public forcedLod: number | null = null;
+
   // Camera FOV in radians (must match camera.getProjectionMatrix)
   private readonly cameraFovRad = Math.PI / 4; // 45 degrees
 
@@ -652,6 +658,29 @@ export class StreamingManager {
   }
 
   /**
+   * Finest LOD currently in the desired set (falls back to resident bricks,
+   * then maxLod). Used to seed a manual LOD slider at the live stream level.
+   */
+  getFinestStreamLod(): number {
+    const parse = (key: string): number | null => {
+      const m = /^lod(\d+):/.exec(key);
+      return m ? Number(m[1]) : null;
+    };
+    let finest = Infinity;
+    for (const key of this.desiredKeys) {
+      const lod = parse(key);
+      if (lod !== null) finest = Math.min(finest, lod);
+    }
+    if (!Number.isFinite(finest)) {
+      for (const key of this.loadedBricks.keys()) {
+        const lod = parse(key);
+        if (lod !== null) finest = Math.min(finest, lod);
+      }
+    }
+    return Number.isFinite(finest) ? finest : this.metadata.maxLod;
+  }
+
+  /**
    * Get current stats
    */
   getStats(): StreamingStats {
@@ -741,10 +770,12 @@ export class StreamingManager {
       const voxelWorldSize = this.getVoxelWorldSize(lod);
       const projectedError = (voxelWorldSize / Math.max(dist, 0.001)) * this.projectionFactor;
 
-      // SSE hysteresis: keep splitting while children exist and error > 70%
-      // of maxPixelError, preventing LOD oscillation during gestures.
+      // Manual override: always split while coarser than forcedLod; never
+      // split at or finer than it. Otherwise use SSE + hysteresis.
       let shouldSplit: boolean;
-      if (projectedError > this.maxPixelError) {
+      if (this.forcedLod !== null) {
+        shouldSplit = lod > this.forcedLod;
+      } else if (projectedError > this.maxPixelError) {
         shouldSplit = lod > 0;
       } else if (lod > 0 && projectedError > this.maxPixelError * 0.7) {
         // In hysteresis band — only keep splitting if children are already resident

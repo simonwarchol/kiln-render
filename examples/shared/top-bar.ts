@@ -17,7 +17,10 @@ export interface TopBar {
 }
 
 export function mountTopBar(opts: TopBarOptions = {}): TopBar {
-  const githubUrl = opts.githubUrl ?? 'https://github.com/MPanknin/kiln-render';
+  const githubUrl =
+    opts.githubUrl ||
+    import.meta.env.VITE_REPO_URL ||
+    'https://github.com/MPanknin/kiln-render';
 
   // The wordmark links back to the gallery. Derive its URL from this viewer's
   // base (/app/ or legacy /app/multichannel/, plus any preview prefix) by

@@ -1,4 +1,5 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://kilnrender.com/sitemap.xml
+# Sitemap URL is rewritten at build time to this deploy's absolute origin
+# (see docs/.vitepress/config.ts buildEnd).

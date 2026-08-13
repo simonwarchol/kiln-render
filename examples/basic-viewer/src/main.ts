@@ -56,6 +56,8 @@ function parseURLParams(): {
   up?: string;
   sse?: number;
   scale?: number;
+  /** Forced stream LOD (omit for Auto) */
+  lod?: number;
   cam?: [number, number, number] | [number, number, number, number, number, number];
   clipMin?: [number, number, number];
   clipMax?: [number, number, number];
@@ -172,6 +174,7 @@ function parseURLParams(): {
     up: params.get('up') ?? undefined,
     sse: params.has('sse') ? Number(params.get('sse')) : undefined,
     scale: params.has('scale') ? Number(params.get('scale')) : undefined,
+    lod: params.has('lod') ? Number(params.get('lod')) : undefined,
     cam,
     clipMin,
     clipMax,
@@ -230,6 +233,8 @@ async function main() {
     cam: urlParams.cam,
     renderScale: urlParams.scale,
     maxPixelError: urlParams.sse,
+    forcedLod:
+      urlParams.lod !== undefined && !Number.isNaN(urlParams.lod) ? urlParams.lod : undefined,
     clipMin: urlParams.clipMin,
     clipMax: urlParams.clipMax,
     sliceX: urlParams.slices?.[0],
@@ -291,6 +296,7 @@ async function main() {
           p.set('up', state.upAxis);
           p.set('mode', state.mode);
           p.set('scale', state.renderScale.toFixed(2));
+          if (state.forcedLod !== null) p.set('lod', String(state.forcedLod));
           const [rx, ry, dist, tx, ty, tz] = state.cam;
           p.set(
             'cam',
@@ -337,6 +343,7 @@ async function main() {
           p.set('tfpts', state.tfPoints.map(pt => `${pt.x.toFixed(2)},${pt.y.toFixed(2)}`).join(','));
           p.set('up', state.upAxis);
           p.set('scale', state.renderScale.toFixed(2));
+          if (state.forcedLod !== null) p.set('lod', String(state.forcedLod));
           const [rx, ry, dist, tx, ty, tz] = state.cam;
           p.set(
             'cam',
@@ -391,7 +398,7 @@ const topBar = IS_EMBED ? null : mountTopBar();
 if (!IS_EMBED) {
   mountDatasetDialog({
     remoteDescription: 'Enter URL to an OME-Zarr dataset or Kiln sharded binary',
-    docsLink: 'https://github.com/MPanknin/kiln-render/blob/main/docs/data/ome-zarr.md',
+    docsLink: `${import.meta.env.VITE_REPO_URL || 'https://github.com/MPanknin/kiln-render'}/blob/main/docs/data/ome-zarr.md`,
   });
 }
 

@@ -31,6 +31,11 @@ export interface ViewerOptions {
   /** LOD screen-space error threshold in pixels */
   maxPixelError?: number;
   /**
+   * Force streaming to a single pyramid level (0 = finest, maxLod = coarsest).
+   * Omit / `null` for automatic screen-space-error selection.
+   */
+  forcedLod?: number | null;
+  /**
    * Atlas VRAM budget in bytes (default ~1.3 GiB). The grid shrinks to fit;
    * lower it for constrained mobile GPUs, raise it to keep 660³ for many channels.
    */
@@ -71,6 +76,8 @@ export interface ViewerState {
   isoValue: number;
   /** User-intended render scale (not the 0.25 interaction override) */
   renderScale: number;
+  /** Forced stream LOD, or `null` for automatic SSE selection */
+  forcedLod: number | null;
   tfPreset: TFPreset;
   tfPoints: Array<{ x: number; y: number }>;
   upAxis: UpAxis;
@@ -346,6 +353,10 @@ export class KilnViewer {
     if (options.maxPixelError !== undefined) {
       streamingManager.maxPixelError = options.maxPixelError;
     }
+    if (options.forcedLod !== undefined && options.forcedLod !== null) {
+      const maxLod = metadata.maxLod;
+      streamingManager.forcedLod = Math.max(0, Math.min(maxLod, Math.round(options.forcedLod)));
+    }
 
     // Construct and return viewer
     const userRenderScale = renderer.renderScale;
@@ -439,6 +450,26 @@ export class KilnViewer {
     this.dirty = true;
   }
 
+  /** Forced stream LOD (`null` = automatic SSE). 0 = finest. */
+  get forcedLod(): number | null {
+    return this.streamingManager.forcedLod;
+  }
+  set forcedLod(value: number | null) {
+    if (value === null) {
+      this.streamingManager.forcedLod = null;
+    } else {
+      const maxLod = this.metadata.maxLod;
+      this.streamingManager.forcedLod = Math.max(0, Math.min(maxLod, Math.round(value)));
+    }
+    this.streamingManager.forceUpdate(this.camera, this.canvas);
+    this.dirty = true;
+  }
+
+  /** Finest LOD currently desired/resident (for seeding the manual LOD slider). */
+  get finestStreamLod(): number {
+    return this.streamingManager.getFinestStreamLod();
+  }
+
   // State serialisation
   getState(): ViewerState {
     const [rx, ry, dist, tx, ty, tz] = this.camera.getOrbitState();
@@ -449,6 +480,7 @@ export class KilnViewer {
       densityScale: this.renderer.densityScale,
       isoValue: this.renderer.isoValue,
       renderScale: this.userRenderScale,
+      forcedLod: this.streamingManager.forcedLod,
       tfPreset: this.transferFunction.preset,
       tfPoints: this.transferFunction.getOpacityPoints(),
       upAxis: this.camera.getUpAxis(),

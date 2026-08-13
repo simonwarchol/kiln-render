@@ -34,6 +34,9 @@ jobs:
       #   - forks / kiln-render-private (staging) / any other: no custom domain,
       #     served at <owner>.github.io/<repo>/, so VITE_BASE = '/<repo>/'.
       #
+      # SITE_ORIGIN + VITE_REPO_URL keep canonicals, OG tags, gallery/demo links,
+      # and in-app GitHub/docs links on *this* deploy (not hardcoded kilnrender.com).
+      #
       # Build order: VitePress site owns dist/ and empties it first; the viewer
       # build then populates dist/app/ (and writes a legacy /app/multichannel/
       # redirect stub).
@@ -41,11 +44,14 @@ jobs:
         run: pnpm run build:site
         env:
           VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && '/' || format('/{0}/', github.event.repository.name) }}
+          SITE_ORIGIN: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && 'https://kilnrender.com' || format('https://{0}.github.io', github.repository_owner) }}
+          VITE_REPO_URL: ${{ format('https://github.com/{0}', github.repository) }}
 
       - name: Build viewer app
         run: pnpm run build
         env:
           VITE_BASE: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && '/' || format('/{0}/', github.event.repository.name) }}
+          VITE_REPO_URL: ${{ format('https://github.com/{0}', github.repository) }}
 
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v3
@@ -56,5 +62,24 @@ jobs:
           # Custom apex domain ONLY on the canonical non-fork production repo.
           # Forks named kiln-render must not publish a CNAME — that claims
           # kilnrender.com and breaks Pages domain verification / deploy.
-          # peaceiris skips writing CNAME when this is empty.
+          # peaceiris skips writing CNAME when this is empty (but does not
+          # delete a leftover one when keep_files is true — see next step).
           cname: ${{ github.event.repository.name == 'kiln-render' && github.event.repository.fork == false && 'kilnrender.com' || '' }}
+
+      # keep_files: true preserves a prior CNAME; strip it on non-production.
+      - name: Remove stale CNAME on non-production deploys
+        if: ${{ !(github.event.repository.name == 'kiln-render' && github.event.repository.fork == false) }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch gh-pages \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" _pages
+          cd _pages
+          if [ -f CNAME ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git rm -f CNAME
+            git commit -m "Remove stale CNAME from non-production Pages deploy"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

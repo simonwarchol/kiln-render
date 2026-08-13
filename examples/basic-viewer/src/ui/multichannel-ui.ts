@@ -62,6 +62,9 @@ export class MultichannelUI {
     renderMode: "dvr" as BaseRenderMode,
     showLodLevels: false,
     renderScale: 0.5,
+    /** Manual Data LOD override (toggle off = Auto SSE) */
+    dataLodManual: false,
+    dataLod: 0,
     showWireframe: false,
     showAxis: false,
     sliceX: 0,
@@ -103,6 +106,8 @@ export class MultichannelUI {
   private wireframeToggle!: ReturnType<typeof createToggle>;
   private axesToggle!: ReturnType<typeof createToggle>;
   private renderScaleSlider!: ReturnType<typeof createSlider>;
+  private dataLodToggle!: ReturnType<typeof createToggle>;
+  private dataLodSlider!: ReturnType<typeof createSlider>;
   private lodLevelsToggle!: ReturnType<typeof createToggle>;
 
   constructor(
@@ -128,6 +133,9 @@ export class MultichannelUI {
     this.params.showWireframe = this.renderer.showWireframe;
     this.params.showAxis = this.renderer.showAxis;
     this.params.renderScale = this.renderer.renderScale;
+    const initialForced = this.viewer.forcedLod;
+    this.params.dataLodManual = initialForced !== null;
+    this.params.dataLod = initialForced ?? this.viewer.finestStreamLod;
 
     // Build per-channel params from renderer state (or URL-restored state)
     if (initialChannels && initialChannels.length > 0) {
@@ -321,6 +329,46 @@ export class MultichannelUI {
       },
     });
     advancedBody.appendChild(this.renderScaleSlider.el);
+
+    const maxLod = this.viewer.metadata.maxLod;
+    const formatDataLod = (v: number) => {
+      if (v === 0) return "L0 (finest)";
+      if (v === maxLod) return `L${v} (coarsest)`;
+      return `L${v}`;
+    };
+    this.dataLodToggle = createToggle({
+      label: "Data LOD",
+      value: this.params.dataLodManual,
+      onChange: (on) => {
+        this.params.dataLodManual = on;
+        if (on) {
+          const seed = this.viewer.finestStreamLod;
+          this.params.dataLod = seed;
+          this.dataLodSlider.setValue(seed);
+          this.viewer.forcedLod = seed;
+          this.dataLodSlider.el.style.display = "";
+        } else {
+          this.viewer.forcedLod = null;
+          this.dataLodSlider.el.style.display = "none";
+        }
+      },
+    });
+    advancedBody.appendChild(this.dataLodToggle.el);
+
+    this.dataLodSlider = createSlider({
+      label: "Level",
+      min: 0,
+      max: maxLod,
+      step: 1,
+      value: this.params.dataLod,
+      format: formatDataLod,
+      onChange: (v) => {
+        this.params.dataLod = v;
+        this.viewer.forcedLod = v;
+      },
+    });
+    this.dataLodSlider.el.style.display = this.params.dataLodManual ? "" : "none";
+    advancedBody.appendChild(this.dataLodSlider.el);
 
     this.lodLevelsToggle = createToggle({
       label: "LOD Levels",

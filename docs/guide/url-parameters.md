@@ -13,6 +13,7 @@ Control rendering settings via URL parameters to share or bookmark specific view
 | `tfpts` | x,y pairs | TF opacity control points (comma-separated) | `tfpts=0,0,0.5,0.8,1,1` |
 | `up` | `x`, `y`, `z`, `-x`, `-y`, `-z` | Camera up axis | `up=-y` |
 | `scale` | 0.25-1.0 | Render resolution | `scale=1.0` |
+| `lod` | integer ≥ 0 | Force stream pyramid level (0 = finest; omit for Auto SSE) | `lod=2` |
 | `cam` | 6 numbers | Camera state (rotation, distance, target) | `cam=0.1,2.3,3.5,0,0,0` |
 | `clipMin` | x,y,z | Clipping min (normalised 0–1) | `clipMin=0.2,0.1,0` |
 | `clipMax` | x,y,z | Clipping max (normalised 0–1) | `clipMax=0.8,0.9,1` |
