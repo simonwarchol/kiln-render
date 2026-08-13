@@ -230,7 +230,7 @@ export class KilnViewer {
     const config = new DatasetConfig(metadata.dimensions, metadata.voxelSpacing);
 
     // Shrink the atlas grid with channel count so total atlas VRAM fits the
-    // budget — a fixed 660³ × 4 channels (~2.3 GB) OOMs mobile GPUs at startup.
+    // budget — a fixed 660³ × many channels OOMs mobile GPUs at startup.
     const bytesPerVoxel = textureFormat === 'r8unorm' ? 1 : 2;
     const { gridSize, atlasSize } = computeAtlasGrid(metadata.numChannels, bytesPerVoxel, options.atlasBudgetBytes);
     const atlasVramMB = Math.round((metadata.numChannels * atlasSize ** 3 * bytesPerVoxel) / 1e6);

@@ -45,11 +45,11 @@ See the [Data Guide → Local OME-Zarr](/data/local-files) for details and limit
 
 ## Multichannel
 
-Multichannel OME-Zarr datasets (up to 4 channels) are detected automatically. Per-channel colour, window/level, and visibility can be controlled via the renderer:
+Multichannel OME-Zarr datasets (up to 6 channels) are detected automatically. Per-channel colour, window/level, and visibility can be controlled via the renderer:
 
 ```typescript
 // Check channel count
-const numChannels = viewer.renderer.numChannels; // 1–4
+const numChannels = viewer.renderer.numChannels; // 1–6
 
 // Set channel colour (RGBA, 0–1)
 viewer.renderer.setChannelColor(0, 0.0, 1.0, 0.0);     // channel 0 → green
@@ -99,7 +99,7 @@ Compatible multiscale OME-Zarr datasets require no Kiln-specific conversion — 
 
 **Supported formats:**
 - OME-NGFF v0.4 and v0.5
-- Single-channel and multichannel datasets (up to 4 channels — see [Multichannel](/rendering/multichannel))
+- Single-channel and multichannel datasets (up to 6 channels — see [Multichannel](/rendering/multichannel))
 - `uint8`, `uint16`, and `float32` input (no signed integers or `float64`); `uint16` and `float32` are converted to `r16float` for GPU storage
 
 See the [Data Guide](/data/ome-zarr) for full format requirements.

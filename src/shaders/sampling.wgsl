@@ -26,17 +26,32 @@ fn sampleAtlas(voxelPos: vec3f, indirection: vec4u, lodScale: f32) -> f32 {
     return textureSampleLevel(volumeTexture, volumeSampler, atlasPos, 0.0).r;
 }
 
+// Per-channel window uniforms are packed as array<vec4f, 2> (ch0–3 in [0],
+// ch4–5 in [1].xy). Index with ch/4, ch%4.
+fn chWindowCenter(ch: u32) -> f32 {
+    return uniforms.channelWindowCenter[ch / 4u][ch % 4u];
+}
+fn chWindowWidth(ch: u32) -> f32 {
+    return uniforms.channelWindowWidth[ch / 4u][ch % 4u];
+}
+
+fn sampleAtlasChTexture(ch: u32, atlasPos: vec3f) -> f32 {
+    switch (ch) {
+        case 0u: { return textureSampleLevel(volumeTexture,  volumeSampler, atlasPos, 0.0).r; }
+        case 1u: { return textureSampleLevel(volumeTexture1, volumeSampler, atlasPos, 0.0).r; }
+        case 2u: { return textureSampleLevel(volumeTexture2, volumeSampler, atlasPos, 0.0).r; }
+        case 3u: { return textureSampleLevel(volumeTexture3, volumeSampler, atlasPos, 0.0).r; }
+        case 4u: { return textureSampleLevel(volumeTexture4, volumeSampler, atlasPos, 0.0).r; }
+        default: { return textureSampleLevel(volumeTexture5, volumeSampler, atlasPos, 0.0).r; }
+    }
+}
+
 // Sample from a specific channel atlas using the shared indirection mapping
 fn sampleAtlasCh(ch: u32, voxelPos: vec3f, indirection: vec4u, lodScale: f32) -> f32 {
     let posInBrick = (voxelPos % (LOGICAL_BRICK_SIZE * lodScale)) / lodScale;
     let atlasBase = vec3f(indirection.xyz) * PHYSICAL_BRICK_SIZE / ATLAS_SIZE;
     let atlasPos = atlasBase + ((posInBrick + BORDER) / ATLAS_SIZE);
-    switch (ch) {
-        case 0u: { return textureSampleLevel(volumeTexture,  volumeSampler, atlasPos, 0.0).r; }
-        case 1u: { return textureSampleLevel(volumeTexture1, volumeSampler, atlasPos, 0.0).r; }
-        case 2u: { return textureSampleLevel(volumeTexture2, volumeSampler, atlasPos, 0.0).r; }
-        default: { return textureSampleLevel(volumeTexture3, volumeSampler, atlasPos, 0.0).r; }
-    }
+    return sampleAtlasChTexture(ch, atlasPos);
 }
 
 // hot-path atlas sampling using precomputed affine transform
@@ -49,12 +64,7 @@ fn sampleAtlasAffine(voxelPos: vec3f, atlasOffset: vec3f, atlasScale: f32) -> f3
 // multi-channel variant of the affine hot-path sampler.
 fn sampleAtlasChAffine(ch: u32, voxelPos: vec3f, atlasOffset: vec3f, atlasScale: f32) -> f32 {
     let atlasPos = atlasOffset + voxelPos * atlasScale;
-    switch (ch) {
-        case 0u: { return textureSampleLevel(volumeTexture,  volumeSampler, atlasPos, 0.0).r; }
-        case 1u: { return textureSampleLevel(volumeTexture1, volumeSampler, atlasPos, 0.0).r; }
-        case 2u: { return textureSampleLevel(volumeTexture2, volumeSampler, atlasPos, 0.0).r; }
-        default: { return textureSampleLevel(volumeTexture3, volumeSampler, atlasPos, 0.0).r; }
-    }
+    return sampleAtlasChTexture(ch, atlasPos);
 }
 
 // Direct atlas sampling without indirection (for debugging)

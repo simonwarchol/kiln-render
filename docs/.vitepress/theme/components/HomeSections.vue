@@ -33,7 +33,7 @@ const features = [
   },
   {
     title: 'uint8, uint16, float32 input',
-    body: 'uint16 and float32 input are converted to r16float for GPU storage, with window/level controls. Up to 4 channels (beta) with per-channel color and windowing.',
+    body: 'uint16 and float32 input are converted to r16float for GPU storage, with window/level controls. Up to 6 channels (beta) with per-channel color and windowing.',
   },
 ];
 

@@ -41,6 +41,8 @@ const sharedBindings = /* wgsl */ `
 @group(0) @binding(8) var volumeTexture1: texture_3d<f32>;
 @group(0) @binding(9) var volumeTexture2: texture_3d<f32>;
 @group(0) @binding(10) var volumeTexture3: texture_3d<f32>;
+@group(0) @binding(11) var volumeTexture4: texture_3d<f32>;
+@group(0) @binding(12) var volumeTexture5: texture_3d<f32>;
 `;
 
 // Assemble the common shader code for a given atlas size

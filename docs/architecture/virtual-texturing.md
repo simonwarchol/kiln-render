@@ -75,7 +75,7 @@ Each slot stores 66³ voxels. At the full `660³` grid (1,000 slots):
 
 ### Multichannel atlas
 
-For multichannel datasets (up to 4 channels), each channel gets its own atlas texture, so VRAM scales with channel count. To stay within budget the atlas grid shrinks as channels increase — e.g. a 4-channel 16-bit dataset uses an ~528³ grid (~1.2 GiB total) instead of the full 660³ (~2.2 GiB). The indirection table is shared across all channels — all channels of a given brick use the same atlas slot indices. See [Multichannel](/rendering/multichannel) for details.
+For multichannel datasets (up to 6 channels), each channel gets its own atlas texture, so VRAM scales with channel count. To stay within budget the atlas grid shrinks as channels increase — e.g. a 4-channel 16-bit dataset uses an ~528³ grid (~1.2 GiB total) instead of the full 660³ (~2.2 GiB). The indirection table is shared across all channels — all channels of a given brick use the same atlas slot indices. See [Multichannel](/rendering/multichannel) for details.
 
 The 1-voxel **ghost border** duplicates neighboring brick data to enable hardware trilinear filtering without seams:
 

@@ -223,14 +223,23 @@ describe('validateZarrSupport', () => {
     warnSpy.mockRestore();
   });
 
-  it('does not reject a 5-channel dataset but warns that only 4 channels will be rendered', () => {
+  it('does not warn for a 6-channel dataset (at the render cap)', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const ms = { datasets: [{ path: '0' }], axes: ['c', 'z', 'y', 'x'] };
-    const reasons = validateZarrSupport(ms, [5, 512, 512, 512], 'uint16');
+    const reasons = validateZarrSupport(ms, [6, 512, 512, 512], 'uint16');
+    expect(reasons).toEqual([]);
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringMatching(/channels/));
+    warnSpy.mockRestore();
+  });
+
+  it('does not reject a 7-channel dataset but warns that only 6 channels will be rendered', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ms = { datasets: [{ path: '0' }], axes: ['c', 'z', 'y', 'x'] };
+    const reasons = validateZarrSupport(ms, [7, 512, 512, 512], 'uint16');
     // Should still be loadable — no rejection reasons
     expect(reasons).toEqual([]);
     // But it must have warned the user
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/5 channels/));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/7 channels/));
     warnSpy.mockRestore();
   });
 

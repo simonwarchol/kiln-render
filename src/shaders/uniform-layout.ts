@@ -84,13 +84,15 @@ export const COMPUTE_UNIFORMS = defineUniformStruct([
   { name: 'densityScale',    type: 'f32' },
   { name: 'clipMax',         type: 'vec3f' },
   { name: 'numChannels',     type: 'u32' },
-  { name: 'channelColors',   type: 'array<vec4f, 4>' },
-  { name: 'channelWindowCenter', type: 'vec4f' },
-  { name: 'channelWindowWidth',  type: 'vec4f' },
+  // Up to MAX_CHANNELS (6). Window center/width packed as two vec4s
+  // (ch0–3 in [0], ch4–5 in [1].xy) so shaders can index with ch/4, ch%4.
+  { name: 'channelColors',   type: 'array<vec4f, 6>' },
+  { name: 'channelWindowCenter', type: 'array<vec4f, 2>' },
+  { name: 'channelWindowWidth',  type: 'array<vec4f, 2>' },
 ]);
 
 // ---------------------------------------------------------------------------
-// Slice planes uniforms (240 bytes)
+// Slice planes uniforms
 // ---------------------------------------------------------------------------
 export const SLICE_UNIFORMS = defineUniformStruct([
   { name: 'mvp',             type: 'mat4x4f' },
@@ -106,7 +108,7 @@ export const SLICE_UNIFORMS = defineUniformStruct([
   { name: 'sliceZEnabled',   type: 'u32' },
   { name: 'numChannels',     type: 'u32' },
   { name: 'lodDebug',        type: 'u32' },
-  { name: 'channelColors',   type: 'array<vec4f, 4>' },
-  { name: 'channelWindowCenter', type: 'vec4f' },
-  { name: 'channelWindowWidth',  type: 'vec4f' },
+  { name: 'channelColors',   type: 'array<vec4f, 6>' },
+  { name: 'channelWindowCenter', type: 'array<vec4f, 2>' },
+  { name: 'channelWindowWidth',  type: 'array<vec4f, 2>' },
 ]);

@@ -2,7 +2,7 @@
 
 > **Beta** — Multichannel rendering is new in v0.4.0 and still stabilizing; the API and compositing behaviour may change. See [Known Issues](/reference/issues) for current limitations.
 
-Kiln can render OME-Zarr datasets with up to 4 channels simultaneously. Each channel is rendered with independent colour, window/level, and visibility controls. Compositing uses additive blending rather than transfer functions.
+Kiln can render OME-Zarr datasets with up to 6 channels simultaneously. Each channel is rendered with independent colour, window/level, and visibility controls. Compositing uses additive blending rather than transfer functions.
 
 ## Overview
 
@@ -18,7 +18,7 @@ Multichannel:     per-channel intensity × per-channel colour → additive blend
 Multichannel rendering works with OME-Zarr datasets that have a channel (`c`) axis:
 
 - **OME-NGFF v0.4 and v0.5**
-- **Up to 4 channels** (datasets with more channels will use the first 4)
+- **Up to 6 channels** (datasets with more channels will use the first 6)
 - **Supported dtypes:** `uint8`, `uint16`, `float32`
 - OMERO metadata is used for per-channel window auto-leveling when available
 
@@ -70,7 +70,7 @@ Transfer functions are **not used** in multichannel mode. Colour is determined e
 
 ```typescript
 const viewer = await KilnViewer.create(canvas, 'https://example.com/multichannel.ome.zarr');
-const numChannels = viewer.renderer.numChannels; // 1–4
+const numChannels = viewer.renderer.numChannels; // 1–6
 ```
 
 ### Setting channel colour
@@ -100,8 +100,8 @@ When per-channel intensity ranges are derived during base LOD loading, the `onCh
 viewer.onChannelWindowsChanged = () => {
   // Channel windows have been updated from data or OMERO metadata.
   // Read the current values from the renderer and update your UI.
-  const cw = viewer.renderer.channelWindowCenter; // Float32Array(4)
-  const ww = viewer.renderer.channelWindowWidth;  // Float32Array(4)
+  const cw = viewer.renderer.channelWindowCenter; // Float32Array (first 6 used)
+  const ww = viewer.renderer.channelWindowWidth;  // Float32Array (first 6 used)
 };
 ```
 
@@ -134,9 +134,9 @@ Channel state encodes each channel as `r,g,b,a,visible,windowMin,windowMax` (0�
 
 ## Known limitations
 
-- **Max 4 channels** — GPU uniforms use `vec4f` for per-channel data, limiting to 4 channels. Datasets with more channels will use the first 4.
+- **Max 6 channels** — Uniforms and atlas bindings are sized for 6 channels. Datasets with more channels will use the first 6.
 - **No transfer function** — Multichannel mode uses additive compositing with direct per-channel colours. The transfer function editor is not available.
 - **No ISO mode** — Isosurface rendering is not supported for multichannel datasets.
 - **VRAM scales with channel count** — Each channel gets its own atlas texture, so the atlas grid shrinks as channels increase to stay within the VRAM budget. See [Architecture → Memory Budget](/architecture/memory-budget) for the exact grid sizes.
-- **Increased network load** — Each brick requires one fetch per channel, so a 4-channel dataset issues 4× the network requests of a single-channel dataset.
+- **Increased network load** — Each brick requires one fetch per channel, so a 6-channel dataset issues 6× the network requests of a single-channel dataset.
 - **Kiln binary format** — The sharded binary format is single-channel only. Multichannel requires OME-Zarr.

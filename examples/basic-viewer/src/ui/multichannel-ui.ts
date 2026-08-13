@@ -32,6 +32,8 @@ const CHANNEL_COLOR_DEFAULTS = [
   { r: 255, g: 255, b: 0 }, // ch1: yellow
   { r: 255, g: 0, b: 0 }, // ch2: red
   { r: 255, g: 255, b: 255 }, // ch3: white
+  { r: 0, g: 255, b: 255 }, // ch4: cyan
+  { r: 255, g: 0, b: 255 }, // ch5: magenta
 ];
 
 export interface ChannelState {

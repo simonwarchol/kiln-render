@@ -149,9 +149,9 @@ export function validateZarrSupport(
   }
 
   const channelIdx = axes.findIndex(a => a.type === 'channel');
-  if (channelIdx >= 0 && (firstArrayShape[channelIdx] ?? 1) > 4) {
+  if (channelIdx >= 0 && (firstArrayShape[channelIdx] ?? 1) > 6) {
     console.warn(
-      `[Kiln] Multi-channel dataset has ${firstArrayShape[channelIdx]} channels — only first 4 will be rendered`,
+      `[Kiln] Multi-channel dataset has ${firstArrayShape[channelIdx]} channels — only first 6 will be rendered`,
     );
   }
 

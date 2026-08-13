@@ -150,17 +150,21 @@ export class Renderer {
 
   private readonly config: DatasetConfig;
 
-  // Per-channel display colors: RGBA (rgb = hue, a = intensity weight). Defaults: blue, yellow, red, white.
+  // Per-channel display colors: RGBA (rgb = hue, a = intensity weight).
+  // Defaults for ch0–5: blue, yellow, red, white, cyan, magenta.
   readonly channelColors = new Float32Array([
     0, 0, 1, 1,   // ch0: blue
     1, 1, 0, 1,   // ch1: yellow
     1, 0, 0, 1,   // ch2: red
     1, 1, 1, 1,   // ch3: white
+    0, 1, 1, 1,   // ch4: cyan
+    1, 0, 1, 1,   // ch5: magenta
   ]);
 
-  // Per-channel windowing (0-1 normalized). Defaults: center=0.5, width=1.0 (full range).
-  readonly channelWindowCenter = new Float32Array([0.5, 0.5, 0.5, 0.5]);
-  readonly channelWindowWidth  = new Float32Array([1.0, 1.0, 1.0, 1.0]);
+  // Per-channel windowing (0-1 normalized). Packed into array<vec4f, 2> on the
+  // GPU (8 floats); only the first MAX_CHANNELS entries are meaningful.
+  readonly channelWindowCenter = new Float32Array([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0, 0]);
+  readonly channelWindowWidth  = new Float32Array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0, 0]);
 
   // Pre-allocated scratch buffers (avoid per-frame GC pressure)
   private readonly vpScratch = new Float32Array(16);
@@ -388,9 +392,9 @@ export class Renderer {
       || this.active.accumFrameCount >= 64;
   }
 
-  /** Set the display color and intensity weight for a channel (0–3). Resets accumulation. */
+  /** Set the display color and intensity weight for a channel (0–5). Resets accumulation. */
   setChannelColor(ch: number, r: number, g: number, b: number, a = 1.0): void {
-    const base = Math.min(Math.max(0, ch), 3) * 4;
+    const base = Math.min(Math.max(0, ch), 5) * 4;
     this.channelColors[base]     = r;
     this.channelColors[base + 1] = g;
     this.channelColors[base + 2] = b;
@@ -398,9 +402,9 @@ export class Renderer {
     this.resetAccumulation();
   }
 
-  /** Set the window center and width for a channel (0–3). Resets accumulation. */
+  /** Set the window center and width for a channel (0–5). Resets accumulation. */
   setChannelWindow(ch: number, center: number, width: number): void {
-    const i = Math.min(Math.max(0, ch), 3);
+    const i = Math.min(Math.max(0, ch), 5);
     this.channelWindowCenter[i] = center;
     this.channelWindowWidth[i]  = width;
     this.resetAccumulation();
@@ -429,6 +433,8 @@ export class Renderer {
         { binding: 8, resource: this.resources.atlasView(1) },
         { binding: 9, resource: this.resources.atlasView(2) },
         { binding: 10, resource: this.resources.atlasView(3) },
+        { binding: 11, resource: this.resources.atlasView(4) },
+        { binding: 12, resource: this.resources.atlasView(5) },
       ],
     });
 
@@ -535,6 +541,8 @@ export class Renderer {
         { binding: 8, resource: this.resources.atlasView(1) },
         { binding: 9, resource: this.resources.atlasView(2) },
         { binding: 10, resource: this.resources.atlasView(3) },
+        { binding: 11, resource: this.resources.atlasView(4) },
+        { binding: 12, resource: this.resources.atlasView(5) },
       ],
     });
 

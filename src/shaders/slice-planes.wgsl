@@ -90,8 +90,8 @@ fn fs(@location(0) voxelPos: vec3f) -> @location(0) vec4f {
         for (var ch = 0u; ch < uniforms.numChannels; ch++) {
             let rawSample = sampleAtlasCh(ch, voxelPos, indirection, lodScale);
             let raw = clamp((rawSample - uniforms.floatMin) * floatInvRange, 0.0, 1.0);
-            let wc = uniforms.channelWindowCenter[ch];
-            let ww = max(uniforms.channelWindowWidth[ch], 0.0001);
+            let wc = chWindowCenter(ch);
+            let ww = max(chWindowWidth(ch), 0.0001);
             let intensity = clamp((raw - (wc - ww * 0.5)) / ww, 0.0, 1.0);
             let chColor = uniforms.channelColors[ch];
             let weight = intensity * chColor.a;

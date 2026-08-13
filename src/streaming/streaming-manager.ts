@@ -1002,7 +1002,7 @@ export class StreamingManager {
     }
 
     // Try CPU cache first, fall back to network — load all channels in parallel.
-    // Capped to renderer.numChannels (≤ 4) so we never write to a non-existent atlas.
+    // Capped to renderer.numChannels (≤ MAX_CHANNELS) so we never write to a non-existent atlas.
     // Caching deferred until after emptiness check (empty bricks shouldn't evict useful cache entries).
     const numChannels = this.resources.numChannels;
     const fromCache: boolean[] = new Array(numChannels).fill(false);

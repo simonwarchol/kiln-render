@@ -12,7 +12,7 @@ import { COMPUTE_UNIFORMS, SLICE_UNIFORMS } from '../src/shaders/uniform-layout.
 
 describe('COMPUTE_UNIFORMS layout', () => {
   it('has the expected total size (multiple of 16)', () => {
-    expect(COMPUTE_UNIFORMS.size).toBe(272);
+    expect(COMPUTE_UNIFORMS.size).toBe(336);
     expect(COMPUTE_UNIFORMS.size % 16).toBe(0);
   });
 
@@ -25,8 +25,8 @@ describe('COMPUTE_UNIFORMS layout', () => {
       clipMin: 144,
       densityScale: 156,    // scalar packed after clipMin's vec3
       channelColors: 176,
-      channelWindowCenter: 240,
-      channelWindowWidth: 256,
+      channelWindowCenter: 272,
+      channelWindowWidth: 304,
     });
   });
 
@@ -39,7 +39,7 @@ describe('COMPUTE_UNIFORMS layout', () => {
 
 describe('SLICE_UNIFORMS layout', () => {
   it('has the expected total size (multiple of 16)', () => {
-    expect(SLICE_UNIFORMS.size).toBe(240);
+    expect(SLICE_UNIFORMS.size).toBe(304);
     expect(SLICE_UNIFORMS.size % 16).toBe(0);
   });
 
@@ -50,8 +50,8 @@ describe('SLICE_UNIFORMS layout', () => {
       datasetSize: 80,
       slicePositions: 112,
       channelColors: 144,
-      channelWindowCenter: 208,
-      channelWindowWidth: 224,
+      channelWindowCenter: 240,
+      channelWindowWidth: 272,
     });
   });
 });

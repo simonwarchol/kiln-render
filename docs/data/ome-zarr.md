@@ -14,14 +14,14 @@ Kiln is listed in the [OME-NGFF tools registry](https://ngff.openmicroscopy.org/
 ## Requirements
 
 - **OME-NGFF v0.4 and v0.5** with `multiscales` metadata in group attributes
-- **Single-channel or multichannel** — up to 4 channels (see [Multichannel](/rendering/multichannel))
+- **Single-channel or multichannel** — up to 6 channels (see [Multichannel](/rendering/multichannel))
 - **3D arrays** with dimensions ordered `[z, y, x]` (standard C-order); multichannel datasets use a `c` axis
 - **Supported dtypes:** `uint8`, `uint16`, `float32` input (signed integers and `float64` not supported)
 - Multiple resolution levels (datasets within `multiscales`) are used as LODs
 - Voxel spacing is read from `coordinateTransformations` if present
 - OMERO metadata is used for per-channel window auto-leveling when available
 
-> **Note:** Currently unsupported: more than 4 channels, signed integer types (`int8`, `int16`), and `float64`. `uint16` and `float32` volumes are stored internally as `r16float` (WebGPU filterable-float32 is not universally available, and there's no native 16-bit-integer alternative in use here); this is not bit-exact across the full `uint16` range. min/max range is read from metadata and used to normalise values in the shader.
+> **Note:** Currently unsupported: more than 6 channels (extras are ignored), signed integer types (`int8`, `int16`), and `float64`. `uint16` and `float32` volumes are stored internally as `r16float` (WebGPU filterable-float32 is not universally available, and there's no native 16-bit-integer alternative in use here); this is not bit-exact across the full `uint16` range. min/max range is read from metadata and used to normalise values in the shader.
 
 ## Usage
 

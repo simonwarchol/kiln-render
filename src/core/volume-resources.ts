@@ -6,7 +6,7 @@
 import { VolumeCanvas, createVolumeCanvas } from './volume.js';
 import { IndirectionTable } from './indirection.js';
 import { AtlasAllocator } from '../streaming/atlas-allocator.js';
-import { GRID_SIZE, PHYSICAL_BRICK_SIZE } from './config.js';
+import { GRID_SIZE, MAX_CHANNELS, PHYSICAL_BRICK_SIZE } from './config.js';
 import type { DatasetConfig } from './config.js';
 import type { BitDepth } from '../data/data-provider.js';
 
@@ -35,7 +35,7 @@ export class VolumeResources {
   get canvas(): VolumeCanvas { return this.canvases[0]!; }
 
   constructor(device: GPUDevice, bitDepth: BitDepth, textureFormat: GPUTextureFormat, config: DatasetConfig, numChannels = 1, gridSize: number = GRID_SIZE) {
-    this.numChannels = Math.min(Math.max(1, numChannels), 4);
+    this.numChannels = Math.min(Math.max(1, numChannels), MAX_CHANNELS);
     this.gridSize = gridSize;
     this.atlasSize = gridSize * PHYSICAL_BRICK_SIZE;
 

@@ -24,7 +24,7 @@ fn composeSample(density, stepSize, color, alpha) {
 
 ## Multichannel compositing
 
-For multichannel datasets (up to 4 channels), the rendering pipeline switches from transfer-function-based compositing to **additive per-channel blending**. Each channel is sampled from its own atlas texture, windowed independently, and coloured with a user-defined colour. The weighted contributions are summed:
+For multichannel datasets (up to 6 channels), the rendering pipeline switches from transfer-function-based compositing to **additive per-channel blending**. Each channel is sampled from its own atlas texture, windowed independently, and coloured with a user-defined colour. The weighted contributions are summed:
 
 ```wgsl
 // Per-channel: sample atlas, apply windowing, weight by channel colour

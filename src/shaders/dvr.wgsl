@@ -15,15 +15,15 @@ fn rayMarchDVR(
     // colors, and a compacted list of visible channels (alpha > 0) — hidden
     // channels then cost nothing in the per-sample loop below instead of a
     // dynamically-indexed uniform read + branch per channel per sample.
-    var chLower: array<f32, 4>;
-    var chInvWidth: array<f32, 4>;
-    var chColorLocal: array<vec4f, 4>;
-    var visibleCh: array<u32, 4>;
+    var chLower: array<f32, 6>;
+    var chInvWidth: array<f32, 6>;
+    var chColorLocal: array<vec4f, 6>;
+    var visibleCh: array<u32, 6>;
     var numVisible = 0u;
     if (numCh > 1u) {
         for (var ch = 0u; ch < numCh; ch++) {
-            let ww = max(uniforms.channelWindowWidth[ch], 0.0001);
-            chLower[ch] = uniforms.channelWindowCenter[ch] - ww * 0.5;
+            let ww = max(chWindowWidth(ch), 0.0001);
+            chLower[ch] = chWindowCenter(ch) - ww * 0.5;
             chInvWidth[ch] = 1.0 / ww;
             let c = uniforms.channelColors[ch];
             chColorLocal[ch] = c;

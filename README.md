@@ -2,7 +2,7 @@
 
 A WebGPU-native out-of-core volume rendering system for large virtualized volumetric datasets.
 
-Kiln streams multi-gigabyte volumes over HTTP, rendering them at interactive framerates using a bounded GPU residency/atlas cache and virtual-texture indirection. It handles single-channel and multichannel OME-Zarr datasets (up to 4 channels).
+Kiln streams multi-gigabyte volumes over HTTP, rendering them at interactive framerates using a bounded GPU residency/atlas cache and virtual-texture indirection. It handles single-channel and multichannel OME-Zarr datasets (up to 6 channels).
 
 > **v0.4.1** — Multichannel rendering is in **beta**; see [Multichannel](docs/rendering/multichannel.md) for details and known limitations.
 
@@ -53,7 +53,7 @@ try {
 ## Features
 
 - **Out-of-core streaming** — Fixed VRAM footprint, SSE-based LOD selection, LRU brick cache
-- **Multichannel rendering** — Up to 4 channels with per-channel colour, windowing, and visibility controls ([details](docs/rendering/multichannel.md))
+- **Multichannel rendering** — Up to 6 channels with per-channel colour, windowing, and visibility controls ([details](docs/rendering/multichannel.md))
 - **OME-Zarr & Kiln binary** — Stream from S3, CDN, or load local files (OME-Zarr v0.4/v0.5, uint8/uint16/float32)
 - **Local filesystem** — Load local `.zarr` / `.ome.zarr` directories via the File System Access API (Chrome/Edge)
 - **uint8, uint16 & float32 input** — `uint16` and `float32` are converted to `r16float` for GPU storage, with window/level controls
