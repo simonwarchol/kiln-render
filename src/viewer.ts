@@ -3,17 +3,17 @@
  * data provider setup, render loop, and resize. App layer handles UI.
  */
 
-import { Renderer, VolumeRenderMode } from './core/renderer.js';
-import { VolumeResources } from './core/volume-resources.js';
-import { Camera, UpAxis } from './core/camera.js';
-import { TransferFunction, TFPreset } from './core/transfer-function.js';
-import { StreamingManager } from './streaming/streaming-manager.js';
-import { DatasetConfig, computeAtlasGrid } from './core/config.js';
-import { detectBest16BitFormat } from './core/volume.js';
-import type { DataProvider, VolumeMetadata } from './data/data-provider.js';
-import { ShardedDataProvider } from './data/sharded-provider.js';
-import { ZarrDataProvider } from './data/zarr-provider.js';
-import { isRemoteZarr } from './data/zarr-validator.js';
+import { Camera, type UpAxis } from "./core/camera.js";
+import { computeAtlasGrid, DatasetConfig } from "./core/config.js";
+import { Renderer, type VolumeRenderMode } from "./core/renderer.js";
+import { type TFPreset, TransferFunction } from "./core/transfer-function.js";
+import { detectBest16BitFormat } from "./core/volume.js";
+import { VolumeResources } from "./core/volume-resources.js";
+import type { DataProvider, VolumeMetadata } from "./data/data-provider.js";
+import { ShardedDataProvider } from "./data/sharded-provider.js";
+import { ZarrDataProvider } from "./data/zarr-provider.js";
+import { isRemoteZarr } from "./data/zarr-validator.js";
+import { StreamingManager } from "./streaming/streaming-manager.js";
 
 export interface ViewerOptions {
   /** Initial render mode */
@@ -51,7 +51,9 @@ export interface ViewerOptions {
   /** Camera up axis */
   upAxis?: UpAxis;
   /** Camera orbit state [rx, ry, dist] or [rx, ry, dist, tx, ty, tz] */
-  cam?: [number, number, number] | [number, number, number, number, number, number];
+  cam?:
+    | [number, number, number]
+    | [number, number, number, number, number, number];
   /** performance.now() at page load, used for time-to-first-render metric */
   pageLoadStart?: number;
   /** Slice plane positions, normalised 0–1 */
@@ -141,11 +143,16 @@ export class KilnViewer {
     this.metadata = metadata;
     this.userRenderScale = userRenderScale;
 
-    this.renderer.onDirty = () => { this.dirty = true; };
+    this.renderer.onDirty = () => {
+      this.dirty = true;
+    };
 
     this.resizeObserver = new ResizeObserver(() => {
       clearTimeout(this.resizeTimer);
-      this.resizeTimer = setTimeout(() => this.resize(), 100) as unknown as number;
+      this.resizeTimer = setTimeout(
+        () => this.resize(),
+        100,
+      ) as unknown as number;
     });
     this.resizeObserver.observe(canvas);
     this.resize(); // Ensure correct dimensions before first frame
@@ -159,10 +166,11 @@ export class KilnViewer {
     dataset: string | DataProvider,
     options: ViewerOptions = {},
   ): Promise<KilnViewer> {
-
-    // WebGPU init 
-    const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
-    if (!adapter) throw new Error('WebGPU not supported');
+    // WebGPU init
+    const adapter = await navigator.gpu?.requestAdapter({
+      powerPreference: "high-performance",
+    });
+    if (!adapter) throw new Error("WebGPU not supported");
 
     const adapterLimits = adapter.limits;
     const device = await adapter.requestDevice({
@@ -174,12 +182,13 @@ export class KilnViewer {
     });
 
     const format = navigator.gpu.getPreferredCanvasFormat();
-    const context = canvas.getContext('webgpu')!;
+    const context = canvas.getContext("webgpu");
+    if (!context) throw new Error("Failed to get WebGPU canvas context");
     context.configure({ device, format });
 
     // Data provider
     let dataProvider: DataProvider;
-    const isExternalProvider = typeof dataset !== 'string';
+    const isExternalProvider = typeof dataset !== "string";
 
     if (isExternalProvider) {
       dataProvider = dataset as DataProvider;
@@ -190,7 +199,7 @@ export class KilnViewer {
         : new ShardedDataProvider(dataset as string);
     }
 
-    // Metadata and texture format detection 
+    // Metadata and texture format detection
     const metadata = await dataProvider.initialize();
     const sourceBitDepth = metadata.bitDepth;
 
@@ -199,42 +208,64 @@ export class KilnViewer {
 
     if (sourceBitDepth === 16) {
       textureFormat = detectBest16BitFormat(device);
-      if (textureFormat === 'r8unorm') {
+      if (textureFormat === "r8unorm") {
         effectiveBitDepth = 8;
         console.warn(
-          '[Kiln] ⚠️  GPU does not support 16-bit textures (r16unorm/r16float).\n' +
-          'Downsampling to 8-bit (quality loss).',
+          "[Kiln] ⚠️  GPU does not support 16-bit textures (r16unorm/r16float).\n" +
+            "Downsampling to 8-bit (quality loss).",
         );
       }
     } else {
-      textureFormat = 'r8unorm';
+      textureFormat = "r8unorm";
     }
 
     // Configure worker target format (string-URL providers only)
     if (!isExternalProvider) {
       if (dataProvider instanceof ZarrDataProvider) {
         await dataProvider.setTargetFormat(
-          textureFormat as 'r8unorm' | 'r16float',
+          textureFormat as "r8unorm" | "r16float",
         );
-      } else if (textureFormat !== 'r16unorm' || sourceBitDepth !== 16) {
-        (dataProvider as ShardedDataProvider).setTargetFormat(textureFormat as 'r8unorm' | 'r16float');
+      } else if (textureFormat !== "r16unorm" || sourceBitDepth !== 16) {
+        (dataProvider as ShardedDataProvider).setTargetFormat(
+          textureFormat as "r8unorm" | "r16float",
+        );
       }
-    } else if ('setTargetFormat' in dataProvider) {
-      (dataProvider as { setTargetFormat: (f: string) => void }).setTargetFormat(textureFormat);
+    } else if ("setTargetFormat" in dataProvider) {
+      (
+        dataProvider as { setTargetFormat: (f: string) => void }
+      ).setTargetFormat(textureFormat);
     }
 
     // Build DatasetConfig
-    const config = new DatasetConfig(metadata.dimensions, metadata.voxelSpacing);
+    const config = new DatasetConfig(
+      metadata.dimensions,
+      metadata.voxelSpacing,
+    );
 
     // Shrink the atlas grid with channel count so total atlas VRAM fits the
     // budget — a fixed 660³ × many channels OOMs mobile GPUs at startup.
-    const bytesPerVoxel = textureFormat === 'r8unorm' ? 1 : 2;
-    const { gridSize, atlasSize } = computeAtlasGrid(metadata.numChannels, bytesPerVoxel, options.atlasBudgetBytes);
-    const atlasVramMB = Math.round((metadata.numChannels * atlasSize ** 3 * bytesPerVoxel) / 1e6);
-    console.log(`[Kiln] atlas grid ${gridSize}³ (${atlasSize}³ voxels) × ${metadata.numChannels} channel(s) ≈ ${atlasVramMB} MB VRAM`);
+    const bytesPerVoxel = textureFormat === "r8unorm" ? 1 : 2;
+    const { gridSize, atlasSize } = computeAtlasGrid(
+      metadata.numChannels,
+      bytesPerVoxel,
+      options.atlasBudgetBytes,
+    );
+    const atlasVramMB = Math.round(
+      (metadata.numChannels * atlasSize ** 3 * bytesPerVoxel) / 1e6,
+    );
+    console.log(
+      `[Kiln] atlas grid ${gridSize}³ (${atlasSize}³ voxels) × ${metadata.numChannels} channel(s) ≈ ${atlasVramMB} MB VRAM`,
+    );
 
     // Construct subsystems
-    const resources = new VolumeResources(device, effectiveBitDepth, textureFormat, config, metadata.numChannels, gridSize);
+    const resources = new VolumeResources(
+      device,
+      effectiveBitDepth,
+      textureFormat,
+      config,
+      metadata.numChannels,
+      gridSize,
+    );
     const renderer = new Renderer(device, format, resources, config);
 
     // Apply 16-bit window/level defaults from metadata
@@ -243,8 +274,14 @@ export class KilnViewer {
         const { start, end, min, max } = metadata.window;
         const range = max - min;
         if (range > 0) {
-          renderer.windowCenter = Math.max(0, Math.min(1, ((start + end) / 2 - min) / range));
-          renderer.windowWidth = Math.max(0.01, Math.min(1, (end - start) / range));
+          renderer.windowCenter = Math.max(
+            0,
+            Math.min(1, ((start + end) / 2 - min) / range),
+          );
+          renderer.windowWidth = Math.max(
+            0.01,
+            Math.min(1, (end - start) / range),
+          );
         }
       } else {
         renderer.windowCenter = 0.5;
@@ -255,15 +292,19 @@ export class KilnViewer {
     // Apply per-channel window/level from metadata. Float windows are
     // relative to the global dataRange (not per-channel OMERO min/max).
     if (metadata.channelWindows && metadata.numChannels > 1) {
-      const useGlobalRange = (metadata.isFloat ?? false) && !!metadata.dataRange;
+      const dataRange =
+        (metadata.isFloat ?? false) ? metadata.dataRange : undefined;
       for (let ch = 0; ch < metadata.channelWindows.length; ch++) {
         const w = metadata.channelWindows[ch];
         if (!w) continue;
-        const lo = useGlobalRange ? metadata.dataRange![0] : w.min;
-        const hi = useGlobalRange ? metadata.dataRange![1] : w.max;
+        const lo = dataRange ? dataRange[0] : w.min;
+        const hi = dataRange ? dataRange[1] : w.max;
         const range = hi - lo;
         if (range > 0) {
-          const center = Math.max(0, Math.min(1, ((w.start + w.end) / 2 - lo) / range));
+          const center = Math.max(
+            0,
+            Math.min(1, ((w.start + w.end) / 2 - lo) / range),
+          );
           const width = Math.max(0.01, Math.min(1, (w.end - w.start) / range));
           renderer.setChannelWindow(ch, center, width);
         }
@@ -281,7 +322,7 @@ export class KilnViewer {
 
     const camera = new Camera(canvas);
 
-    // Apply ViewerOptions overrides 
+    // Apply ViewerOptions overrides
     if (options.mode !== undefined) {
       renderer.volumeRenderMode = options.mode;
       renderer.resetAccumulation();
@@ -324,10 +365,14 @@ export class KilnViewer {
     if (options.sliceX !== undefined) renderer.sliceX = options.sliceX;
     if (options.sliceY !== undefined) renderer.sliceY = options.sliceY;
     if (options.sliceZ !== undefined) renderer.sliceZ = options.sliceZ;
-    if (options.showSliceX !== undefined) renderer.showSliceX = options.showSliceX;
-    if (options.showSliceY !== undefined) renderer.showSliceY = options.showSliceY;
-    if (options.showSliceZ !== undefined) renderer.showSliceZ = options.showSliceZ;
-    if (options.showWireframe !== undefined) renderer.showWireframe = options.showWireframe;
+    if (options.showSliceX !== undefined)
+      renderer.showSliceX = options.showSliceX;
+    if (options.showSliceY !== undefined)
+      renderer.showSliceY = options.showSliceY;
+    if (options.showSliceZ !== undefined)
+      renderer.showSliceZ = options.showSliceZ;
+    if (options.showWireframe !== undefined)
+      renderer.showWireframe = options.showWireframe;
     if (options.showAxis !== undefined) renderer.showAxis = options.showAxis;
     if (options.upAxis !== undefined) {
       camera.setUpAxis(options.upAxis);
@@ -352,7 +397,10 @@ export class KilnViewer {
     }
     if (options.forcedLod !== undefined && options.forcedLod !== null) {
       const maxLod = metadata.maxLod;
-      streamingManager.forcedLod = Math.max(0, Math.min(maxLod, Math.round(options.forcedLod)));
+      streamingManager.forcedLod = Math.max(
+        0,
+        Math.min(maxLod, Math.round(options.forcedLod)),
+      );
     }
 
     // Construct and return viewer
@@ -385,8 +433,14 @@ export class KilnViewer {
           if (!w) continue;
           const range = w.max - w.min;
           if (range > 0) {
-            const center = Math.max(0, Math.min(1, ((w.start + w.end) / 2 - w.min) / range));
-            const width = Math.max(0.01, Math.min(1, (w.end - w.start) / range));
+            const center = Math.max(
+              0,
+              Math.min(1, ((w.start + w.end) / 2 - w.min) / range),
+            );
+            const width = Math.max(
+              0.01,
+              Math.min(1, (w.end - w.start) / range),
+            );
             renderer.setChannelWindow(ch, center, width);
           }
         }
@@ -401,45 +455,59 @@ export class KilnViewer {
   }
 
   // Render state convenience API
-  get mode(): VolumeRenderMode { return this.renderer.volumeRenderMode; }
+  get mode(): VolumeRenderMode {
+    return this.renderer.volumeRenderMode;
+  }
   set mode(value: VolumeRenderMode) {
     this.renderer.volumeRenderMode = value;
     this.renderer.resetAccumulation();
   }
 
-  get isoValue(): number { return this.renderer.isoValue; }
+  get isoValue(): number {
+    return this.renderer.isoValue;
+  }
   set isoValue(value: number) {
     this.renderer.isoValue = value;
     this.renderer.resetAccumulation();
   }
 
-  get windowCenter(): number { return this.renderer.windowCenter; }
+  get windowCenter(): number {
+    return this.renderer.windowCenter;
+  }
   set windowCenter(value: number) {
     this.renderer.windowCenter = value;
     this.renderer.resetAccumulation();
   }
 
-  get windowWidth(): number { return this.renderer.windowWidth; }
+  get windowWidth(): number {
+    return this.renderer.windowWidth;
+  }
   set windowWidth(value: number) {
     this.renderer.windowWidth = value;
     this.renderer.resetAccumulation();
   }
 
   /** Minimum raw float value that maps to 0.0 in the shader (float32 datasets only). */
-  get floatMin(): number { return this.renderer.floatMin; }
+  get floatMin(): number {
+    return this.renderer.floatMin;
+  }
   set floatMin(value: number) {
     this.renderer.floatMin = value;
     this.renderer.resetAccumulation();
   }
 
   /** Maximum raw float value that maps to 1.0 in the shader (float32 datasets only). */
-  get floatMax(): number { return this.renderer.floatMax; }
+  get floatMax(): number {
+    return this.renderer.floatMax;
+  }
   set floatMax(value: number) {
     this.renderer.floatMax = value;
     this.renderer.resetAccumulation();
   }
 
-  get renderScale(): number { return this.userRenderScale; }
+  get renderScale(): number {
+    return this.userRenderScale;
+  }
   set renderScale(value: number) {
     this.userRenderScale = value;
     // build the scale set now (off the gesture path) and re-render
@@ -456,7 +524,10 @@ export class KilnViewer {
       this.streamingManager.forcedLod = null;
     } else {
       const maxLod = this.metadata.maxLod;
-      this.streamingManager.forcedLod = Math.max(0, Math.min(maxLod, Math.round(value)));
+      this.streamingManager.forcedLod = Math.max(
+        0,
+        Math.min(maxLod, Math.round(value)),
+      );
     }
     this.streamingManager.forceUpdate(this.camera, this.canvas);
     this.dirty = true;
@@ -483,14 +554,14 @@ export class KilnViewer {
       upAxis: this.camera.getUpAxis(),
       cam: [rx, ry, dist, tx, ty, tz],
       clipMin: [
-        this.renderer.clipMin[0]!,
-        this.renderer.clipMin[1]!,
-        this.renderer.clipMin[2]!,
+        this.renderer.clipMin[0] ?? 0,
+        this.renderer.clipMin[1] ?? 0,
+        this.renderer.clipMin[2] ?? 0,
       ],
       clipMax: [
-        this.renderer.clipMax[0]!,
-        this.renderer.clipMax[1]!,
-        this.renderer.clipMax[2]!,
+        this.renderer.clipMax[0] ?? 1,
+        this.renderer.clipMax[1] ?? 1,
+        this.renderer.clipMax[2] ?? 1,
       ],
       sliceX: this.renderer.sliceX,
       sliceY: this.renderer.sliceY,
@@ -542,7 +613,8 @@ export class KilnViewer {
     this.streamingManager.update(this.camera, this.canvas);
 
     // Determine if we need to render
-    const needsRender = this.dirty || interacting || !this.renderer.isConverged;
+    const needsRender =
+      this.dirty || this.camera.isInteracting() || !this.renderer.isConverged;
 
     if (needsRender) {
       this.dirty = false;
