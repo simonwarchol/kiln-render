@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://kilnrender.com/sitemap.xml
+Sitemap: https://simonwarchol.github.io/kiln-render/sitemap.xml
