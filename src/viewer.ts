@@ -74,7 +74,6 @@ export interface ViewerState {
   windowWidth: number;
   densityScale: number;
   isoValue: number;
-  /** User-intended render scale (not the 0.25 interaction override) */
   renderScale: number;
   /** Forced stream LOD, or `null` for automatic SSE selection */
   forcedLod: number | null;
@@ -114,8 +113,6 @@ export class KilnViewer {
   private readonly resizeObserver: ResizeObserver;
   private rafHandle = 0;
   private resizeTimer = 0;
-  /** User-intended render scale; the frame loop may temporarily override it to
-   *  0.25 during camera interaction. */
   private userRenderScale: number;
   private disposed = false;
   private dirty = true;
@@ -523,7 +520,6 @@ export class KilnViewer {
       this.canvas.width = width;
       this.canvas.height = height;
       this.renderer.resize(width, height);
-      this.renderer.prepareScale(0.25);
       this.renderer.prepareScale(this.userRenderScale);
       this.dirty = true;
     }
@@ -532,11 +528,8 @@ export class KilnViewer {
   private frame(): void {
     if (this.disposed) return;
 
-    // Drop to 0.25 during camera interaction; restore to user scale afterward
-    const interacting = this.camera.isInteracting();
-    const targetScale = interacting ? 0.25 : this.userRenderScale;
-    if (this.renderer.renderScale !== targetScale) {
-      this.renderer.activateScale(targetScale);
+    if (this.renderer.renderScale !== this.userRenderScale) {
+      this.renderer.activateScale(this.userRenderScale);
       this.dirty = true;
     }
 
