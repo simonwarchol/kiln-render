@@ -251,6 +251,53 @@
   overflow: hidden;
 }
 
+/* LOD: title + Auto on line 1, full-width slider + level on line 2. */
+.ctl-slider-row.has-toggle {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.ctl-slider-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ctl-slider-head .ctl-slider-label {
+  flex: 0 0 auto;
+}
+
+.ctl-slider-auto {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.ctl-slider-auto-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.ctl-slider-auto:hover .ctl-toggle-track {
+  background: rgba(187, 188, 196, 0.25);
+}
+
+.ctl-slider-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ctl-slider-row.has-toggle .ctl-slider-value {
+  flex: 0 0 auto;
+  overflow: visible;
+}
+
 /* --- Track wrappers: base track + fill are painted here, not on the input --- */
 .ctl-slider-track,
 .ctl-range-track {

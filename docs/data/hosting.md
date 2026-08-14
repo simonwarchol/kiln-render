@@ -1,6 +1,6 @@
 # Hosting for streaming
 
-Host the [sharded binary](/data/sharded-binary) output directory on any server that supports HTTP Range requests.
+Host [sharded binary](/data/sharded-binary) directories, [OME-Zarr](/data/ome-zarr) stores, or a single [Imaris](/data/imaris) `.ims` object on any server that supports HTTP Range requests.
 
 ## Amazon S3
 

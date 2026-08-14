@@ -6,34 +6,50 @@
  * is chosen from viewer.renderer.numChannels (VolumeUI vs MultichannelUI).
  */
 
+import type {
+  DataProvider,
+  TFPreset,
+  UpAxis,
+  ViewerOptions,
+} from "kiln-render";
 import {
+  getStoredHandle,
+  getStoredImsHandle,
+  ImarisDataProvider,
   KilnViewer,
   LocalZarrDataProvider,
-  UnsupportedDatasetError,
-  VolumeRenderMode,
-  getStoredHandle,
   requestPermission,
-} from 'kiln-render';
-import type { ViewerOptions, DataProvider, TFPreset, UpAxis } from 'kiln-render';
-import { VolumeUI } from './ui/volume-ui.js';
-import { MultichannelUI } from './ui/multichannel-ui.js';
-import type { ChannelState } from './ui/multichannel-ui.js';
-import { mountDatasetDialog, showDialogError } from '../../shared/dataset-dialog.js';
-import { mountToast } from '../../shared/toast.js';
-import { setupShareButton } from '../../shared/share-button.js';
-import { mountTopBar } from '../../shared/top-bar.js';
-import { trackEvent, trackDataset, trackRenderMode } from '../../shared/analytics.js';
-import { maybeRunBench } from '../../shared/bench.js';
-import '../../shared/viewer-shell.css';
-import '../../shared/controls/controls.css';
+  UnsupportedDatasetError,
+  type VolumeRenderMode,
+} from "kiln-render";
+import {
+  trackDataset,
+  trackEvent,
+  trackRenderMode,
+} from "../../shared/analytics.js";
+import { maybeRunBench } from "../../shared/bench.js";
+import {
+  mountDatasetDialog,
+  showDialogError,
+} from "../../shared/dataset-dialog.js";
+import { setupShareButton } from "../../shared/share-button.js";
+import { mountToast } from "../../shared/toast.js";
+import { mountTopBar } from "../../shared/top-bar.js";
+import type { ChannelState } from "./ui/multichannel-ui.js";
+import { MultichannelUI } from "./ui/multichannel-ui.js";
+import { VolumeUI } from "./ui/volume-ui.js";
+import "../../shared/viewer-shell.css";
+import "../../shared/controls/controls.css";
 
 // Default volume source (can be overridden via ?dataset= URL parameter)
-const DEFAULT_VOLUME_SOURCE = 'https://d39zu0xtgv0613.cloudfront.net/chameleon-16bit';
+const DEFAULT_VOLUME_SOURCE =
+  "https://d39zu0xtgv0613.cloudfront.net/chameleon-16bit";
 
 // ?embed=1 — rendering only: no top bar, dataset dialog, controls/stats panel,
 // or share button. Camera orbit/pan/zoom still works — that's wired directly
 // onto the canvas by the Camera class, independent of any of this example's UI.
-const IS_EMBED = new URLSearchParams(window.location.search).get('embed') === '1';
+const IS_EMBED =
+  new URLSearchParams(window.location.search).get("embed") === "1";
 
 interface MultiSliceParams {
   x: number;
@@ -58,7 +74,9 @@ function parseURLParams(): {
   scale?: number;
   /** Forced stream LOD (omit for Auto) */
   lod?: number;
-  cam?: [number, number, number] | [number, number, number, number, number, number];
+  cam?:
+    | [number, number, number]
+    | [number, number, number, number, number, number];
   clipMin?: [number, number, number];
   clipMax?: [number, number, number];
   slices?: [number, number, number];
@@ -71,43 +89,49 @@ function parseURLParams(): {
   multiSlice?: MultiSliceParams;
 } {
   const params = new URLSearchParams(window.location.search);
-  let cam: [number, number, number] | [number, number, number, number, number, number] | undefined;
-  const camStr = params.get('cam');
+  let cam:
+    | [number, number, number]
+    | [number, number, number, number, number, number]
+    | undefined;
+  const camStr = params.get("cam");
   if (camStr) {
-    const parts = camStr.split(',').map(Number);
-    if ((parts.length === 3 || parts.length === 6) && parts.every(n => !isNaN(n))) {
+    const parts = camStr.split(",").map(Number);
+    if (
+      (parts.length === 3 || parts.length === 6) &&
+      parts.every((n) => !isNaN(n))
+    ) {
       cam = parts as typeof cam;
     }
   }
 
   let clipMin: [number, number, number] | undefined;
   let clipMax: [number, number, number] | undefined;
-  const clipMinStr = params.get('clipMin');
-  const clipMaxStr = params.get('clipMax');
+  const clipMinStr = params.get("clipMin");
+  const clipMaxStr = params.get("clipMax");
   if (clipMinStr) {
-    const parts = clipMinStr.split(',').map(Number);
-    if (parts.length === 3 && parts.every(n => !isNaN(n))) {
+    const parts = clipMinStr.split(",").map(Number);
+    if (parts.length === 3 && parts.every((n) => !isNaN(n))) {
       clipMin = parts as [number, number, number];
     }
   }
   if (clipMaxStr) {
-    const parts = clipMaxStr.split(',').map(Number);
-    if (parts.length === 3 && parts.every(n => !isNaN(n))) {
+    const parts = clipMaxStr.split(",").map(Number);
+    if (parts.length === 3 && parts.every((n) => !isNaN(n))) {
       clipMax = parts as [number, number, number];
     }
   }
 
   let slices: [number, number, number] | undefined;
-  const slicesStr = params.get('slices');
+  const slicesStr = params.get("slices");
   if (slicesStr) {
-    const parts = slicesStr.split(',').map(Number);
-    if (parts.length === 3 && parts.every(n => !isNaN(n))) {
+    const parts = slicesStr.split(",").map(Number);
+    if (parts.length === 3 && parts.every((n) => !isNaN(n))) {
       slices = parts as [number, number, number];
     }
   }
 
   let sliceVis: [boolean, boolean, boolean] | undefined;
-  const sliceVisStr = params.get('sliceVis');
+  const sliceVisStr = params.get("sliceVis");
   if (sliceVisStr !== null) {
     const mask = parseInt(sliceVisStr, 10);
     if (!isNaN(mask)) {
@@ -116,10 +140,14 @@ function parseURLParams(): {
   }
 
   let tfPoints: Array<{ x: number; y: number }> | undefined;
-  const tfPtsStr = params.get('tfpts');
+  const tfPtsStr = params.get("tfpts");
   if (tfPtsStr) {
-    const nums = tfPtsStr.split(',').map(Number);
-    if (nums.length >= 2 && nums.length % 2 === 0 && nums.every(n => !isNaN(n))) {
+    const nums = tfPtsStr.split(",").map(Number);
+    if (
+      nums.length >= 2 &&
+      nums.length % 2 === 0 &&
+      nums.every((n) => !isNaN(n))
+    ) {
       tfPoints = [];
       for (let i = 0; i < nums.length; i += 2) {
         tfPoints.push({ x: nums[i]!, y: nums[i + 1]! });
@@ -128,10 +156,10 @@ function parseURLParams(): {
   }
 
   let channels: ChannelState[] | undefined;
-  const channelsStr = params.get('channels');
+  const channelsStr = params.get("channels");
   if (channelsStr) {
-    const parsed = channelsStr.split(';').map(part => {
-      const nums = part.split(',').map(Number);
+    const parsed = channelsStr.split(";").map((part) => {
+      const nums = part.split(",").map(Number);
       return {
         r: (nums[0] ?? NaN) | 0,
         g: (nums[1] ?? NaN) | 0,
@@ -142,16 +170,20 @@ function parseURLParams(): {
         max: nums[6] ?? 1,
       };
     });
-    if (parsed.every(ch => !isNaN(ch.r) && !isNaN(ch.g) && !isNaN(ch.b) && !isNaN(ch.a))) {
+    if (
+      parsed.every(
+        (ch) => !isNaN(ch.r) && !isNaN(ch.g) && !isNaN(ch.b) && !isNaN(ch.a),
+      )
+    ) {
       channels = parsed;
     }
   }
 
   let multiSlice: MultiSliceParams | undefined;
-  const sliceStr = params.get('slice');
+  const sliceStr = params.get("slice");
   if (sliceStr) {
-    const parts = sliceStr.split(',').map(Number);
-    if (parts.length === 6 && parts.every(n => !isNaN(n))) {
+    const parts = sliceStr.split(",").map(Number);
+    if (parts.length === 6 && parts.every((n) => !isNaN(n))) {
       multiSlice = {
         x: parts[0]!,
         y: parts[1]!,
@@ -164,25 +196,25 @@ function parseURLParams(): {
   }
 
   return {
-    dataset: params.get('dataset') ?? DEFAULT_VOLUME_SOURCE,
-    mode: (params.get('mode') as VolumeRenderMode) ?? undefined,
-    wc: params.has('wc') ? Number(params.get('wc')) : undefined,
-    ww: params.has('ww') ? Number(params.get('ww')) : undefined,
-    density: params.has('density') ? Number(params.get('density')) : undefined,
-    iso: params.has('iso') ? Number(params.get('iso')) : undefined,
-    tf: params.get('tf') ?? undefined,
-    up: params.get('up') ?? undefined,
-    sse: params.has('sse') ? Number(params.get('sse')) : undefined,
-    scale: params.has('scale') ? Number(params.get('scale')) : undefined,
-    lod: params.has('lod') ? Number(params.get('lod')) : undefined,
+    dataset: params.get("dataset") ?? DEFAULT_VOLUME_SOURCE,
+    mode: (params.get("mode") as VolumeRenderMode) ?? undefined,
+    wc: params.has("wc") ? Number(params.get("wc")) : undefined,
+    ww: params.has("ww") ? Number(params.get("ww")) : undefined,
+    density: params.has("density") ? Number(params.get("density")) : undefined,
+    iso: params.has("iso") ? Number(params.get("iso")) : undefined,
+    tf: params.get("tf") ?? undefined,
+    up: params.get("up") ?? undefined,
+    sse: params.has("sse") ? Number(params.get("sse")) : undefined,
+    scale: params.has("scale") ? Number(params.get("scale")) : undefined,
+    lod: params.has("lod") ? Number(params.get("lod")) : undefined,
     cam,
     clipMin,
     clipMax,
     slices,
     sliceVis,
     tfPoints,
-    wireframe: params.get('wireframe') === '1' ? true : undefined,
-    axis: params.get('axis') === '1' ? true : undefined,
+    wireframe: params.get("wireframe") === "1" ? true : undefined,
+    axis: params.get("axis") === "1" ? true : undefined,
     channels,
     multiSlice,
   };
@@ -192,8 +224,8 @@ function parseURLParams(): {
 const PAGE_LOAD_START = performance.now();
 
 async function main() {
-  const canvas = document.querySelector('canvas') as HTMLCanvasElement | null;
-  if (!canvas) throw new Error('Canvas not found');
+  const canvas = document.querySelector("canvas") as HTMLCanvasElement | null;
+  if (!canvas) throw new Error("Canvas not found");
 
   const urlParams = parseURLParams();
   const volumeSource = urlParams.dataset;
@@ -204,10 +236,18 @@ async function main() {
   let isLocalZarr = false;
 
   const params = new URLSearchParams(window.location.search);
-  const useLocal = params.get('local') === 'true';
+  const localMode = params.get("local");
   const storedHandle = await getStoredHandle();
+  const storedImsHandle = await getStoredImsHandle();
 
-  if (useLocal && storedHandle) {
+  if (localMode === "ims" && storedImsHandle) {
+    const hasPermission = await requestPermission(storedImsHandle);
+    if (hasPermission) {
+      dataset = new ImarisDataProvider(await storedImsHandle.getFile());
+    } else {
+      dataset = volumeSource;
+    }
+  } else if (localMode === "true" && storedHandle) {
     const hasPermission = await requestPermission(storedHandle);
     if (hasPermission) {
       dataset = new LocalZarrDataProvider(storedHandle);
@@ -234,7 +274,9 @@ async function main() {
     renderScale: urlParams.scale,
     maxPixelError: urlParams.sse,
     forcedLod:
-      urlParams.lod !== undefined && !Number.isNaN(urlParams.lod) ? urlParams.lod : undefined,
+      urlParams.lod !== undefined && !Number.isNaN(urlParams.lod)
+        ? urlParams.lod
+        : undefined,
     clipMin: urlParams.clipMin,
     clipMax: urlParams.clipMax,
     sliceX: urlParams.slices?.[0],
@@ -253,9 +295,9 @@ async function main() {
   // Show spinner during metadata fetch + any pre-scans (cause 1: main-thread
   // scanFloatRange/scanChannelRanges can block for seconds on large base LODs).
   // The UI stats interval takes over once the viewer exists.
-  document.getElementById('spinner')?.classList.add('active');
+  document.getElementById("spinner")?.classList.add("active");
   const viewer = await KilnViewer.create(canvas, dataset, options);
-  document.getElementById('spinner')?.classList.remove('active');
+  document.getElementById("spinner")?.classList.remove("active");
 
   const isMultichannel = viewer.renderer.numChannels > 1;
   topBar?.setDatasetName(viewer.metadata.name);
@@ -264,12 +306,14 @@ async function main() {
   // Multichannel share links often set mode after create (ISO unsupported).
   if (
     isMultichannel &&
-    (urlParams.mode === 'dvr' || urlParams.mode === 'mip' || urlParams.mode === 'slice')
+    (urlParams.mode === "dvr" ||
+      urlParams.mode === "mip" ||
+      urlParams.mode === "slice")
   ) {
     viewer.mode = urlParams.mode;
   }
 
-  trackEvent('webgpu-ok', 'WebGPU initialized');
+  trackEvent("webgpu-ok", "WebGPU initialized");
   trackDataset(viewer.metadata.name);
   trackRenderMode(viewer.getState().mode);
 
@@ -282,7 +326,11 @@ async function main() {
     const toast = mountToast();
 
     if (isMultichannel) {
-      const ui = new MultichannelUI(viewer, urlParams.channels, urlParams.multiSlice);
+      const ui = new MultichannelUI(
+        viewer,
+        urlParams.channels,
+        urlParams.multiSlice,
+      );
       viewer.onBeforeFrame = () => ui.recordFrame();
       viewer.onChannelWindowsChanged = () => ui.refreshChannelWindows();
 
@@ -292,31 +340,32 @@ async function main() {
         buildShareUrl: () => {
           const state = viewer.getState();
           const p = new URLSearchParams();
-          if (volumeSource !== DEFAULT_VOLUME_SOURCE) p.set('dataset', volumeSource);
-          p.set('up', state.upAxis);
-          p.set('mode', state.mode);
-          p.set('scale', state.renderScale.toFixed(2));
-          if (state.forcedLod !== null) p.set('lod', String(state.forcedLod));
+          if (volumeSource !== DEFAULT_VOLUME_SOURCE)
+            p.set("dataset", volumeSource);
+          p.set("up", state.upAxis);
+          p.set("mode", state.mode);
+          p.set("scale", state.renderScale.toFixed(2));
+          if (state.forcedLod !== null) p.set("lod", String(state.forcedLod));
           const [rx, ry, dist, tx, ty, tz] = state.cam;
           p.set(
-            'cam',
+            "cam",
             `${rx.toFixed(3)},${ry.toFixed(3)},${dist.toFixed(3)},${tx.toFixed(3)},${ty.toFixed(3)},${tz.toFixed(3)}`,
           );
           const channelState = ui.getChannelState();
           if (channelState.length > 0) {
             p.set(
-              'channels',
+              "channels",
               channelState
                 .map(
-                  ch =>
+                  (ch) =>
                     `${ch.r},${ch.g},${ch.b},${ch.a.toFixed(2)},${ch.visible ? 1 : 0},${ch.min.toFixed(2)},${ch.max.toFixed(2)}`,
                 )
-                .join(';'),
+                .join(";"),
             );
           }
           const sliceState = ui.getSliceState();
           p.set(
-            'slice',
+            "slice",
             `${sliceState.x},${sliceState.y},${sliceState.z},${sliceState.showX ? 1 : 0},${sliceState.showY ? 1 : 0},${sliceState.showZ ? 1 : 0}`,
           );
           return `${window.location.origin}${window.location.pathname}?${p.toString()}`;
@@ -333,41 +382,57 @@ async function main() {
         buildShareUrl: () => {
           const state = viewer.getState();
           const p = new URLSearchParams();
-          if (volumeSource !== DEFAULT_VOLUME_SOURCE) p.set('dataset', volumeSource);
-          p.set('mode', state.mode);
-          p.set('wc', state.windowCenter.toFixed(2));
-          p.set('ww', state.windowWidth.toFixed(2));
-          p.set('density', state.densityScale.toFixed(2));
-          p.set('iso', state.isoValue.toFixed(2));
-          p.set('tf', state.tfPreset);
-          p.set('tfpts', state.tfPoints.map(pt => `${pt.x.toFixed(2)},${pt.y.toFixed(2)}`).join(','));
-          p.set('up', state.upAxis);
-          p.set('scale', state.renderScale.toFixed(2));
-          if (state.forcedLod !== null) p.set('lod', String(state.forcedLod));
+          if (volumeSource !== DEFAULT_VOLUME_SOURCE)
+            p.set("dataset", volumeSource);
+          p.set("mode", state.mode);
+          p.set("wc", state.windowCenter.toFixed(2));
+          p.set("ww", state.windowWidth.toFixed(2));
+          p.set("density", state.densityScale.toFixed(2));
+          p.set("iso", state.isoValue.toFixed(2));
+          p.set("tf", state.tfPreset);
+          p.set(
+            "tfpts",
+            state.tfPoints
+              .map((pt) => `${pt.x.toFixed(2)},${pt.y.toFixed(2)}`)
+              .join(","),
+          );
+          p.set("up", state.upAxis);
+          p.set("scale", state.renderScale.toFixed(2));
+          if (state.forcedLod !== null) p.set("lod", String(state.forcedLod));
           const [rx, ry, dist, tx, ty, tz] = state.cam;
           p.set(
-            'cam',
+            "cam",
             `${rx.toFixed(3)},${ry.toFixed(3)},${dist.toFixed(3)},${tx.toFixed(3)},${ty.toFixed(3)},${tz.toFixed(3)}`,
           );
 
-          if (state.clipMin[0] !== 0 || state.clipMin[1] !== 0 || state.clipMin[2] !== 0) {
-            p.set('clipMin', state.clipMin.map(v => v.toFixed(2)).join(','));
+          if (
+            state.clipMin[0] !== 0 ||
+            state.clipMin[1] !== 0 ||
+            state.clipMin[2] !== 0
+          ) {
+            p.set("clipMin", state.clipMin.map((v) => v.toFixed(2)).join(","));
           }
-          if (state.clipMax[0] !== 1 || state.clipMax[1] !== 1 || state.clipMax[2] !== 1) {
-            p.set('clipMax', state.clipMax.map(v => v.toFixed(2)).join(','));
+          if (
+            state.clipMax[0] !== 1 ||
+            state.clipMax[1] !== 1 ||
+            state.clipMax[2] !== 1
+          ) {
+            p.set("clipMax", state.clipMax.map((v) => v.toFixed(2)).join(","));
           }
 
-          if (state.showWireframe) p.set('wireframe', '1');
-          if (state.showAxis) p.set('axis', '1');
+          if (state.showWireframe) p.set("wireframe", "1");
+          if (state.showAxis) p.set("axis", "1");
 
-          if (state.mode === 'slice') {
+          if (state.mode === "slice") {
             p.set(
-              'slices',
+              "slices",
               `${state.sliceX.toFixed(2)},${state.sliceY.toFixed(2)},${state.sliceZ.toFixed(2)}`,
             );
             const visMask =
-              (state.showSliceX ? 1 : 0) | (state.showSliceY ? 2 : 0) | (state.showSliceZ ? 4 : 0);
-            if (visMask !== 7) p.set('sliceVis', String(visMask));
+              (state.showSliceX ? 1 : 0) |
+              (state.showSliceY ? 2 : 0) |
+              (state.showSliceZ ? 4 : 0);
+            if (visMask !== 7) p.set("sliceVis", String(visMask));
           }
 
           return `${window.location.origin}${window.location.pathname}?${p.toString()}`;
@@ -378,16 +443,16 @@ async function main() {
 
   // ── Cleanup ────────────────────────────────────────────────────────────────
 
-  window.addEventListener('beforeunload', () => {
+  window.addEventListener("beforeunload", () => {
     viewer.dispose();
   });
 }
 
 function showError(message: string) {
-  const el = document.getElementById('error');
+  const el = document.getElementById("error");
   if (el) {
     el.textContent = message;
-    el.style.display = 'block';
+    el.style.display = "block";
   }
   console.error(message);
 }
@@ -397,8 +462,9 @@ function showError(message: string) {
 const topBar = IS_EMBED ? null : mountTopBar();
 if (!IS_EMBED) {
   mountDatasetDialog({
-    remoteDescription: 'Enter URL to an OME-Zarr dataset or Kiln sharded binary',
-    docsLink: `${import.meta.env.VITE_REPO_URL || 'https://github.com/MPanknin/kiln-render'}/blob/main/docs/data/ome-zarr.md`,
+    remoteDescription:
+      "Enter URL to an OME-Zarr, Imaris (.ims), or Kiln sharded binary dataset",
+    docsLink: `${import.meta.env.VITE_REPO_URL || "https://github.com/MPanknin/kiln-render"}/blob/main/docs/data/ome-zarr.md`,
   });
 }
 
@@ -407,8 +473,11 @@ main().catch((e) => {
     showDialogError(e.reasons, true);
   } else {
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg === 'WebGPU not supported' || msg === 'WebGPU device creation failed') {
-      trackEvent('webgpu-failed', msg);
+    if (
+      msg === "WebGPU not supported" ||
+      msg === "WebGPU device creation failed"
+    ) {
+      trackEvent("webgpu-failed", msg);
     }
     showError(msg);
   }

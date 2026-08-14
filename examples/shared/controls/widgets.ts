@@ -161,7 +161,17 @@ export function createSlider(opts: {
   value: number;
   format?: (v: number) => string;
   onChange: (v: number) => void;
-}): { el: HTMLElement; setValue(v: number): void } {
+  /** Optional switch at the end of the row (e.g. Auto on the LOD slider). */
+  toggle?: {
+    checked: boolean;
+    title?: string;
+    onChange: (v: boolean) => void;
+  };
+}): {
+  el: HTMLElement;
+  setValue(v: number): void;
+  setChecked(v: boolean): void;
+} {
   const format = opts.format ?? ((v: number) => v.toFixed(2));
   const pct = (v: number) => ((v - opts.min) / (opts.max - opts.min)) * 100;
 
@@ -177,6 +187,8 @@ export function createSlider(opts: {
 
   const fill = document.createElement("div");
   fill.className = "ctl-slider-fill";
+
+  if (opts.toggle) el.classList.add("has-toggle");
 
   const input = document.createElement("input");
   input.type = "range";
@@ -205,15 +217,54 @@ export function createSlider(opts: {
 
   trackWrap.appendChild(fill);
   trackWrap.appendChild(input);
-  el.appendChild(label);
-  el.appendChild(trackWrap);
-  el.appendChild(value);
+
+  let toggleInput: HTMLInputElement | null = null;
+  if (opts.toggle) {
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.className = "ctl-toggle-input";
+    toggle.checked = opts.toggle.checked;
+    toggle.setAttribute("aria-label", opts.toggle.title ?? "Toggle");
+    toggle.addEventListener("change", () =>
+      opts.toggle?.onChange(toggle.checked),
+    );
+    const caption = document.createElement("span");
+    caption.className = "ctl-slider-auto-label";
+    caption.textContent = opts.toggle.title ?? "Auto";
+    const track = document.createElement("span");
+    track.className = "ctl-toggle-track";
+    const toggleLabel = document.createElement("label");
+    toggleLabel.className = "ctl-slider-auto";
+    toggleLabel.appendChild(caption);
+    toggleLabel.appendChild(toggle);
+    toggleLabel.appendChild(track);
+
+    const head = document.createElement("div");
+    head.className = "ctl-slider-head";
+    head.appendChild(label);
+    head.appendChild(toggleLabel);
+    const body = document.createElement("div");
+    body.className = "ctl-slider-body";
+    body.appendChild(trackWrap);
+    body.appendChild(value);
+    el.appendChild(head);
+    el.appendChild(body);
+    toggleInput = toggle;
+  } else {
+    el.appendChild(label);
+    el.appendChild(trackWrap);
+    el.appendChild(value);
+  }
+
   return {
     el,
     setValue(v: number) {
       setFill(v);
       input.value = String(v);
       value.textContent = format(v);
+    },
+    setChecked(v: boolean) {
+      if (toggleInput) toggleInput.checked = v;
     },
   };
 }

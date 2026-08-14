@@ -45,6 +45,28 @@ import { clearHandle } from 'kiln-render';
 await clearHandle();
 ```
 
+## Local Imaris (`.ims`)
+
+A single `.ims` file can be picked the same way (Chrome/Edge). The handle is stored in IndexedDB; workers read slices with `FileReaderSync` instead of HTTP Range.
+
+```typescript
+import {
+  KilnViewer,
+  ImarisDataProvider,
+  promptForImsFile,
+  getStoredImsHandle,
+  requestPermission,
+} from 'kiln-render';
+
+const handle = await promptForImsFile();
+const viewer = await KilnViewer.create(
+  canvas,
+  new ImarisDataProvider(await handle.getFile()),
+);
+```
+
+See [Imaris](/data/imaris) for format limits.
+
 ## Limitations vs. HTTP streaming
 
 - Runs on the main thread (the `FileSystemDirectoryHandle` cannot be transferred to a worker)

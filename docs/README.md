@@ -12,6 +12,7 @@ New to Kiln? Start with the **[Introduction](guide/introduction.md)** — what i
 
 ### Data
 - [OME-Zarr](data/ome-zarr.md) — supported formats and requirements
+- [Imaris](data/imaris.md) — 3D .ims over HTTPS/S3
 - [Local files](data/local-files.md) — File System Access API
 - [Sharded binary](data/sharded-binary.md) — conversion CLI and format
 - [Hosting](data/hosting.md) — S3, local dev, CDN

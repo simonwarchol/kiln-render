@@ -3,27 +3,27 @@
  * interface redesign; Tweakpane removed from user-facing UI entirely).
  */
 
-import type { Renderer } from "@kiln/core/renderer.js";
 import type { Camera, UpAxis } from "@kiln/core/camera.js";
-import type { StreamingManager } from "@kiln/streaming/streaming-manager.js";
+import type { Renderer } from "@kiln/core/renderer.js";
 import type { VolumeMetadata } from "@kiln/data/data-provider.js";
+import type { StreamingManager } from "@kiln/streaming/streaming-manager.js";
 import type { KilnViewer, VolumeRenderMode } from "kiln-render";
-import { StatsPanel } from "../../../shared/stats-panel.js";
-import {
-  createPanel,
-  createSwapRegion,
-  createCollapsible,
-  createToggle,
-  createSlider,
-  createRangeSlider,
-  createSelect,
-  createSegmentedControl,
-  createSliderToggleRow,
-  createColorSwatch,
-} from "../../../shared/controls/widgets.js";
 import { trackRenderMode } from "../../../shared/analytics.js";
+import {
+  createCollapsible,
+  createColorSwatch,
+  createPanel,
+  createRangeSlider,
+  createSegmentedControl,
+  createSelect,
+  createSlider,
+  createSliderToggleRow,
+  createSwapRegion,
+  createToggle,
+} from "../../../shared/controls/widgets.js";
+import { StatsPanel } from "../../../shared/stats-panel.js";
 
-/** Only 'dvr' | 'mip' | 'slice' are selectable via the Mode segmented control — 'slice-lod' is a debug visualization, relocated to the "LOD Levels" Advanced toggle (applied on top of the base mode). */
+/** Only 'dvr' | 'mip' | 'slice' are selectable via the Mode segmented control. */
 type BaseRenderMode = "dvr" | "mip" | "slice";
 
 // Default channel colors matching renderer defaults
@@ -62,7 +62,6 @@ export class MultichannelUI {
   private params = {
     upAxis: "-y" as UpAxis,
     renderMode: "dvr" as BaseRenderMode,
-    showLodLevels: false,
     renderScale: 0.5,
     /** Manual Data LOD override (toggle off = Auto SSE) */
     dataLodManual: false,
@@ -108,9 +107,7 @@ export class MultichannelUI {
   private wireframeToggle!: ReturnType<typeof createToggle>;
   private axesToggle!: ReturnType<typeof createToggle>;
   private renderScaleSlider!: ReturnType<typeof createSlider>;
-  private dataLodToggle!: ReturnType<typeof createToggle>;
   private dataLodSlider!: ReturnType<typeof createSlider>;
-  private lodLevelsToggle!: ReturnType<typeof createToggle>;
 
   constructor(
     viewer: KilnViewer,
@@ -131,7 +128,10 @@ export class MultichannelUI {
     // Sync initial values
     this.initialSlice = initialSlice;
     this.params.upAxis = this.camera.getUpAxis();
-    this.decomposeRenderMode(this.renderer.volumeRenderMode);
+    this.params.renderMode = this.normalizeMode(this.viewer.mode);
+    if (this.viewer.mode !== this.params.renderMode) {
+      this.viewer.mode = this.params.renderMode;
+    }
     this.params.showWireframe = this.renderer.showWireframe;
     this.params.showAxis = this.renderer.showAxis;
     this.params.renderScale = this.renderer.renderScale;
@@ -163,6 +163,7 @@ export class MultichannelUI {
           (restored.min + restored.max) / 2,
           Math.max(0.001, restored.max - restored.min),
         );
+        this.viewer.streamingManager.setChannelEnabled(i, restored.visible);
       } else {
         const defaults = CHANNEL_COLOR_DEFAULTS[i] ?? {
           r: 255,
@@ -219,32 +220,21 @@ export class MultichannelUI {
     this.initStreaming(viewer.streamingManager, viewer.metadata);
   }
 
-  /** Decompose a (possibly debug) renderer mode into { base mode, showLodLevels }. */
-  private decomposeRenderMode(mode: VolumeRenderMode): void {
-    if (mode === "slice-lod") {
-      this.params.renderMode = "slice";
-      this.params.showLodLevels = true;
-    } else if (mode === "dvr" || mode === "mip" || mode === "slice") {
-      this.params.renderMode = mode;
-      this.params.showLodLevels = false;
-    } else {
-      // 'iso'/'lod' were never reachable via this viewer's UI — fall back to dvr.
-      this.params.renderMode = "dvr";
-      this.params.showLodLevels = false;
-    }
+  private normalizeMode(mode: VolumeRenderMode): BaseRenderMode {
+    if (mode === "dvr" || mode === "mip" || mode === "slice") return mode;
+    if (mode === "slice-lod") return "slice";
+    return "dvr";
   }
 
-  /** Apply { base mode, showLodLevels } onto the viewer's actual VolumeRenderMode. */
-  private applyEffectiveMode(): void {
-    const base = this.params.renderMode;
-    const effective: VolumeRenderMode =
-      this.params.showLodLevels && base === "slice" ? "slice-lod" : base;
-    this.viewer.mode = effective;
+  private applyMode(): void {
+    this.viewer.mode = this.params.renderMode;
     this.updateVisibility();
   }
 
   private buildPanel(container: HTMLElement): void {
-    const { el: panelEl, body } = createPanel("Controls", { defaultCollapsed: true });
+    const { el: panelEl, body } = createPanel("Controls", {
+      defaultCollapsed: false,
+    });
     container.appendChild(panelEl);
 
     this.modeControl = createSegmentedControl({
@@ -256,11 +246,13 @@ export class MultichannelUI {
       value: this.params.renderMode,
       onChange: (v) => {
         this.params.renderMode = v as BaseRenderMode;
-        this.applyEffectiveMode();
+        this.applyMode();
         trackRenderMode(v);
       },
     });
     body.appendChild(this.modeControl.el);
+
+    this.mountLodControls(body);
 
     this.modeSwap = createSwapRegion();
     body.appendChild(this.modeSwap.el);
@@ -332,56 +324,6 @@ export class MultichannelUI {
     });
     advancedBody.appendChild(this.renderScaleSlider.el);
 
-    const maxLod = this.viewer.metadata.maxLod;
-    const formatDataLod = (v: number) => {
-      if (v === 0) return "L0 (finest)";
-      if (v === maxLod) return `L${v} (coarsest)`;
-      return `L${v}`;
-    };
-    this.dataLodToggle = createToggle({
-      label: "Data LOD",
-      value: this.params.dataLodManual,
-      onChange: (on) => {
-        this.params.dataLodManual = on;
-        if (on) {
-          const seed = this.viewer.finestStreamLod;
-          this.params.dataLod = seed;
-          this.dataLodSlider.setValue(seed);
-          this.viewer.forcedLod = seed;
-          this.dataLodSlider.el.style.display = "";
-        } else {
-          this.viewer.forcedLod = null;
-          this.dataLodSlider.el.style.display = "none";
-        }
-      },
-    });
-    advancedBody.appendChild(this.dataLodToggle.el);
-
-    this.dataLodSlider = createSlider({
-      label: "Level",
-      min: 0,
-      max: maxLod,
-      step: 1,
-      value: this.params.dataLod,
-      format: formatDataLod,
-      onChange: (v) => {
-        this.params.dataLod = v;
-        this.viewer.forcedLod = v;
-      },
-    });
-    this.dataLodSlider.el.style.display = this.params.dataLodManual ? "" : "none";
-    advancedBody.appendChild(this.dataLodSlider.el);
-
-    this.lodLevelsToggle = createToggle({
-      label: "LOD Levels",
-      value: this.params.showLodLevels,
-      onChange: (v) => {
-        this.params.showLodLevels = v;
-        this.applyEffectiveMode();
-      },
-    });
-    advancedBody.appendChild(this.lodLevelsToggle.el);
-
     this.updateVisibility();
   }
 
@@ -411,6 +353,7 @@ export class MultichannelUI {
             c.b / 255,
             v ? c.a : 0,
           );
+          this.viewer.streamingManager.setChannelEnabled(ch, v);
         },
       });
 
@@ -612,6 +555,58 @@ export class MultichannelUI {
 
   recordFrame(): void {
     this.stats.recordFrame();
+    this.syncAutoLod();
+  }
+
+  private mountLodControls(parent: HTMLElement): void {
+    const maxLod = this.viewer.metadata.maxLod;
+    const formatLod = (v: number) => {
+      if (v === 0) return "L0 (finest)";
+      if (v === maxLod) return `L${v} (coarsest)`;
+      return `L${v}`;
+    };
+
+    this.dataLodSlider = createSlider({
+      label: "LOD",
+      min: 0,
+      max: maxLod,
+      step: 1,
+      value: this.params.dataLod,
+      format: formatLod,
+      onChange: (v) => {
+        if (!this.params.dataLodManual) {
+          this.params.dataLodManual = true;
+          this.dataLodSlider.setChecked(false);
+        }
+        this.params.dataLod = v;
+        this.viewer.forcedLod = v;
+      },
+      toggle: {
+        checked: !this.params.dataLodManual,
+        title: "Auto",
+        onChange: (auto) => {
+          this.params.dataLodManual = !auto;
+          if (auto) {
+            this.viewer.forcedLod = null;
+            this.params.dataLod = this.viewer.finestStreamLod;
+          } else {
+            const seed = this.viewer.finestStreamLod;
+            this.params.dataLod = seed;
+            this.viewer.forcedLod = seed;
+          }
+          this.dataLodSlider.setValue(this.params.dataLod);
+        },
+      },
+    });
+    parent.appendChild(this.dataLodSlider.el);
+  }
+
+  private syncAutoLod(): void {
+    if (this.params.dataLodManual) return;
+    const lod = this.viewer.finestStreamLod;
+    if (lod === this.params.dataLod) return;
+    this.params.dataLod = lod;
+    this.dataLodSlider.setValue(lod);
   }
 
   private updateVisibility(): void {

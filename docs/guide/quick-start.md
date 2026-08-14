@@ -33,7 +33,7 @@ try {
 }
 ```
 
-`KilnViewer.create()` handles WebGPU initialisation, data provider setup, and starts the render loop. It accepts a URL string (OME-Zarr or Kiln sharded binary) or a pre-constructed `DataProvider` instance.
+`KilnViewer.create()` handles WebGPU initialisation, data provider setup, and starts the render loop. It accepts a URL string (OME-Zarr, Imaris `.ims`, or Kiln sharded binary) or a pre-constructed `DataProvider` instance.
 
 ## ViewerOptions
 
@@ -41,7 +41,7 @@ Pass an optional third argument to set the initial viewer state:
 
 ```typescript
 const viewer = await KilnViewer.create(canvas, url, {
-  mode: 'dvr',          // 'dvr' | 'mip' | 'iso' | 'lod' | 'slice'
+  mode: 'dvr',          // 'dvr' | 'mip' | 'iso' | 'slice'
   windowCenter: 0.35,   // 0–1 (16-bit window centre)
   windowWidth: 0.55,    // 0–1 (16-bit window width)
   isoValue: 0.2,        // 0–1 (isosurface threshold)

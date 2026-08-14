@@ -3,26 +3,29 @@
  * 66³ bricks entirely off-thread, transferring results back zero-copy.
  */
 
-import { open, root, Array as ZarrArray, registry } from 'zarrita';
-import type { DataType, Readable } from 'zarrita';
-import blosc from 'numcodecs/blosc';
-import lz4 from 'numcodecs/lz4';
-import zstd from 'numcodecs/zstd';
-import { TolerantFetchStore } from './tolerant-fetch-store.js';
-import { float32ToFloat16Bits, getUint16ToFloat16Lut } from '../utils/float16.js';
-import { SharedFetchRegistry } from './shared-fetch.js';
+import blosc from "numcodecs/blosc";
+import lz4 from "numcodecs/lz4";
+import zstd from "numcodecs/zstd";
+import type { DataType, Readable } from "zarrita";
+import { open, registry, root, type Array as ZarrArray } from "zarrita";
+import {
+  float32ToFloat16Bits,
+  getUint16ToFloat16Lut,
+} from "../utils/float16.js";
+import { SharedFetchRegistry } from "./shared-fetch.js";
+import { TolerantFetchStore } from "./tolerant-fetch-store.js";
 
 // Static codec imports — zarrita's dynamic imports fail in Vite dev workers.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-registry.set('blosc', async () => blosc as any);
+registry.set("blosc", async () => blosc as any);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-registry.set('lz4', async () => lz4 as any);
+registry.set("lz4", async () => lz4 as any);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-registry.set('zstd', async () => zstd as any);
+registry.set("zstd", async () => zstd as any);
 
 /** Messages from main thread to worker */
 export interface ZarrWorkerRequest {
-  type: 'init' | 'loadBrick' | 'setTargetFormat' | 'setFloatRange' | 'cancel';
+  type: "init" | "loadBrick" | "setTargetFormat" | "setFloatRange" | "cancel";
   id: number;
   /** For 'init': dataset URL and array paths */
   url?: string;
@@ -37,9 +40,15 @@ export interface ZarrWorkerRequest {
   physicalBrickSize?: number;
   /** Per-LOD scale factors and chunk info (sent with init) */
   lodParams?: {
-    scaleX: number; scaleY: number; scaleZ: number;
-    actualDimX: number; actualDimY: number; actualDimZ: number;
-    csx: number; csy: number; csz: number;
+    scaleX: number;
+    scaleY: number;
+    scaleZ: number;
+    actualDimX: number;
+    actualDimY: number;
+    actualDimZ: number;
+    csx: number;
+    csy: number;
+    csz: number;
     shapePrefixLength: number;
     channelAxisIdx: number;
   }[];
@@ -53,7 +62,7 @@ export interface ZarrWorkerRequest {
   dispatchTime?: number;
   is16bit?: boolean;
   /** Target texture format: r8unorm (8-bit), r16unorm (16-bit uint), r16float (16-bit float) */
-  targetFormat?: 'r8unorm' | 'r16unorm' | 'r16float';
+  targetFormat?: "r8unorm" | "r16unorm" | "r16float";
   /** Whether source data is float32/float64 */
   isFloat32?: boolean;
   /**
@@ -80,7 +89,7 @@ export interface ZarrWorkerRequest {
 
 /** Messages from worker to main thread */
 export interface ZarrWorkerResponse {
-  type: 'init' | 'loadBrick' | 'setTargetFormat' | 'setFloatRange';
+  type: "init" | "loadBrick" | "setTargetFormat" | "setFloatRange";
   id: number;
   error?: string;
   /** For 'loadBrick': assembled brick data (transferable) */
@@ -113,9 +122,9 @@ export interface ZarrWorkerResponse {
 let arrays: ZarrArray<DataType, Readable>[] = [];
 let LOGICAL_SIZE = 64;
 let PHYSICAL_SIZE = 66;
-let lodParams: ZarrWorkerRequest['lodParams'] = [];
+let lodParams: ZarrWorkerRequest["lodParams"] = [];
 let is16bit = false;
-let targetFormat: 'r8unorm' | 'r16unorm' | 'r16float' = 'r16unorm';
+let targetFormat: "r8unorm" | "r16unorm" | "r16float" = "r16unorm";
 let isFloat32 = false;
 let floatMin = 0;
 let floatMax = 1;
@@ -123,7 +132,10 @@ let dynamicCacheBudget = false; // ?p3=1
 let refcountedAborts = false; // ?p4=1
 
 // Per-worker chunk cache (LRU, bounded by byte count to prevent OOM)
-const chunkCache = new Map<string, { data: ArrayLike<number>; shape: number[]; bytes: number }>();
+const chunkCache = new Map<
+  string,
+  { data: ArrayLike<number>; shape: number[]; bytes: number }
+>();
 let cacheBytes = 0;
 let largestChunkBytes = 0;
 const FIXED_CACHE_BYTES = 32 * 1024 * 1024; // 32 MB per worker — the ?p3=1 control value
@@ -133,7 +145,10 @@ const MAX_DYNAMIC_CACHE_BYTES = 256 * 1024 * 1024;
 /** Cache budget for this worker: fixed (control), or scaled to the largest chunk seen (?p3=1). */
 function cacheBudgetBytes(): number {
   if (!dynamicCacheBudget) return FIXED_CACHE_BYTES;
-  return Math.min(MAX_DYNAMIC_CACHE_BYTES, Math.max(MIN_DYNAMIC_CACHE_BYTES, 8 * largestChunkBytes));
+  return Math.min(
+    MAX_DYNAMIC_CACHE_BYTES,
+    Math.max(MIN_DYNAMIC_CACHE_BYTES, 8 * largestChunkBytes),
+  );
 }
 
 // In-flight chunk fetch promises — coalesces concurrent requests for the same chunk
@@ -141,11 +156,17 @@ function cacheBudgetBytes(): number {
 // Used only when refcountedAborts (?p4=1) is OFF — see fetchChunkShared/sharedFetches
 // for the ON path. Kept as a separate map (rather than reusing one for both) so the
 // control path is byte-for-byte unchanged regardless of the flag.
-const inflightFetches = new Map<string, Promise<{ data: ArrayLike<number>; shape: number[] }>>();
+const inflightFetches = new Map<
+  string,
+  Promise<{ data: ArrayLike<number>; shape: number[] }>
+>();
 
 // ?p4=1 only — see fetchChunkShared / SharedFetchRegistry (shared-fetch.ts)
 // for the concurrency/abort semantics this fixes (bug B4).
-const sharedFetches = new SharedFetchRegistry<{ data: ArrayLike<number>; shape: number[] }>();
+const sharedFetches = new SharedFetchRegistry<{
+  data: ArrayLike<number>;
+  shape: number[];
+}>();
 
 /** Refcounted chunk fetch (?p4=1) — the zarr-specific fetch + cache wrapper around SharedFetchRegistry. */
 function fetchChunkShared(
@@ -156,11 +177,17 @@ function fetchChunkShared(
 ): Promise<{ data: ArrayLike<number>; shape: number[] }> {
   return sharedFetches.run(
     key,
-    (fetchSignal) => arr.getChunk(coords, { signal: fetchSignal } as RequestInit).then(chunk => {
-      const result = { data: chunk.data as unknown as ArrayLike<number>, shape: chunk.shape };
-      cacheSet(key, result.data, result.shape);
-      return result;
-    }),
+    (fetchSignal) =>
+      arr
+        .getChunk(coords, { signal: fetchSignal } as RequestInit)
+        .then((chunk) => {
+          const result = {
+            data: chunk.data as unknown as ArrayLike<number>,
+            shape: chunk.shape,
+          };
+          cacheSet(key, result.data, result.shape);
+          return result;
+        }),
     signal,
   );
 }
@@ -172,14 +199,27 @@ let workerStore: TolerantFetchStore | null = null;
 const cancelledRequests = new Set<number>();
 const activeControllers = new Map<number, AbortController>();
 
-function cacheKey(lod: number, cz: number, cy: number, cx: number, channelIndex: number): string {
+function cacheKey(
+  lod: number,
+  cz: number,
+  cy: number,
+  cx: number,
+  channelIndex: number,
+): string {
   return `${lod}:ch${channelIndex}:${cz}/${cy}/${cx}`;
 }
 
 function estimateBytes(data: ArrayLike<number>): number {
-  if (data instanceof Uint8Array || data instanceof Int8Array) return data.length;
-  if (data instanceof Uint16Array || data instanceof Int16Array) return data.length * 2;
-  if (data instanceof Float32Array || data instanceof Uint32Array || data instanceof Int32Array) return data.length * 4;
+  if (data instanceof Uint8Array || data instanceof Int8Array)
+    return data.length;
+  if (data instanceof Uint16Array || data instanceof Int16Array)
+    return data.length * 2;
+  if (
+    data instanceof Float32Array ||
+    data instanceof Uint32Array ||
+    data instanceof Int32Array
+  )
+    return data.length * 4;
   if (data instanceof Float64Array) return data.length * 8;
   return data.length * (is16bit ? 2 : 1); // fallback estimate
 }
@@ -206,29 +246,29 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
 
   // Cancel messages are handled immediately — not queued.
   // They must arrive and take effect even while a loadBrick is in progress.
-  if (type === 'cancel') {
+  if (type === "cancel") {
     cancelledRequests.add(id);
     const controller = activeControllers.get(id);
     if (controller) controller.abort();
     return;
   }
 
-  if (type === 'setTargetFormat') {
-    targetFormat = event.data.targetFormat ?? 'r16unorm';
-    const resp: ZarrWorkerResponse = { type: 'setTargetFormat', id };
+  if (type === "setTargetFormat") {
+    targetFormat = event.data.targetFormat ?? "r16unorm";
+    const resp: ZarrWorkerResponse = { type: "setTargetFormat", id };
     (self as unknown as Worker).postMessage(resp);
     return;
   }
 
-  if (type === 'setFloatRange') {
+  if (type === "setFloatRange") {
     floatMin = event.data.floatMin ?? 0;
     floatMax = event.data.floatMax ?? 1;
-    const resp: ZarrWorkerResponse = { type: 'setFloatRange', id };
+    const resp: ZarrWorkerResponse = { type: "setFloatRange", id };
     (self as unknown as Worker).postMessage(resp);
     return;
   }
 
-  if (type === 'init') {
+  if (type === "init") {
     // Init is called once at startup before any loadBrick — safe to handle directly
     (async () => {
       try {
@@ -237,31 +277,34 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
         PHYSICAL_SIZE = event.data.physicalBrickSize ?? 66;
         lodParams = event.data.lodParams ?? [];
         is16bit = event.data.is16bit ?? false;
-        targetFormat = event.data.targetFormat ?? 'r16unorm';
+        targetFormat = event.data.targetFormat ?? "r16unorm";
         isFloat32 = event.data.isFloat32 ?? false;
         dynamicCacheBudget = event.data.dynamicCacheBudget ?? false;
         refcountedAborts = event.data.refcountedAborts ?? false;
         floatMin = event.data.floatMin ?? 0;
         floatMax = event.data.floatMax ?? 1;
         if (isFloat32) {
-          console.log(`[ZarrWorker] Float32 normalization range: [${floatMin}, ${floatMax}]`);
+          console.log(
+            `[ZarrWorker] Float32 normalization range: [${floatMin}, ${floatMax}]`,
+          );
         }
 
         workerStore = new TolerantFetchStore(url!);
-        const rootGroup = await open(root(workerStore), { kind: 'group' });
+        const rootGroup = await open(root(workerStore), { kind: "group" });
 
         arrays = [];
         for (const path of paths!) {
-          const arr = await open(rootGroup.resolve(path), { kind: 'array' });
+          const arr = await open(rootGroup.resolve(path), { kind: "array" });
           arrays.push(arr);
         }
 
-        const resp: ZarrWorkerResponse = { type: 'init', id };
+        const resp: ZarrWorkerResponse = { type: "init", id };
         (self as unknown as Worker).postMessage(resp);
       } catch (e) {
         const resp: ZarrWorkerResponse = {
-          type: 'init', id,
-          error: e instanceof Error ? e.message : 'Init failed',
+          type: "init",
+          id,
+          error: e instanceof Error ? e.message : "Init failed",
         };
         (self as unknown as Worker).postMessage(resp);
       }
@@ -269,12 +312,13 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
     return;
   }
 
-  if (type === 'loadBrick') {
+  if (type === "loadBrick") {
     const { lod, bx, by, bz, dispatchTime } = event.data;
     const channelIndex = event.data.channelIndex ?? 0;
     // dispatchTime is Date.now() from the main thread — Date.now() shares the
     // same epoch across contexts, unlike performance.now() (per-context origin).
-    const queueMs = dispatchTime !== undefined ? Date.now() - dispatchTime : undefined;
+    const queueMs =
+      dispatchTime !== undefined ? Date.now() - dispatchTime : undefined;
 
     // Already cancelled before we started? Skip entirely.
     if (cancelledRequests.has(id)) {
@@ -287,7 +331,14 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
 
     (async () => {
       try {
-        const result = await assembleBrick(lod!, bx!, by!, bz!, channelIndex, controller.signal);
+        const result = await assembleBrick(
+          lod!,
+          bx!,
+          by!,
+          bz!,
+          channelIndex,
+          controller.signal,
+        );
 
         activeControllers.delete(id);
         cancelledRequests.delete(id);
@@ -295,7 +346,8 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
         if (controller.signal.aborted) return;
 
         const resp: ZarrWorkerResponse = {
-          type: 'loadBrick', id,
+          type: "loadBrick",
+          id,
           data: result.buffer,
           min: result.min,
           max: result.max,
@@ -315,11 +367,12 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
         activeControllers.delete(id);
         cancelledRequests.delete(id);
 
-        if (e instanceof DOMException && e.name === 'AbortError') return;
+        if (e instanceof DOMException && e.name === "AbortError") return;
 
         const resp: ZarrWorkerResponse = {
-          type: 'loadBrick', id,
-          error: e instanceof Error ? e.message : 'loadBrick failed',
+          type: "loadBrick",
+          id,
+          error: e instanceof Error ? e.message : "loadBrick failed",
         };
         (self as unknown as Worker).postMessage(resp);
       }
@@ -331,11 +384,39 @@ self.onmessage = (event: MessageEvent<ZarrWorkerRequest>) => {
  * Full brick assembly: fetch overlapping chunks, decompress, re-chunk into 66³ brick
  */
 async function assembleBrick(
-  lod: number, bx: number, by: number, bz: number, channelIndex: number, signal?: AbortSignal
-): Promise<{ buffer: ArrayBuffer; min: number; max: number; avg: number; rawMin?: number; rawMax?: number; fetchMs: number; assemblyMs: number; chunkHits: number; chunkTotal: number }> {
+  lod: number,
+  bx: number,
+  by: number,
+  bz: number,
+  channelIndex: number,
+  signal?: AbortSignal,
+): Promise<{
+  buffer: ArrayBuffer;
+  min: number;
+  max: number;
+  avg: number;
+  rawMin?: number;
+  rawMax?: number;
+  fetchMs: number;
+  assemblyMs: number;
+  chunkHits: number;
+  chunkTotal: number;
+}> {
   const arr = arrays[lod]!;
   const params = lodParams![lod]!;
-  const { scaleX, scaleY, scaleZ, actualDimX, actualDimY, actualDimZ, csx, csy, csz, shapePrefixLength, channelAxisIdx } = params;
+  const {
+    scaleX,
+    scaleY,
+    scaleZ,
+    actualDimX,
+    actualDimY,
+    actualDimZ,
+    csx,
+    csy,
+    csz,
+    shapePrefixLength,
+    channelAxisIdx,
+  } = params;
   const physSize = PHYSICAL_SIZE;
 
   // Virtual brick voxel range (in uniformly downsampled space)
@@ -347,9 +428,18 @@ async function assembleBrick(
   const aStartX = Math.max(0, Math.floor(Math.max(0, vStartX) * scaleX));
   const aStartY = Math.max(0, Math.floor(Math.max(0, vStartY) * scaleY));
   const aStartZ = Math.max(0, Math.floor(Math.max(0, vStartZ) * scaleZ));
-  const aEndX = Math.min(actualDimX - 1, Math.floor((vStartX + physSize - 1) * scaleX));
-  const aEndY = Math.min(actualDimY - 1, Math.floor((vStartY + physSize - 1) * scaleY));
-  const aEndZ = Math.min(actualDimZ - 1, Math.floor((vStartZ + physSize - 1) * scaleZ));
+  const aEndX = Math.min(
+    actualDimX - 1,
+    Math.floor((vStartX + physSize - 1) * scaleX),
+  );
+  const aEndY = Math.min(
+    actualDimY - 1,
+    Math.floor((vStartY + physSize - 1) * scaleY),
+  );
+  const aEndZ = Math.min(
+    actualDimZ - 1,
+    Math.floor((vStartZ + physSize - 1) * scaleZ),
+  );
 
   // Determine which Zarr chunks overlap
   const minCx = Math.floor(aStartX / csx);
@@ -367,11 +457,17 @@ async function assembleBrick(
   const ncx = maxCx - minCx + 1;
   const ncy = maxCy - minCy + 1;
   const chunkCount = ncx * ncy * (maxCz - minCz + 1);
-  const chunkDataArr: (ArrayLike<number> | null)[] = new Array(chunkCount).fill(null);
-  const chunkW = new Int32Array(chunkCount);  // per-chunk width (stride for Y)
+  const chunkDataArr: (ArrayLike<number> | null)[] = new Array(chunkCount).fill(
+    null,
+  );
+  const chunkW = new Int32Array(chunkCount); // per-chunk width (stride for Y)
   const chunkWH = new Int32Array(chunkCount); // per-chunk W*H (stride for Z)
 
-  const setChunkEntry = (fi: number, data: ArrayLike<number>, shape: number[]) => {
+  const setChunkEntry = (
+    fi: number,
+    data: ArrayLike<number>,
+    shape: number[],
+  ) => {
     chunkDataArr[fi] = data;
     const w = shape[shape.length - 1]!;
     const h = shape[shape.length - 2]!;
@@ -403,7 +499,7 @@ async function assembleBrick(
           if (refcountedAborts) {
             // ?p4=1 — see fetchChunkShared.
             fetchPromises.push(
-              fetchChunkShared(arr, coords, key, signal).then(entry => {
+              fetchChunkShared(arr, coords, key, signal).then((entry) => {
                 setChunkEntry(fi, entry.data, entry.shape);
               }),
             );
@@ -413,34 +509,53 @@ async function assembleBrick(
             // promise instead of issuing a duplicate HTTP request.
             let chunkPromise = inflightFetches.get(key);
             if (!chunkPromise) {
-              chunkPromise = arr.getChunk(coords, { signal } as RequestInit).then(chunk => {
-                const entry = { data: chunk.data as unknown as ArrayLike<number>, shape: chunk.shape };
-                cacheSet(key, entry.data, entry.shape);
-                return entry;
-              }).finally(() => {
-                inflightFetches.delete(key);
-              });
+              chunkPromise = arr
+                .getChunk(coords, { signal } as RequestInit)
+                .then((chunk) => {
+                  const entry = {
+                    data: chunk.data as unknown as ArrayLike<number>,
+                    shape: chunk.shape,
+                  };
+                  cacheSet(key, entry.data, entry.shape);
+                  return entry;
+                })
+                .finally(() => {
+                  inflightFetches.delete(key);
+                });
               inflightFetches.set(key, chunkPromise);
             }
-            fetchPromises.push(chunkPromise.then(entry => {
-              setChunkEntry(fi, entry.data, entry.shape);
-            }).catch(e => {
-              // Dedup conflict: the shared fetch was aborted by another brick's
-              // signal, but this brick is still active. Retry with our own signal.
-              if (e instanceof DOMException && e.name === 'AbortError' && !signal?.aborted) {
-                const cached = chunkCache.get(key);
-                if (cached) {
-                  setChunkEntry(fi, cached.data, cached.shape);
-                  return;
-                }
-                return arr.getChunk(coords, { signal } as RequestInit).then(chunk => {
-                  const entry = { data: chunk.data as unknown as ArrayLike<number>, shape: chunk.shape };
-                  cacheSet(key, entry.data, entry.shape);
+            fetchPromises.push(
+              chunkPromise
+                .then((entry) => {
                   setChunkEntry(fi, entry.data, entry.shape);
-                });
-              }
-              throw e;
-            }));
+                })
+                .catch((e) => {
+                  // Dedup conflict: the shared fetch was aborted by another brick's
+                  // signal, but this brick is still active. Retry with our own signal.
+                  if (
+                    e instanceof DOMException &&
+                    e.name === "AbortError" &&
+                    !signal?.aborted
+                  ) {
+                    const cached = chunkCache.get(key);
+                    if (cached) {
+                      setChunkEntry(fi, cached.data, cached.shape);
+                      return;
+                    }
+                    return arr
+                      .getChunk(coords, { signal } as RequestInit)
+                      .then((chunk) => {
+                        const entry = {
+                          data: chunk.data as unknown as ArrayLike<number>,
+                          shape: chunk.shape,
+                        };
+                        cacheSet(key, entry.data, entry.shape);
+                        setChunkEntry(fi, entry.data, entry.shape);
+                      });
+                  }
+                  throw e;
+                }),
+            );
           }
         }
       }
@@ -454,7 +569,7 @@ async function assembleBrick(
   // Abort check between fetch and assembly — the CPU-bound assembly loop
   // can't yield, so this is the last interruptible point.
   if (signal?.aborted) {
-    throw new DOMException('Aborted', 'AbortError');
+    throw new DOMException("Aborted", "AbortError");
   }
 
   // --- Stage 2: brick assembly (LUT-based voxel scatter + format conversion) ---
@@ -468,17 +583,28 @@ async function assembleBrick(
   const lutOffZ = new Int32Array(physSize);
 
   for (let i = 0; i < physSize; i++) {
-    const gx = Math.max(0, Math.min(actualDimX - 1, Math.round((vStartX + i) * scaleX)));
+    // Clamp to the fetched window, not the full volume — round() can land
+    // one voxel past aEnd* (computed with floor) on scaled pyramid levels.
+    const gx = Math.max(
+      aStartX,
+      Math.min(aEndX, Math.round((vStartX + i) * scaleX)),
+    );
     const cxI = Math.floor(gx / csx);
     lutChunkX[i] = cxI - minCx;
     lutOffX[i] = gx - cxI * csx;
 
-    const gy = Math.max(0, Math.min(actualDimY - 1, Math.round((vStartY + i) * scaleY)));
+    const gy = Math.max(
+      aStartY,
+      Math.min(aEndY, Math.round((vStartY + i) * scaleY)),
+    );
     const cyI = Math.floor(gy / csy);
     lutChunkY[i] = cyI - minCy;
     lutOffY[i] = gy - cyI * csy;
 
-    const gz = Math.max(0, Math.min(actualDimZ - 1, Math.round((vStartZ + i) * scaleZ)));
+    const gz = Math.max(
+      aStartZ,
+      Math.min(aEndZ, Math.round((vStartZ + i) * scaleZ)),
+    );
     const czI = Math.floor(gz / csz);
     lutChunkZ[i] = czI - minCz;
     lutOffZ[i] = gz - czI * csz;
@@ -491,7 +617,7 @@ async function assembleBrick(
 
   // uint16 → r16float bricks write float16 bits directly via the encode LUT,
   // in the same pass as the scatter — avoids a second full-brick conversion pass.
-  const writeFloat16 = is16bit && targetFormat === 'r16float' && !isFloat32;
+  const writeFloat16 = is16bit && targetFormat === "r16float" && !isFloat32;
   const u16ToF16Lut = writeFloat16 ? getUint16ToFloat16Lut() : null;
 
   let min = Infinity;
@@ -526,14 +652,17 @@ async function assembleBrick(
 
           if (isFloat32) {
             const range = floatMax - floatMin;
-            const normalizedVal = range > 0
-              ? Math.max(0, Math.min(1, (raw - floatMin) / range))
-              : 0;
+            const normalizedVal =
+              range > 0
+                ? Math.max(0, Math.min(1, (raw - floatMin) / range))
+                : 0;
             // Stats always in [0, 65535] space so isBrickEmpty thresholds work
             statVal = Math.round(normalizedVal * 65535);
             // Store raw float value as float16 bits — shader normalises using floatMin/floatMax uniforms.
             // Clamp to r16float representable range (±65504) before encoding.
-            brickVal = float32ToFloat16Bits(Math.max(-65504, Math.min(65504, raw)));
+            brickVal = float32ToFloat16Bits(
+              Math.max(-65504, Math.min(65504, raw)),
+            );
             // Track raw-space extremes for range derivation
             if (isFinite(raw)) {
               if (raw < rawMinVal) rawMinVal = raw;
@@ -562,7 +691,7 @@ async function assembleBrick(
   // Handle format conversions based on targetFormat
   let outputBrick: Uint8Array | Uint16Array = brick;
 
-  if (is16bit && targetFormat === 'r8unorm') {
+  if (is16bit && targetFormat === "r8unorm") {
     // 16-bit → 8-bit conversion (downsample for r8unorm fallback)
     const uint16Brick = brick as Uint16Array;
     const uint8Brick = new Uint8Array(uint16Brick.length);
@@ -590,9 +719,10 @@ async function assembleBrick(
 
   const assemblyMs = performance.now() - t1;
 
-  const buffer = outputBrick.buffer instanceof ArrayBuffer
-    ? outputBrick.buffer
-    : outputBrick.buffer.slice(0);
+  const buffer =
+    outputBrick.buffer instanceof ArrayBuffer
+      ? outputBrick.buffer
+      : outputBrick.buffer.slice(0);
 
   return {
     buffer: buffer as ArrayBuffer,

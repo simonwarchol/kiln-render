@@ -2,7 +2,7 @@
 
 > **Beta** — Multichannel rendering is new in v0.4.0 and still stabilizing; the API and compositing behaviour may change. See [Known Issues](/reference/issues) for current limitations.
 
-Kiln can render OME-Zarr datasets with up to 6 channels simultaneously. Each channel is rendered with independent colour, window/level, and visibility controls. Compositing uses additive blending rather than transfer functions.
+Kiln can render OME-Zarr and Imaris datasets with up to 6 channels simultaneously. Each channel is rendered with independent colour, window/level, and visibility controls. Compositing uses additive blending rather than transfer functions.
 
 ## Overview
 
@@ -15,7 +15,7 @@ Multichannel:     per-channel intensity × per-channel colour → additive blend
 
 ## Supported formats
 
-Multichannel rendering works with OME-Zarr datasets that have a channel (`c`) axis:
+Multichannel rendering works with OME-Zarr datasets that have a channel (`c`) axis, and with multi-channel Imaris (`Channel N`):
 
 - **OME-NGFF v0.4 and v0.5**
 - **Up to 6 channels** (datasets with more channels will use the first 6)
@@ -117,7 +117,7 @@ pnpm dev   # http://localhost:3000
 
 | Parameter | Format | Description |
 |-----------|--------|-------------|
-| `dataset` | URL | OME-Zarr dataset URL |
+| `dataset` | URL | OME-Zarr or Imaris dataset URL |
 | `channels` | `r,g,b,a,vis,min,max;...` | Per-channel state, semicolon-separated |
 | `mode` | `dvr`, `mip`, `slice` | Render mode |
 | `slice` | `x,y,z,showX,showY,showZ` | Slice plane positions and visibility |

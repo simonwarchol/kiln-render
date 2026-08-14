@@ -60,6 +60,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.3.14",
     "fflate": "^0.8.2",
+    "h5wasm": "^0.10.3",
     "lefthook": "^2.1.1",
     "numcodecs": "^0.3.2",
     "typescript": "^5.7.2",

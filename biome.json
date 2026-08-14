@@ -21,6 +21,14 @@
       },
       "correctness": {
         "noUnusedVariables": "off"
+      },
+      "style": {
+        "noNonNullAssertion": "off"
+      },
+      "suspicious": {
+        "noExplicitAny": "off",
+        "noGlobalIsFinite": "off",
+        "noGlobalIsNan": "off"
       }
     }
   },

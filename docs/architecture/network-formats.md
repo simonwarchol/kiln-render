@@ -55,6 +55,10 @@ The compression is transparent to the rest of the system—bricks are decompress
 
 The **ZarrDataProvider** (`src/data/zarr-provider.ts`) loads OME-Zarr volumes directly over HTTP using zarrita.js. A pool of Web Workers handles chunk fetching, decompression, and re-chunking into 66³ bricks with ghost borders. Since Zarr chunk boundaries don't align with Kiln's brick grid, workers fetch the overlapping chunks and assemble each brick from the relevant regions.
 
+### Imaris streaming
+
+The **ImarisDataProvider** (`src/data/imaris-provider.ts`) loads Imaris 5.5 HDF5 (`.ims`) over HTTP Range requests via h5wasm in Web Workers. Each `ResolutionLevel` is a 3D chunked volume (Z is part of the pyramid). Workers hyperslab a 66³ brick (plus ghost) from `/DataSet/ResolutionLevel N/TimePoint 0/Channel C/Data`.
+
 ## 16-bit and float32 volume support
 
 Kiln supports 8-bit unsigned, 16-bit unsigned, and 32-bit float volumes:

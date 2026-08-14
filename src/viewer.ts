@@ -10,6 +10,8 @@ import { type TFPreset, TransferFunction } from "./core/transfer-function.js";
 import { detectBest16BitFormat } from "./core/volume.js";
 import { VolumeResources } from "./core/volume-resources.js";
 import type { DataProvider, VolumeMetadata } from "./data/data-provider.js";
+import { ImarisDataProvider } from "./data/imaris-provider.js";
+import { isRemoteIms, looksLikeImsUrl } from "./data/imaris-validator.js";
 import { ShardedDataProvider } from "./data/sharded-provider.js";
 import { ZarrDataProvider } from "./data/zarr-provider.js";
 import { isRemoteZarr } from "./data/zarr-validator.js";
@@ -193,10 +195,14 @@ export class KilnViewer {
     if (isExternalProvider) {
       dataProvider = dataset as DataProvider;
     } else {
-      const isZarr = await isRemoteZarr(dataset as string);
-      dataProvider = isZarr
-        ? new ZarrDataProvider(dataset as string)
-        : new ShardedDataProvider(dataset as string);
+      const url = dataset as string;
+      if (looksLikeImsUrl(url) && (await isRemoteIms(url))) {
+        dataProvider = new ImarisDataProvider(url);
+      } else if (await isRemoteZarr(url)) {
+        dataProvider = new ZarrDataProvider(url);
+      } else {
+        dataProvider = new ShardedDataProvider(url);
+      }
     }
 
     // Metadata and texture format detection
@@ -219,13 +225,16 @@ export class KilnViewer {
       textureFormat = "r8unorm";
     }
 
-    // Configure worker target format (string-URL providers only)
-    if (!isExternalProvider) {
-      if (dataProvider instanceof ZarrDataProvider) {
-        await dataProvider.setTargetFormat(
-          textureFormat as "r8unorm" | "r16float",
-        );
-      } else if (textureFormat !== "r16unorm" || sourceBitDepth !== 16) {
+    if (dataProvider instanceof ZarrDataProvider) {
+      await dataProvider.setTargetFormat(
+        textureFormat as "r8unorm" | "r16float",
+      );
+    } else if (dataProvider instanceof ImarisDataProvider) {
+      await dataProvider.setTargetFormat(
+        textureFormat as "r8unorm" | "r16float",
+      );
+    } else if (!isExternalProvider) {
+      if (textureFormat !== "r16unorm" || sourceBitDepth !== 16) {
         (dataProvider as ShardedDataProvider).setTargetFormat(
           textureFormat as "r8unorm" | "r16float",
         );

@@ -1,10 +1,11 @@
 # OME-Zarr
 
-Kiln supports two input formats:
+Kiln supports these input formats:
 
 | Format | Preprocessing | Use Case |
 |--------|---------------|----------|
 | **OME-Zarr (NGFF v0.4/v0.5)** | None — no Kiln-specific conversion | Standard scientific imaging format, chunked arrays |
+| **Imaris (.ims)** | None — Range-streamed HDF5 | 3D Imaris 5.5 on HTTP/S3; see [Imaris](/data/imaris) |
 | **Kiln sharded binary** | Requires [conversion script](/data/sharded-binary) | Gzip-compressed bricks, HTTP Range streaming |
 
 Kiln can load compatible multiscale [OME-Zarr](https://ngff.openmicroscopy.org/) volumes directly over HTTP, with no Kiln-specific conversion. Point it at a `.ome.zarr` URL and it streams chunk data on demand.

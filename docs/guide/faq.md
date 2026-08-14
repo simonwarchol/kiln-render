@@ -9,12 +9,13 @@ If WebGPU is unavailable, `KilnViewer.create()` rejects with a descriptive error
 ## Can Kiln read my data?
 
 - **OME-Zarr (NGFF v0.4/v0.5)** — compatible multiscale datasets load directly from a URL or local directory, with no Kiln-specific conversion. Input can be `uint8`, `uint16`, or `float32` (not signed integers or `float64`); `uint16` and `float32` are converted to `r16float` internally.
+- **Imaris (.ims)** — 3D Imaris 5.5 HDF5 over HTTPS/S3 Range requests. Same dtypes; native 3D pyramid (Z is downsampled). See [Imaris](/data/imaris).
 - **Raw volumes** (and other formats) are converted once to Kiln's compressed [sharded binary format](/data/sharded-binary) with the bundled CLI, then streamed the same way.
 - Full requirements are in the [Data Guide](/data/ome-zarr).
 
 ## Why won't my dataset load from S3 or my own server?
 
-Almost always **CORS**. Kiln fetches data with cross-origin HTTP requests (including Range requests), so the bucket or server must return permissive CORS headers — `Access-Control-Allow-Origin`, and `Access-Control-Allow-Headers: Range` for sharded binary. See [Hosting for streaming](/data/hosting) for the S3/CDN configuration.
+Almost always **CORS**. Kiln fetches data with cross-origin HTTP requests (including Range requests), so the bucket or server must return permissive CORS headers — `Access-Control-Allow-Origin`, and `Access-Control-Allow-Headers: Range` for sharded binary and Imaris. See [Hosting for streaming](/data/hosting) for the S3/CDN configuration.
 
 ## How much VRAM does Kiln use?
 

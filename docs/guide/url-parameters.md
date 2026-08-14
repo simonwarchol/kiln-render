@@ -4,8 +4,8 @@ Control rendering settings via URL parameters to share or bookmark specific view
 
 | Parameter | Values | Description | Example |
 |-----------|--------|-------------|---------|
-| `dataset` | URL | Volume data source | `dataset=https://...volume.ome.zarr` |
-| `mode` | `dvr`, `mip`, `iso`, `lod`, `slice` | Render mode | `mode=mip` |
+| `dataset` | URL | Volume data source (OME-Zarr, Imaris `.ims`, or sharded) | `dataset=https://...volume.ome.zarr` |
+| `mode` | `dvr`, `mip`, `iso`, `slice` | Render mode | `mode=mip` |
 | `wc` | 0-1 | Window center | `wc=0.35` |
 | `ww` | 0-1 | Window width | `ww=0.55` |
 | `iso` | 0-1 | Isosurface threshold | `iso=0.15` |

@@ -17,7 +17,7 @@ Kiln implements a **virtual texturing** system that decouples the logical volume
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  AtlasAllocator             │  IndirectionTable        │  DataProviders     │
 │  - LRU slot tracking        │  - Virtual→Physical map  │  - Sharded binary  │
-│  - Eviction selection       │  - Multi-LOD support     │  - OME-Zarr        │
+│  - Eviction selection       │  - Multi-LOD support     │  - OME-Zarr / IMS  │
 │  - Metadata bookkeeping     │  - Empty brick markers   │  - Worker pools    │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                              GPU Resources                                  │

@@ -18,6 +18,9 @@ importers:
       fflate:
         specifier: ^0.8.2
         version: 0.8.3
+      h5wasm:
+        specifier: ^0.10.3
+        version: 0.10.3
       lefthook:
         specifier: ^2.1.1
         version: 2.1.10
@@ -932,6 +935,9 @@ packages:
     resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
+
+  h5wasm@0.10.3:
+    resolution: {integrity: sha512-W4Jy5ExtX/VNbyD8GdOBckDuj6AL16TemppVNxZsV3rJZEWCv2sxlCzOttZLer3zkMttbDYsWHl0qt1z3Bln+Q==}
 
   hast-util-to-html@9.0.5:
     resolution: {integrity: sha512-OguPdidb+fbHQSU4Q4ZiLKnzWo8Wwsf5bZfbvu7//a9oTYoqD/fWpe96NuHkoS9h0ccGOTe0C4NGXdtS0iObOw==}
@@ -2101,6 +2107,8 @@ snapshots:
 
   fsevents@2.3.3:
     optional: true
+
+  h5wasm@0.10.3: {}
 
   hast-util-to-html@9.0.5:
     dependencies:

@@ -1,10 +1,10 @@
 # Loading data
 
-How to load remote OME-Zarr, local filesystem directories, and multichannel datasets — both from the library API and the demo viewer.
+How to load remote OME-Zarr, Imaris (`.ims`), local filesystem directories and files, and multichannel datasets — both from the library API and the demo viewer.
 
 ## Local filesystem loading
 
-Load a local `.zarr` or `.ome.zarr` directory using the File System Access API:
+Load a local `.zarr` or `.ome.zarr` directory, or a local Imaris `.ims` file, using the File System Access API.
 
 ```typescript
 import {
@@ -28,7 +28,28 @@ const provider = new LocalZarrDataProvider(handle);
 const viewer = await KilnViewer.create(canvas, provider);
 ```
 
-> **Browser requirement:** The File System Access API is currently only supported in Chrome/Edge. `promptForZarrDirectory()` throws if the API is unavailable.
+Local Imaris `.ims` files use the same picker API:
+
+```typescript
+import {
+  KilnViewer,
+  ImarisDataProvider,
+  promptForImsFile,
+  preValidateLocalIms,
+} from 'kiln-render';
+
+const handle = await promptForImsFile();
+const file = await handle.getFile();
+const issues = await preValidateLocalIms(file);
+if (issues.length > 0) {
+  console.error('Unsupported dataset:', issues);
+  return;
+}
+
+const viewer = await KilnViewer.create(canvas, new ImarisDataProvider(file));
+```
+
+> **Browser requirement:** The File System Access API is currently only supported in Chrome/Edge. `promptForZarrDirectory()` / `promptForImsFile()` throw if the API is unavailable.
 
 Previously granted handles can be restored across page loads:
 
@@ -71,12 +92,14 @@ See the [Multichannel documentation](/rendering/multichannel) for compositing de
 Check a remote URL for compatibility before starting a load:
 
 ```typescript
-import { preValidateRemoteZarr } from 'kiln-render';
+import { preValidateRemoteZarr, preValidateRemoteIms } from 'kiln-render';
 
 const issues = await preValidateRemoteZarr('https://example.com/scan.ome.zarr');
 if (issues.length > 0) {
   // e.g. unsupported dtype, missing multiscales metadata, etc.
 }
+
+const imsIssues = await preValidateRemoteIms('https://example.com/scan.ims');
 ```
 
 ## Demo viewer — loading custom datasets
@@ -103,6 +126,12 @@ Compatible multiscale OME-Zarr datasets require no Kiln-specific conversion — 
 - `uint8`, `uint16`, and `float32` input (no signed integers or `float64`); `uint16` and `float32` are converted to `r16float` for GPU storage
 
 See the [Data Guide](/data/ome-zarr) for full format requirements.
+
+### Imaris
+
+3D Imaris 5.5 files (`.ims`) on HTTPS/S3 stream the same way. Each resolution level is a 3D chunked volume (Z is downsampled in the pyramid).
+
+See the [Imaris guide](/data/imaris) for CORS/Range requirements and limitations.
 
 ### Local datasets (File System Access API)
 

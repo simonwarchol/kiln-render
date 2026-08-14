@@ -3,18 +3,27 @@
  * bricks by frustum/LOD, queues priority loads, and cancels stale requests.
  */
 
-import { mat4 } from 'wgpu-matrix';
-import { Camera, extractFrustumPlanes, isAABBInFrustum } from '../core/camera.js';
-import type { VolumeResources } from '../core/volume-resources.js';
-import type { DataProvider, VolumeMetadata, BrickLoadResult, LodLevel } from '../data/data-provider.js';
-import { AtlasSlot } from './atlas-allocator.js';
-import { BrickCache } from './brick-cache.js';
-import { PHYSICAL_BRICK_SIZE } from '../core/config.js';
-import type { DatasetConfig } from '../core/config.js';
-import { writeToCanvas } from '../core/volume.js';
-import { getFloat16ToFloat32Lut } from '../utils/float16.js';
-import type { PipelineTimings } from '../data/data-provider.js';
-import { RollingAvg } from '../data/network-tracker.js';
+import { mat4 } from "wgpu-matrix";
+import {
+  type Camera,
+  extractFrustumPlanes,
+  isAABBInFrustum,
+} from "../core/camera.js";
+import type { DatasetConfig } from "../core/config.js";
+import { PHYSICAL_BRICK_SIZE } from "../core/config.js";
+import { writeToCanvas } from "../core/volume.js";
+import type { VolumeResources } from "../core/volume-resources.js";
+import type {
+  BrickLoadResult,
+  DataProvider,
+  LodLevel,
+  PipelineTimings,
+  VolumeMetadata,
+} from "../data/data-provider.js";
+import { RollingAvg } from "../data/network-tracker.js";
+import { getFloat16ToFloat32Lut } from "../utils/float16.js";
+import type { AtlasSlot } from "./atlas-allocator.js";
+import { BrickCache } from "./brick-cache.js";
 
 export interface BrickRequest {
   lod: number;
@@ -28,6 +37,10 @@ export interface BrickRequest {
 export interface LoadedBrickInfo {
   slot: AtlasSlot;
   slotIndex: number;
+  lod: number;
+  bx: number;
+  by: number;
+  bz: number;
 }
 
 export interface StreamingStats {
@@ -100,17 +113,32 @@ export class StreamingManager {
   private inFlightStaleTime = new Map<string, number>();
   private readonly CANCEL_GRACE_MS = 200;
 
-  // Max concurrent requests
+  // Max concurrent brick dispatches (each brick may fan out to N channels)
   private maxConcurrentRequests = 12;
 
+  // Cap on in-flight channel fetches across all bricks — keeps worker pools
+  // from queueing 12 bricks × N channels at once.
+  private maxConcurrentChannelJobs = 8;
+  private activeChannelJobs = 0;
+  private channelJobWaiters: Array<{
+    resolve: () => void;
+    reject: (err: Error) => void;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+  }> = [];
+
   // Callback for when base LOD is loaded with brick data
-  private onBaseLodLoaded: ((brickData: (Uint8Array | Uint16Array)[]) => void) | null = null;
+  private onBaseLodLoaded:
+    | ((brickData: (Uint8Array | Uint16Array)[]) => void)
+    | null = null;
 
   // Callback for when base LOD derives float/channel ranges
-  private onRangesDerived: ((opts: {
-    dataRange?: [number, number];
-    channelRanges?: Array<{ min: number; max: number }>;
-  }) => void) | null = null;
+  private onRangesDerived:
+    | ((opts: {
+        dataRange?: [number, number];
+        channelRanges?: Array<{ min: number; max: number }>;
+      }) => void)
+    | null = null;
 
   // Bricks remaining in the base-LOD load. Included in pendingCount so the
   // UI spinner is visible from the first frame — previously the base load
@@ -147,6 +175,9 @@ export class StreamingManager {
    */
   public forcedLod: number | null = null;
 
+  /** Per-channel fetch mask. Hidden channels are not requested on LOD changes. */
+  private channelEnabled: boolean[];
+
   // Camera FOV in radians (must match camera.getProjectionMatrix)
   private readonly cameraFovRad = Math.PI / 4; // 45 degrees
 
@@ -161,7 +192,7 @@ export class StreamingManager {
 
   // cached zero-filled bricks per bit depth, used to clear stale slot
   // contents when a channel's fetch failed
-  // reused slots may contain a previous brick's data 
+  // reused slots may contain a previous brick's data
   // without this a failed channel would show ghosts.
   private zeroBricks = new Map<number, Uint8Array | Uint16Array>();
 
@@ -179,7 +210,13 @@ export class StreamingManager {
     timeToFirstRender: null,
     evictedCount: 0,
     allocationsRefused: 0,
-    pipelineTimings: { avgQueueMs: 0, avgFetchMs: 0, avgAssemblyMs: 0, avgUploadMs: 0, sampleCount: 0 },
+    pipelineTimings: {
+      avgQueueMs: 0,
+      avgFetchMs: 0,
+      avgAssemblyMs: 0,
+      avgUploadMs: 0,
+      sampleCount: 0,
+    },
     bricksDispatched: 0,
     bricksCommitted: 0,
     bricksCancelled: 0,
@@ -209,7 +246,7 @@ export class StreamingManager {
     device: GPUDevice,
     config: DatasetConfig,
     onResetAccumulation: () => void,
-    pageLoadStartTime?: number
+    pageLoadStartTime?: number,
   ) {
     this.resources = resources;
     this.onResetAccumulation = onResetAccumulation;
@@ -224,7 +261,12 @@ export class StreamingManager {
 
     // Scale concurrent requests and cache budget for multichannel
     const numChannels = resources.numChannels;
+    this.channelEnabled = Array.from({ length: numChannels }, () => true);
     this.maxConcurrentRequests = numChannels > 1 ? 12 : 8;
+    // Multi-channel: limit channel jobs below brick concurrency so N-way
+    // Promise.all per brick cannot flood Imaris(≤4)/Zarr(≤8) worker pools.
+    this.maxConcurrentChannelJobs =
+      numChannels > 1 ? 8 : this.maxConcurrentRequests;
     this.brickCache = new BrickCache(numChannels * 256 * 1024 * 1024);
 
     // Use page load start time if provided for true time-to-first-render
@@ -235,24 +277,137 @@ export class StreamingManager {
   }
 
   /** Set callback to be invoked when base LOD is loaded with brick data */
-  setBaseLodLoadedCallback(callback: (brickData: (Uint8Array | Uint16Array)[]) => void): void {
+  setBaseLodLoadedCallback(
+    callback: (brickData: (Uint8Array | Uint16Array)[]) => void,
+  ): void {
     this.onBaseLodLoaded = callback;
   }
 
   /** Set callback for when base LOD derives float/channel ranges */
-  setRangesDerivedCallback(callback: (opts: {
-    dataRange?: [number, number];
-    channelRanges?: Array<{ min: number; max: number }>;
-  }) => void): void {
+  setRangesDerivedCallback(
+    callback: (opts: {
+      dataRange?: [number, number];
+      channelRanges?: Array<{ min: number; max: number }>;
+    }) => void,
+  ): void {
     this.onRangesDerived = callback;
+  }
+
+  /** Skip fetching this channel on subsequent brick/LOD loads. Re-enabling backfills resident bricks. */
+  setChannelEnabled(ch: number, enabled: boolean): void {
+    if (ch < 0 || ch >= this.channelEnabled.length) return;
+    if (this.channelEnabled[ch] === enabled) return;
+    this.channelEnabled[ch] = enabled;
+    if (enabled) void this.backfillChannel(ch);
+  }
+
+  /** Fetch a newly-visible channel into every currently resident brick. */
+  private async backfillChannel(ch: number): Promise<void> {
+    const jobs: Promise<void>[] = [];
+    for (const [key, info] of this.loadedBricks) {
+      jobs.push(this.backfillBrickChannel(ch, key, info));
+    }
+    await Promise.all(jobs);
+    if (this.channelEnabled[ch]) this.scheduleAccumulationReset();
+  }
+
+  private async backfillBrickChannel(
+    ch: number,
+    key: string,
+    info: LoadedBrickInfo,
+  ): Promise<void> {
+    if (!this.channelEnabled[ch]) return;
+    const cacheKey = `ch${ch}:${key}`;
+    let data = this.brickCache.get(cacheKey);
+    if (!data) {
+      let result: BrickLoadResult | null;
+      try {
+        result = await this.withChannelJob(() =>
+          this.dataProvider.loadBrick(info.lod, info.bx, info.by, info.bz, ch),
+        );
+      } catch {
+        return;
+      }
+      if (!result || !this.channelEnabled[ch]) return;
+      if (this.loadedBricks.get(key) !== info) return;
+      this.brickCache.put(cacheKey, result.data);
+      data = result.data;
+    }
+    if (this.loadedBricks.get(key) !== info) return;
+    writeToCanvas(
+      this.device,
+      this.resources.canvases[ch]!,
+      data,
+      [PHYSICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE],
+      [
+        info.slot.x * PHYSICAL_BRICK_SIZE,
+        info.slot.y * PHYSICAL_BRICK_SIZE,
+        info.slot.z * PHYSICAL_BRICK_SIZE,
+      ],
+    );
+  }
+
+  private async acquireChannelJob(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    if (this.activeChannelJobs < this.maxConcurrentChannelJobs) {
+      this.activeChannelJobs++;
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const entry: (typeof this.channelJobWaiters)[number] = {
+        resolve,
+        reject,
+        signal,
+      };
+      entry.onAbort = () => {
+        const i = this.channelJobWaiters.indexOf(entry);
+        if (i >= 0) {
+          this.channelJobWaiters.splice(i, 1);
+          reject(new DOMException("Aborted", "AbortError"));
+        }
+      };
+      this.channelJobWaiters.push(entry);
+      signal?.addEventListener("abort", entry.onAbort, { once: true });
+    });
+  }
+
+  private releaseChannelJob(): void {
+    const next = this.channelJobWaiters.shift();
+    if (next) {
+      if (next.onAbort && next.signal) {
+        next.signal.removeEventListener("abort", next.onAbort);
+      }
+      if (next.signal?.aborted) {
+        next.reject(new DOMException("Aborted", "AbortError"));
+        this.releaseChannelJob();
+        return;
+      }
+      next.resolve(); // transfer slot — activeChannelJobs unchanged
+      return;
+    }
+    this.activeChannelJobs--;
+  }
+
+  private async withChannelJob<T>(
+    fn: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    await this.acquireChannelJob(signal);
+    try {
+      return await fn();
+    } finally {
+      this.releaseChannelJob();
+    }
   }
 
   /** Lazily create (and cache) a zero-filled physical brick for a bit depth */
   private getZeroBrick(bitDepth: number): Uint8Array | Uint16Array {
     let brick = this.zeroBricks.get(bitDepth);
     if (!brick) {
-      const voxels = PHYSICAL_BRICK_SIZE * PHYSICAL_BRICK_SIZE * PHYSICAL_BRICK_SIZE;
-      brick = bitDepth === 16 ? new Uint16Array(voxels) : new Uint8Array(voxels);
+      const voxels =
+        PHYSICAL_BRICK_SIZE * PHYSICAL_BRICK_SIZE * PHYSICAL_BRICK_SIZE;
+      brick =
+        bitDepth === 16 ? new Uint16Array(voxels) : new Uint8Array(voxels);
       this.zeroBricks.set(bitDepth, brick);
     }
     return brick;
@@ -334,7 +489,9 @@ export class StreamingManager {
 
     // Center-out ordering: the volume's central content appears first instead
     // of a bottom-up z-slab wipe. Cheap and dramatically better perceived load.
-    const ccx = (gridX - 1) / 2, ccy = (gridY - 1) / 2, ccz = (gridZ - 1) / 2;
+    const ccx = (gridX - 1) / 2,
+      ccy = (gridY - 1) / 2,
+      ccz = (gridZ - 1) / 2;
     bricks.sort((a, b) => {
       const da = (a.bx - ccx) ** 2 + (a.by - ccy) ** 2 + (a.bz - ccz) ** 2;
       const db = (b.bx - ccx) ** 2 + (b.by - ccy) ** 2 + (b.bz - ccz) ** 2;
@@ -342,7 +499,9 @@ export class StreamingManager {
     });
 
     const concurrency = Math.min(bricks.length, this.maxConcurrentRequests);
-    console.log(`[Kiln] loadBaseLod: ${bricks.length} bricks × ${numChannels} channels (concurrency: ${concurrency})`);
+    console.log(
+      `[Kiln] loadBaseLod: ${bricks.length} bricks × ${numChannels} channels (concurrency: ${concurrency})`,
+    );
 
     // Process bricks with bounded concurrency — avoids firing all N×channels network
     // requests simultaneously, which saturates the browser's HTTP connection pool.
@@ -350,107 +509,151 @@ export class StreamingManager {
     // from the shared queue until empty.
     const allBrickData: (Uint8Array | Uint16Array)[] = [];
     let firstBrickMs: number | null = null;
-    let sumIsEmptyMs = 0, sumFetchMs = 0, sumUploadMs = 0, brickCount = 0;
+    let sumIsEmptyMs = 0,
+      sumFetchMs = 0,
+      sumUploadMs = 0,
+      brickCount = 0;
 
     // Range accumulators — derive float data range and per-channel
     // min/max incrementally from BrickLoadResult stats during base LOD loading.
     const isFloat = this.metadata.isFloat ?? false;
     const needsFloatRange = isFloat && !this.metadata.window; // no OMERO → provisional
     const needsChannelRanges = numChannels > 1 && !this.metadata.channelWindows;
-    let floatRangeMin = Infinity, floatRangeMax = -Infinity;
-    const channelMins = needsChannelRanges ? new Array(numChannels).fill(Infinity) as number[] : [];
-    const channelMaxs = needsChannelRanges ? new Array(numChannels).fill(-Infinity) as number[] : [];
+    let floatRangeMin = Infinity,
+      floatRangeMax = -Infinity;
+    const channelMins = needsChannelRanges
+      ? (new Array(numChannels).fill(Infinity) as number[])
+      : [];
+    const channelMaxs = needsChannelRanges
+      ? (new Array(numChannels).fill(-Infinity) as number[])
+      : [];
 
     const queue = [...bricks];
 
-    const processBrick = async ({ bx, by, bz, key }: typeof bricks[0]) => {
+    const processBrick = async ({ bx, by, bz, key }: (typeof bricks)[0]) => {
       try {
-      const tIsEmpty = performance.now();
-      const isEmpty = await this.dataProvider.isBrickEmpty(maxLod, bx, by, bz, this.config.emptyBrickThreshold);
-      sumIsEmptyMs += performance.now() - tIsEmpty;
-
-      if (isEmpty) {
-        this.emptyBricks.add(key);
-        this.resources.indirection.setEmpty(bx, by, bz, maxLod);
-        return;
-      }
-
-      // Load all channels in parallel — ch0 is mandatory, others degrade gracefully
-      const tFetch = performance.now();
-      const channelResults = await Promise.all(
-        Array.from({ length: numChannels }, (_, ch) =>
-          this.dataProvider.loadBrick(maxLod, bx, by, bz, ch)
-        )
-      );
-      sumFetchMs += performance.now() - tFetch;
-
-      if (!channelResults[0]) return; // ch0 mandatory; skip brick entirely if it failed
-
-      // Accumulate per-channel stats for range derivation
-      for (let ch = 0; ch < numChannels; ch++) {
-        const r = channelResults[ch];
-        if (!r) continue;
-        if (needsFloatRange && r.rawMin !== undefined && r.rawMax !== undefined) {
-          if (r.rawMin < floatRangeMin) floatRangeMin = r.rawMin;
-          if (r.rawMax > floatRangeMax) floatRangeMax = r.rawMax;
-        }
-        if (needsChannelRanges) {
-          // For non-float: stats are in native [0, 255] or [0, 65535] space.
-          // For float: use raw min/max (stats are normalized to provisional range).
-          const chMin = isFloat ? (r.rawMin ?? r.min) : r.min;
-          const chMax = isFloat ? (r.rawMax ?? r.max) : r.max;
-          if (chMin < channelMins[ch]!) channelMins[ch] = chMin;
-          if (chMax > channelMaxs[ch]!) channelMaxs[ch] = chMax;
-        }
-      }
-
-      const result = this.resources.allocator.allocate(this.frameCount);
-      if (!result) {
-        console.warn('[Kiln] loadBaseLod: atlas allocation failed');
-        return;
-      }
-
-      const offset: [number, number, number] = [
-        result.slot.x * PHYSICAL_BRICK_SIZE,
-        result.slot.y * PHYSICAL_BRICK_SIZE,
-        result.slot.z * PHYSICAL_BRICK_SIZE,
-      ];
-      const tUpload = performance.now();
-      for (let ch = 0; ch < numChannels; ch++) {
-        // Zero-fill failed channels. The "fresh from free list" assumption is
-        // only true on cold load — after clear() the allocator recycles slots
-        // without re-zeroing texture memory, so skipping would show the
-        // previous dataset's data in that channel.
-        const data = channelResults[ch]?.data ?? this.getZeroBrick(this.resources.canvases[ch]!.bitDepth);
-        writeToCanvas(
-          this.device,
-          this.resources.canvases[ch]!,
-          data,
-          [PHYSICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE],
-          offset
+        const tIsEmpty = performance.now();
+        const isEmpty = await this.dataProvider.isBrickEmpty(
+          maxLod,
+          bx,
+          by,
+          bz,
+          this.config.emptyBrickThreshold,
         );
-      }
-      const uploadMs = performance.now() - tUpload;
-      sumUploadMs += uploadMs;
-      this.uploadAvg.add(uploadMs);
+        sumIsEmptyMs += performance.now() - tIsEmpty;
 
-      this.resources.indirection.setBrick(bx, by, bz, result.slot.x, result.slot.y, result.slot.z, maxLod);
-      this.resources.allocator.setMetadata(result.slotIndex, { lod: maxLod, bx, by, bz, key });
-      this.resources.allocator.pin(result.slotIndex);
+        if (isEmpty) {
+          this.emptyBricks.add(key);
+          this.resources.indirection.setEmpty(bx, by, bz, maxLod);
+          return;
+        }
 
-      this.loadedBricks.set(key, { slot: result.slot, slotIndex: result.slotIndex });
-      this.pinnedBricks.add(key);
-      allBrickData.push(channelResults[0].data);
-      brickCount++;
+        // Load channels in parallel — gated by channel-job semaphore
+        const tFetch = performance.now();
+        const channelResults = await Promise.all(
+          Array.from({ length: numChannels }, (_, ch) =>
+            this.withChannelJob(() =>
+              this.dataProvider.loadBrick(maxLod, bx, by, bz, ch),
+            ),
+          ),
+        );
+        sumFetchMs += performance.now() - tFetch;
 
-      if (firstBrickMs === null) {
-        firstBrickMs = performance.now() - this.loadStartTime;
-      }
+        if (!channelResults[0]) return; // ch0 mandatory; skip brick entirely if it failed
 
-      // arriving base bricks must trigger a re-render — otherwise the
-      // viewer converges on a near-empty scene and freezes while the base LOD
-      // silently streams in. The 100 ms debounce coalesces the burst.
-      this.scheduleAccumulationReset();
+        // Accumulate per-channel stats for range derivation
+        for (let ch = 0; ch < numChannels; ch++) {
+          const r = channelResults[ch];
+          if (!r) continue;
+          if (
+            needsFloatRange &&
+            r.rawMin !== undefined &&
+            r.rawMax !== undefined
+          ) {
+            if (r.rawMin < floatRangeMin) floatRangeMin = r.rawMin;
+            if (r.rawMax > floatRangeMax) floatRangeMax = r.rawMax;
+          }
+          if (needsChannelRanges) {
+            // For non-float: stats are in native [0, 255] or [0, 65535] space.
+            // For float: use raw min/max (stats are normalized to provisional range).
+            const chMin = isFloat ? (r.rawMin ?? r.min) : r.min;
+            const chMax = isFloat ? (r.rawMax ?? r.max) : r.max;
+            if (chMin < channelMins[ch]!) channelMins[ch] = chMin;
+            if (chMax > channelMaxs[ch]!) channelMaxs[ch] = chMax;
+          }
+        }
+
+        const result = this.resources.allocator.allocate(this.frameCount);
+        if (!result) {
+          console.warn("[Kiln] loadBaseLod: atlas allocation failed");
+          return;
+        }
+
+        const offset: [number, number, number] = [
+          result.slot.x * PHYSICAL_BRICK_SIZE,
+          result.slot.y * PHYSICAL_BRICK_SIZE,
+          result.slot.z * PHYSICAL_BRICK_SIZE,
+        ];
+        const tUpload = performance.now();
+        for (let ch = 0; ch < numChannels; ch++) {
+          if (!this.channelEnabled[ch]) continue;
+          // Zero-fill failed channels. The "fresh from free list" assumption is
+          // only true on cold load — after clear() the allocator recycles slots
+          // without re-zeroing texture memory, so skipping would show the
+          // previous dataset's data in that channel.
+          const data =
+            channelResults[ch]?.data ??
+            this.getZeroBrick(this.resources.canvases[ch]!.bitDepth);
+          writeToCanvas(
+            this.device,
+            this.resources.canvases[ch]!,
+            data,
+            [PHYSICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE],
+            offset,
+          );
+        }
+        const uploadMs = performance.now() - tUpload;
+        sumUploadMs += uploadMs;
+        this.uploadAvg.add(uploadMs);
+
+        this.resources.indirection.setBrick(
+          bx,
+          by,
+          bz,
+          result.slot.x,
+          result.slot.y,
+          result.slot.z,
+          maxLod,
+        );
+        this.resources.allocator.setMetadata(result.slotIndex, {
+          lod: maxLod,
+          bx,
+          by,
+          bz,
+          key,
+        });
+        this.resources.allocator.pin(result.slotIndex);
+
+        this.loadedBricks.set(key, {
+          slot: result.slot,
+          slotIndex: result.slotIndex,
+          lod: maxLod,
+          bx,
+          by,
+          bz,
+        });
+        this.pinnedBricks.add(key);
+        allBrickData.push(channelResults[0].data);
+        brickCount++;
+
+        if (firstBrickMs === null) {
+          firstBrickMs = performance.now() - this.loadStartTime;
+        }
+
+        // arriving base bricks must trigger a re-render — otherwise the
+        // viewer converges on a near-empty scene and freezes while the base LOD
+        // silently streams in. The 100 ms debounce coalesces the burst.
+        this.scheduleAccumulationReset();
       } finally {
         this.baseLodPending = Math.max(0, this.baseLodPending - 1);
       }
@@ -459,17 +662,22 @@ export class StreamingManager {
     // Spawn `concurrency` runners that drain the shared queue
     await Promise.all(
       Array.from({ length: concurrency }, async () => {
-        let brick;
-        while ((brick = queue.shift()) !== undefined) {
+        for (;;) {
+          const brick = queue.shift();
+          if (brick === undefined) break;
           await processBrick(brick);
         }
-      })
+      }),
     );
 
     // Retry any bricks that failed (ch0 network error)
-    const failed = bricks.filter(b => !this.loadedBricks.has(b.key) && !this.emptyBricks.has(b.key));
+    const failed = bricks.filter(
+      (b) => !this.loadedBricks.has(b.key) && !this.emptyBricks.has(b.key),
+    );
     if (failed.length > 0) {
-      console.warn(`[Kiln] loadBaseLod: ${failed.length} bricks failed, retrying sequentially`);
+      console.warn(
+        `[Kiln] loadBaseLod: ${failed.length} bricks failed, retrying sequentially`,
+      );
       for (const brick of failed) {
         await processBrick(brick);
       }
@@ -478,9 +686,13 @@ export class StreamingManager {
     // Any base bricks that still failed after retry must not leave cells at w=0
     // (unloaded → shader treats as invalid → permanent black hole). Mark them as
     // empty so the shader cleanly skips them instead of rendering a broken hole.
-    const stillFailed = bricks.filter(b => !this.loadedBricks.has(b.key) && !this.emptyBricks.has(b.key));
+    const stillFailed = bricks.filter(
+      (b) => !this.loadedBricks.has(b.key) && !this.emptyBricks.has(b.key),
+    );
     if (stillFailed.length > 0) {
-      console.error(`[Kiln] loadBaseLod: ${stillFailed.length} bricks permanently failed — marking empty to prevent holes`);
+      console.error(
+        `[Kiln] loadBaseLod: ${stillFailed.length} bricks permanently failed — marking empty to prevent holes`,
+      );
       for (const { bx, by, bz, key } of stillFailed) {
         this.emptyBricks.add(key);
         this.resources.indirection.setEmpty(bx, by, bz, maxLod);
@@ -489,7 +701,8 @@ export class StreamingManager {
 
     const totalMs = performance.now() - t0;
     const firstBrickMsValue = firstBrickMs as number | null;
-    const firstBrickStr = firstBrickMsValue !== null ? firstBrickMsValue.toFixed(0) : 'n/a';
+    const firstBrickStr =
+      firstBrickMsValue !== null ? firstBrickMsValue.toFixed(0) : "n/a";
     this.baseLodPending = 0;
     this.baseLodLoaded = true;
     this.timeToFirstRender = firstBrickMsValue ?? totalMs;
@@ -501,10 +714,10 @@ export class StreamingManager {
 
     console.log(
       `[Kiln] loadBaseLod done: ${brickCount}/${bricks.length} bricks loaded in ${totalMs.toFixed(0)}ms` +
-      ` | first brick: ${firstBrickStr}ms` +
-      ` | avg isEmpty: ${(sumIsEmptyMs / bricks.length).toFixed(1)}ms` +
-      ` | avg fetch: ${brickCount > 0 ? (sumFetchMs / brickCount).toFixed(1) : 'n/a'}ms` +
-      ` | avg upload: ${brickCount > 0 ? (sumUploadMs / brickCount).toFixed(1) : 'n/a'}ms`
+        ` | first brick: ${firstBrickStr}ms` +
+        ` | avg isEmpty: ${(sumIsEmptyMs / bricks.length).toFixed(1)}ms` +
+        ` | avg fetch: ${brickCount > 0 ? (sumFetchMs / brickCount).toFixed(1) : "n/a"}ms` +
+        ` | avg upload: ${brickCount > 0 ? (sumUploadMs / brickCount).toFixed(1) : "n/a"}ms`,
     );
 
     // Finalize derived ranges and push to renderer + workers
@@ -513,21 +726,33 @@ export class StreamingManager {
       channelRanges?: Array<{ min: number; max: number }>;
     } = {};
 
-    if (needsFloatRange && isFinite(floatRangeMin) && isFinite(floatRangeMax) && floatRangeMin < floatRangeMax) {
+    if (
+      needsFloatRange &&
+      isFinite(floatRangeMin) &&
+      isFinite(floatRangeMax) &&
+      floatRangeMin < floatRangeMax
+    ) {
       // Percentile-clip (p0.1 / p99.9) using the in-memory base bricks —
       // absolute per-brick extremes let one hot voxel compress the whole
       // contrast range. (Falls back to raw extremes if no brick data.)
-      const clipped = allBrickData.length > 0
-        ? this.computeFloatPercentileRange(allBrickData as Uint16Array[], floatRangeMin, floatRangeMax)
-        : ([floatRangeMin, floatRangeMax] as [number, number]);
+      const clipped =
+        allBrickData.length > 0
+          ? this.computeFloatPercentileRange(
+              allBrickData as Uint16Array[],
+              floatRangeMin,
+              floatRangeMax,
+            )
+          : ([floatRangeMin, floatRangeMax] as [number, number]);
       derivedRanges.dataRange = clipped;
       this.metadata.dataRange = clipped;
       // Update workers so future brick stats use the real range
       this.dataProvider.setFloatRange?.(clipped[0], clipped[1]);
-      console.log(`[Kiln] derived float range: [${clipped[0]}, ${clipped[1]}] (raw extremes: [${floatRangeMin}, ${floatRangeMax}])`);
+      console.log(
+        `[Kiln] derived float range: [${clipped[0]}, ${clipped[1]}] (raw extremes: [${floatRangeMin}, ${floatRangeMax}])`,
+      );
     }
 
-    if (needsChannelRanges && channelMins.some(v => isFinite(v))) {
+    if (needsChannelRanges && channelMins.some((v) => isFinite(v))) {
       // Window space must match shader expectations: float windows use
       // raw-space dataRange, integer windows use effective atlas bit depth.
       const effectiveBitDepth = this.resources.canvases[0]!.bitDepth;
@@ -537,15 +762,30 @@ export class StreamingManager {
       const ranges: Array<{ min: number; max: number }> = [];
       for (let ch = 0; ch < numChannels; ch++) {
         const cMin = isFinite(channelMins[ch]!) ? channelMins[ch]! : 0;
-        const cMax = isFinite(channelMaxs[ch]!) ? channelMaxs[ch]! : (isFinite(channelMins[ch]!) ? channelMins[ch]! + 1 : 1);
+        const cMax = isFinite(channelMaxs[ch]!)
+          ? channelMaxs[ch]!
+          : isFinite(channelMins[ch]!)
+            ? channelMins[ch]! + 1
+            : 1;
         ranges.push({ min: cMin, max: cMax });
       }
       derivedRanges.channelRanges = ranges;
-      this.metadata.channelWindows = ranges.map(r => ({ start: r.min, end: r.max, min: winMin, max: winMax }));
-      console.log('[Kiln] derived per-channel ranges:', ranges.map((r, i) => `ch${i}: [${r.min}, ${r.max}]`).join(', '));
+      this.metadata.channelWindows = ranges.map((r) => ({
+        start: r.min,
+        end: r.max,
+        min: winMin,
+        max: winMax,
+      }));
+      console.log(
+        "[Kiln] derived per-channel ranges:",
+        ranges.map((r, i) => `ch${i}: [${r.min}, ${r.max}]`).join(", "),
+      );
     }
 
-    if ((derivedRanges.dataRange || derivedRanges.channelRanges) && this.onRangesDerived) {
+    if (
+      (derivedRanges.dataRange || derivedRanges.channelRanges) &&
+      this.onRangesDerived
+    ) {
       this.onRangesDerived(derivedRanges);
     }
 
@@ -582,8 +822,10 @@ export class StreamingManager {
     // cancellation has its own grace period, so per-frame recompute during
     // movement bought nothing but full octree traversals at the tightest
     // frame budget. Recompute immediately the instant the camera stops.
-    const regularUpdate = (this.frameCount - this.lastUpdateFrame) >= this.updateInterval;
-    const cameraJustStopped = this.cameraStillFrames === this.cameraStillThreshold;
+    const regularUpdate =
+      this.frameCount - this.lastUpdateFrame >= this.updateInterval;
+    const cameraJustStopped =
+      this.cameraStillFrames === this.cameraStillThreshold;
 
     // Don't start streaming finer LODs until base LOD is fully loaded.
     // loadBaseLod runs independently; fine bricks requested before it finishes
@@ -651,6 +893,11 @@ export class StreamingManager {
     this.allocationStalled = false;
     this.baseLodPending = 0;
     this.baseLodLoaded = false;
+    for (const w of this.channelJobWaiters) {
+      w.reject(new DOMException("Cleared", "AbortError"));
+    }
+    this.channelJobWaiters = [];
+    this.activeChannelJobs = 0;
     this.resources.indirection.clearAll();
 
     // Reload base LOD
@@ -686,7 +933,11 @@ export class StreamingManager {
   getStats(): StreamingStats {
     const networkStats = this.dataProvider.getNetworkStats();
     const providerTimings = this.dataProvider.getPipelineTimings?.() ?? {
-      avgQueueMs: 0, avgFetchMs: 0, avgAssemblyMs: 0, avgUploadMs: 0, sampleCount: 0,
+      avgQueueMs: 0,
+      avgFetchMs: 0,
+      avgAssemblyMs: 0,
+      avgUploadMs: 0,
+      sampleCount: 0,
     };
     return {
       ...this.lastStats,
@@ -700,7 +951,10 @@ export class StreamingManager {
         avgFetchMs: providerTimings.avgFetchMs,
         avgAssemblyMs: providerTimings.avgAssemblyMs,
         avgUploadMs: this.uploadAvg.value,
-        sampleCount: Math.max(providerTimings.sampleCount, this.uploadAvg.count),
+        sampleCount: Math.max(
+          providerTimings.sampleCount,
+          this.uploadAvg.count,
+        ),
         chunkCacheHitRatio: providerTimings.chunkCacheHitRatio,
       },
       bricksDispatched: this.bricksDispatched,
@@ -734,7 +988,8 @@ export class StreamingManager {
 
     // projectionFactor targets full canvas resolution — LOD selection pre-loads
     // fine bricks during interaction; dispatch gating prevents wasted loads.
-    this.projectionFactor = canvas.height / (2 * Math.tan(this.cameraFovRad / 2));
+    this.projectionFactor =
+      canvas.height / (2 * Math.tan(this.cameraFovRad / 2));
 
     // Get LOD range from metadata
     const maxLod = this.maxLod;
@@ -743,14 +998,27 @@ export class StreamingManager {
     const desiredBricks: BrickRequest[] = [];
 
     // Recursive traversal function
-    const traverse = (bx: number, by: number, bz: number, lod: number): void => {
+    const traverse = (
+      bx: number,
+      by: number,
+      bz: number,
+      lod: number,
+    ): void => {
       const level = this.levelsByLod[lod];
       if (!level) return;
 
       const [gridX, gridY, gridZ] = level.brickGrid;
 
       // Bounds check - handles non-power-of-two grids
-      if (bx < 0 || bx >= gridX || by < 0 || by >= gridY || bz < 0 || bz >= gridZ) return;
+      if (
+        bx < 0 ||
+        bx >= gridX ||
+        by < 0 ||
+        by >= gridY ||
+        bz < 0 ||
+        bz >= gridZ
+      )
+        return;
 
       // Get brick AABB
       const aabb = this.getBrickAABB(bx, by, bz, lod);
@@ -768,7 +1036,8 @@ export class StreamingManager {
       // At this LOD, each voxel represents 2^lod original voxels
       // The error is the projected size of one voxel at this LOD
       const voxelWorldSize = this.getVoxelWorldSize(lod);
-      const projectedError = (voxelWorldSize / Math.max(dist, 0.001)) * this.projectionFactor;
+      const projectedError =
+        (voxelWorldSize / Math.max(dist, 0.001)) * this.projectionFactor;
 
       // Manual override: always split while coarser than forcedLod; never
       // split at or finer than it. Otherwise use SSE + hysteresis.
@@ -819,7 +1088,14 @@ export class StreamingManager {
     };
 
     // Helper to add a brick to desired set
-    this.addDesiredBrick = (bricks: BrickRequest[], bx: number, by: number, bz: number, lod: number, dist: number) => {
+    this.addDesiredBrick = (
+      bricks: BrickRequest[],
+      bx: number,
+      by: number,
+      bz: number,
+      lod: number,
+      dist: number,
+    ) => {
       const key = `lod${lod}:${bz}/${by}/${bx}`;
 
       // Check if known empty
@@ -893,7 +1169,7 @@ export class StreamingManager {
 
     // Find missing bricks and add to load queue
     const missingBricks = desiredBricks.filter(
-      b => !this.loadedBricks.has(b.key) && !this.inFlightRequests.has(b.key)
+      (b) => !this.loadedBricks.has(b.key) && !this.inFlightRequests.has(b.key),
     );
 
     // Sort by distance (closest first)
@@ -918,7 +1194,13 @@ export class StreamingManager {
       timeToFirstRender: null, // Actual value comes from getStats()
       evictedCount: this.lastStats.evictedCount,
       allocationsRefused: this.lastStats.allocationsRefused,
-      pipelineTimings: { avgQueueMs: 0, avgFetchMs: 0, avgAssemblyMs: 0, avgUploadMs: 0, sampleCount: 0 },
+      pipelineTimings: {
+        avgQueueMs: 0,
+        avgFetchMs: 0,
+        avgAssemblyMs: 0,
+        avgUploadMs: 0,
+        sampleCount: 0,
+      },
       bricksDispatched: 0, // live values from getStats()
       bricksCommitted: 0,
       bricksCancelled: 0,
@@ -928,7 +1210,14 @@ export class StreamingManager {
   }
 
   // Helper method reference (assigned in computeDesiredSet)
-  private addDesiredBrick: (bricks: BrickRequest[], bx: number, by: number, bz: number, lod: number, dist: number) => void = () => {};
+  private addDesiredBrick: (
+    bricks: BrickRequest[],
+    bx: number,
+    by: number,
+    bz: number,
+    lod: number,
+    dist: number,
+  ) => void = () => {};
 
   /**
    * Process pending load requests (non-blocking)
@@ -982,14 +1271,23 @@ export class StreamingManager {
   /**
    * Load a single brick with abort support
    */
-  private async loadBrick(request: BrickRequest, signal: AbortSignal): Promise<void> {
+  private async loadBrick(
+    request: BrickRequest,
+    signal: AbortSignal,
+  ): Promise<void> {
     const { lod, bx, by, bz, key } = request;
 
     // Check if aborted before starting
     if (signal.aborted) return;
 
     // Check if empty
-    const isEmpty = await this.dataProvider.isBrickEmpty(lod, bx, by, bz, this.config.emptyBrickThreshold);
+    const isEmpty = await this.dataProvider.isBrickEmpty(
+      lod,
+      bx,
+      by,
+      bz,
+      this.config.emptyBrickThreshold,
+    );
     if (signal.aborted) return;
 
     if (isEmpty) {
@@ -1008,6 +1306,7 @@ export class StreamingManager {
     const fromCache: boolean[] = new Array(numChannels).fill(false);
     const channelResults: (BrickLoadResult | null)[] = await Promise.all(
       Array.from({ length: numChannels }, async (_, ch) => {
+        if (!this.channelEnabled[ch]) return null;
         const cacheKey = `ch${ch}:${key}`;
         const cached = this.brickCache.get(cacheKey);
         if (cached) {
@@ -1015,19 +1314,44 @@ export class StreamingManager {
           // Cached data has no stats — use 1 for max so it's never treated as empty
           return { data: cached, min: 0, max: 1, avg: 0 } as BrickLoadResult;
         }
-        return this.dataProvider.loadBrick(lod, bx, by, bz, ch, signal);
-      })
+        try {
+          return await this.withChannelJob(
+            () => this.dataProvider.loadBrick(lod, bx, by, bz, ch, signal),
+            signal,
+          );
+        } catch (err) {
+          if (
+            signal.aborted ||
+            (err instanceof DOMException && err.name === "AbortError")
+          ) {
+            return null;
+          }
+          throw err;
+        }
+      }),
     );
     if (signal.aborted) return;
 
-    // ch0 mandatory; other channels degrade gracefully (retry re-fetches missing ones).
-    if (!channelResults[0]) return;
+    // At least one enabled channel must succeed; hidden channels are skipped.
+    let haveVisibleData = false;
+    for (let ch = 0; ch < numChannels; ch++) {
+      if (this.channelEnabled[ch] && channelResults[ch]) {
+        haveVisibleData = true;
+        break;
+      }
+    }
+    if (!haveVisibleData) return;
 
     // Emptiness check via inline stats. Skipped for cache-served bricks
     // (sentinel stats would false-positive; cached bricks are already proven non-empty).
-    if (!fromCache.some(v => v)) {
+    if (!fromCache.some((v) => v)) {
       const threshold = this.config.emptyBrickThreshold ?? 1;
-      const maxAcrossChannels = Math.max(...channelResults.map(r => r?.max ?? 0));
+      let maxAcrossChannels = 0;
+      for (let ch = 0; ch < numChannels; ch++) {
+        if (!this.channelEnabled[ch]) continue;
+        const m = channelResults[ch]?.max ?? 0;
+        if (m > maxAcrossChannels) maxAcrossChannels = m;
+      }
       if (maxAcrossChannels < threshold) {
         this.emptyBricks.add(key);
         this.resources.indirection.setEmpty(bx, by, bz, lod);
@@ -1071,7 +1395,12 @@ export class StreamingManager {
       const evictedEntry = this.loadedBricks.get(evictedKey);
 
       if (!evictedEntry || evictedEntry.slotIndex === result.slotIndex) {
-        const fallback = this.findParentBrick(result.evicted.bx, result.evicted.by, result.evicted.bz, result.evicted.lod);
+        const fallback = this.findParentBrick(
+          result.evicted.bx,
+          result.evicted.by,
+          result.evicted.bz,
+          result.evicted.lod,
+        );
 
         if (fallback) {
           this.resources.indirection.clearBrick(
@@ -1080,16 +1409,23 @@ export class StreamingManager {
             result.evicted.bz,
             result.evicted.lod,
             [fallback.slot.x, fallback.slot.y, fallback.slot.z],
-            fallback.lod
+            fallback.lod,
           );
-        } else if (this.hasEmptyAncestor(result.evicted.bx, result.evicted.by, result.evicted.bz, result.evicted.lod)) {
+        } else if (
+          this.hasEmptyAncestor(
+            result.evicted.bx,
+            result.evicted.by,
+            result.evicted.bz,
+            result.evicted.lod,
+          )
+        ) {
           // Ancestor is known-empty — restore empty marker (w=255) so the
           // shader skips this region instead of treating w=0 as unloaded.
           this.resources.indirection.setEmpty(
             result.evicted.bx,
             result.evicted.by,
             result.evicted.bz,
-            result.evicted.lod
+            result.evicted.lod,
           );
         } else {
           // No parent found - clear completely (shouldn't happen if base LOD is loaded)
@@ -1097,17 +1433,16 @@ export class StreamingManager {
             result.evicted.bx,
             result.evicted.by,
             result.evicted.bz,
-            result.evicted.lod
+            result.evicted.lod,
           );
         }
         this.loadedBricks.delete(evictedKey);
       }
-
     }
 
-    // Upload each channel to its atlas at the same slot coordinates (timed for pipeline telemetry).
-    // failed channels are zero-filled — the slot may be a reused
-    // (evicted) slot still holding a previous brick's data for that channel.
+    // Upload enabled channels (and zero-fill failed enabled ones — recycled
+    // atlas slots may still hold a previous brick). Hidden channels are skipped;
+    // backfillChannel writes them if re-enabled.
     const offset: [number, number, number] = [
       result.slot.x * PHYSICAL_BRICK_SIZE,
       result.slot.y * PHYSICAL_BRICK_SIZE,
@@ -1115,25 +1450,49 @@ export class StreamingManager {
     ];
     const tUpload = performance.now();
     for (let ch = 0; ch < numChannels; ch++) {
-      const data = channelResults[ch]?.data ?? this.getZeroBrick(this.resources.canvases[ch]!.bitDepth);
+      if (!this.channelEnabled[ch]) continue;
+      const data =
+        channelResults[ch]?.data ??
+        this.getZeroBrick(this.resources.canvases[ch]!.bitDepth);
       writeToCanvas(
         this.device,
         this.resources.canvases[ch]!,
         data,
         [PHYSICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE],
-        offset
+        offset,
       );
     }
     this.uploadAvg.add(performance.now() - tUpload);
 
     // Update indirection
-    this.resources.indirection.setBrick(bx, by, bz, result.slot.x, result.slot.y, result.slot.z, lod);
+    this.resources.indirection.setBrick(
+      bx,
+      by,
+      bz,
+      result.slot.x,
+      result.slot.y,
+      result.slot.z,
+      lod,
+    );
 
     // Set metadata for future eviction
-    this.resources.allocator.setMetadata(result.slotIndex, { lod, bx, by, bz, key });
+    this.resources.allocator.setMetadata(result.slotIndex, {
+      lod,
+      bx,
+      by,
+      bz,
+      key,
+    });
 
     // Track
-    this.loadedBricks.set(key, { slot: result.slot, slotIndex: result.slotIndex });
+    this.loadedBricks.set(key, {
+      slot: result.slot,
+      slotIndex: result.slotIndex,
+      lod,
+      bx,
+      by,
+      bz,
+    });
     this.bricksCommitted++;
 
     // Record end-to-end latency (dispatch → committed)
@@ -1162,7 +1521,7 @@ export class StreamingManager {
     bx: number,
     by: number,
     bz: number,
-    lod: number
+    lod: number,
   ): { min: [number, number, number]; max: [number, number, number] } {
     const level = this.levelsByLod[lod];
     if (!level) return { min: [0, 0, 0], max: [0, 0, 0] };
@@ -1200,7 +1559,10 @@ export class StreamingManager {
     ];
   }
 
-  private distance(a: [number, number, number], b: [number, number, number]): number {
+  private distance(
+    a: [number, number, number],
+    b: [number, number, number],
+  ): number {
     const dx = a[0] - b[0];
     const dy = a[1] - b[1];
     const dz = a[2] - b[2];
@@ -1218,7 +1580,9 @@ export class StreamingManager {
     // Base voxel size in normalized space (LOD 0)
     // Use the largest dimension for consistent error metric
     const maxDim = Math.max(dims[0], dims[1], dims[2]);
-    const baseVoxelSize = Math.max(normalizedSize[0], normalizedSize[1], normalizedSize[2]) / maxDim;
+    const baseVoxelSize =
+      Math.max(normalizedSize[0], normalizedSize[1], normalizedSize[2]) /
+      maxDim;
 
     // At LOD N, each voxel represents 2^N original voxels
     return baseVoxelSize * (1 << lod);
@@ -1232,7 +1596,7 @@ export class StreamingManager {
     bx: number,
     by: number,
     bz: number,
-    lod: number
+    lod: number,
   ): { slot: AtlasSlot; lod: number } | null {
     const maxLod = this.maxLod;
 
@@ -1256,14 +1620,22 @@ export class StreamingManager {
   }
 
   /** Check if any child brick (one LOD finer) is loaded or in-flight (SSE hysteresis). */
-  private hasResidentChildren(bx: number, by: number, bz: number, lod: number): boolean {
+  private hasResidentChildren(
+    bx: number,
+    by: number,
+    bz: number,
+    lod: number,
+  ): boolean {
     const finerLod = lod - 1;
     if (finerLod < 0) return false;
     for (let dz = 0; dz < 2; dz++) {
       for (let dy = 0; dy < 2; dy++) {
         for (let dx = 0; dx < 2; dx++) {
           const childKey = `lod${finerLod}:${bz * 2 + dz}/${by * 2 + dy}/${bx * 2 + dx}`;
-          if (this.loadedBricks.has(childKey) || this.inFlightRequests.has(childKey)) {
+          if (
+            this.loadedBricks.has(childKey) ||
+            this.inFlightRequests.has(childKey)
+          ) {
             return true;
           }
         }
@@ -1273,7 +1645,12 @@ export class StreamingManager {
   }
 
   /** Check if any ancestor brick is known-empty (for eviction fallback). */
-  private hasEmptyAncestor(bx: number, by: number, bz: number, lod: number): boolean {
+  private hasEmptyAncestor(
+    bx: number,
+    by: number,
+    bz: number,
+    lod: number,
+  ): boolean {
     const maxLod = this.maxLod;
     for (let parentLod = lod + 1; parentLod <= maxLod; parentLod++) {
       const scale = 1 << (parentLod - lod);

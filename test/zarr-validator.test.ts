@@ -1,106 +1,121 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
-import { normalizeAxes, extractMultiscales, validateZarrSupport, isRemoteZarr } from '../src/data/zarr-validator.js';
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  extractMultiscales,
+  isRemoteZarr,
+  normalizeAxes,
+  validateZarrSupport,
+} from "../src/data/zarr-validator.js";
 
 // ---------------------------------------------------------------------------
 // normalizeAxes
 // ---------------------------------------------------------------------------
 
-describe('normalizeAxes', () => {
-  it('returns zyx spatial defaults when axes is absent', () => {
+describe("normalizeAxes", () => {
+  it("returns zyx spatial defaults when axes is absent", () => {
     const axes = normalizeAxes(undefined);
     expect(axes).toEqual([
-      { name: 'z', type: 'space' },
-      { name: 'y', type: 'space' },
-      { name: 'x', type: 'space' },
+      { name: "z", type: "space" },
+      { name: "y", type: "space" },
+      { name: "x", type: "space" },
     ]);
   });
 
-  it('returns zyx spatial defaults when axes is null', () => {
+  it("returns zyx spatial defaults when axes is null", () => {
     const axes = normalizeAxes(null);
     expect(axes).toEqual([
-      { name: 'z', type: 'space' },
-      { name: 'y', type: 'space' },
-      { name: 'x', type: 'space' },
+      { name: "z", type: "space" },
+      { name: "y", type: "space" },
+      { name: "x", type: "space" },
     ]);
   });
 
-  it('returns zyx spatial defaults when axes is an empty array', () => {
+  it("returns zyx spatial defaults when axes is an empty array", () => {
     expect(normalizeAxes([])).toEqual([
-      { name: 'z', type: 'space' },
-      { name: 'y', type: 'space' },
-      { name: 'x', type: 'space' },
+      { name: "z", type: "space" },
+      { name: "y", type: "space" },
+      { name: "x", type: "space" },
     ]);
   });
 
   it('normalises v0.4 string array ["z","y","x"] to spatial type', () => {
-    const axes = normalizeAxes(['z', 'y', 'x']);
+    const axes = normalizeAxes(["z", "y", "x"]);
     expect(axes).toEqual([
-      { name: 'z', type: 'space' },
-      { name: 'y', type: 'space' },
-      { name: 'x', type: 'space' },
+      { name: "z", type: "space" },
+      { name: "y", type: "space" },
+      { name: "x", type: "space" },
     ]);
   });
 
   it('infers channel type for "c" axis in v0.4 string form', () => {
-    const axes = normalizeAxes(['c', 'z', 'y', 'x']);
-    expect(axes[0]).toEqual({ name: 'c', type: 'channel' });
-    expect(axes[1]).toEqual({ name: 'z', type: 'space' });
+    const axes = normalizeAxes(["c", "z", "y", "x"]);
+    expect(axes[0]).toEqual({ name: "c", type: "channel" });
+    expect(axes[1]).toEqual({ name: "z", type: "space" });
   });
 
   it('infers time type for "t" axis in v0.4 string form', () => {
-    const axes = normalizeAxes(['t', 'z', 'y', 'x']);
-    expect(axes[0]).toEqual({ name: 't', type: 'time' });
+    const axes = normalizeAxes(["t", "z", "y", "x"]);
+    expect(axes[0]).toEqual({ name: "t", type: "time" });
   });
 
-  it('normalises v0.5 typed object array', () => {
+  it("normalises v0.5 typed object array", () => {
     const raw = [
-      { name: 'z', type: 'space', unit: 'micrometer' },
-      { name: 'y', type: 'space', unit: 'micrometer' },
-      { name: 'x', type: 'space', unit: 'micrometer' },
+      { name: "z", type: "space", unit: "micrometer" },
+      { name: "y", type: "space", unit: "micrometer" },
+      { name: "x", type: "space", unit: "micrometer" },
     ];
     const axes = normalizeAxes(raw);
     expect(axes).toEqual([
-      { name: 'z', type: 'space' },
-      { name: 'y', type: 'space' },
-      { name: 'x', type: 'space' },
+      { name: "z", type: "space" },
+      { name: "y", type: "space" },
+      { name: "x", type: "space" },
     ]);
   });
 
-  it('normalises v0.5 typed objects with channel and time', () => {
+  it("normalises v0.5 typed objects with channel and time", () => {
     const raw = [
-      { name: 't', type: 'time' },
-      { name: 'c', type: 'channel' },
-      { name: 'z', type: 'space' },
-      { name: 'y', type: 'space' },
-      { name: 'x', type: 'space' },
+      { name: "t", type: "time" },
+      { name: "c", type: "channel" },
+      { name: "z", type: "space" },
+      { name: "y", type: "space" },
+      { name: "x", type: "space" },
     ];
     const axes = normalizeAxes(raw);
-    expect(axes[0]).toEqual({ name: 't', type: 'time' });
-    expect(axes[1]).toEqual({ name: 'c', type: 'channel' });
+    expect(axes[0]).toEqual({ name: "t", type: "time" });
+    expect(axes[1]).toEqual({ name: "c", type: "channel" });
   });
 
-  it('falls back gracefully when name or type fields are missing', () => {
-    const axes = normalizeAxes([{ name: 'z' }, { type: 'space' }, {}]);
-    expect(axes[0]).toEqual({ name: 'z', type: 'space' });
-    expect(axes[1]).toEqual({ name: '', type: 'space' });
-    expect(axes[2]).toEqual({ name: '', type: 'space' });
+  it("falls back gracefully when name or type fields are missing", () => {
+    const axes = normalizeAxes([{ name: "z" }, { type: "space" }, {}]);
+    expect(axes[0]).toEqual({ name: "z", type: "space" });
+    expect(axes[1]).toEqual({ name: "", type: "space" });
+    expect(axes[2]).toEqual({ name: "", type: "space" });
   });
 
-  it('infers channel type from name when type field is absent in v0.5 object form', () => {
-    const axes = normalizeAxes([{ name: 'c' }, { name: 'z' }, { name: 'y' }, { name: 'x' }]);
-    expect(axes[0]).toEqual({ name: 'c', type: 'channel' });
-    expect(axes[1]).toEqual({ name: 'z', type: 'space' });
+  it("infers channel type from name when type field is absent in v0.5 object form", () => {
+    const axes = normalizeAxes([
+      { name: "c" },
+      { name: "z" },
+      { name: "y" },
+      { name: "x" },
+    ]);
+    expect(axes[0]).toEqual({ name: "c", type: "channel" });
+    expect(axes[1]).toEqual({ name: "z", type: "space" });
   });
 
-  it('infers time type from name when type field is absent in v0.5 object form', () => {
-    const axes = normalizeAxes([{ name: 't' }, { name: 'z' }, { name: 'y' }, { name: 'x' }]);
-    expect(axes[0]).toEqual({ name: 't', type: 'time' });
+  it("infers time type from name when type field is absent in v0.5 object form", () => {
+    const axes = normalizeAxes([
+      { name: "t" },
+      { name: "z" },
+      { name: "y" },
+      { name: "x" },
+    ]);
+    expect(axes[0]).toEqual({ name: "t", type: "time" });
   });
 
-  it('explicit type field takes precedence over name-based inference', () => {
+  it("explicit type field takes precedence over name-based inference", () => {
     // Unusual but valid — trust the explicit type over the name
-    const axes = normalizeAxes([{ name: 'c', type: 'space' }]);
-    expect(axes[0]).toEqual({ name: 'c', type: 'space' });
+    const axes = normalizeAxes([{ name: "c", type: "space" }]);
+    expect(axes[0]).toEqual({ name: "c", type: "space" });
   });
 });
 
@@ -108,54 +123,54 @@ describe('normalizeAxes', () => {
 // extractMultiscales
 // ---------------------------------------------------------------------------
 
-describe('extractMultiscales', () => {
-  const ds = [{ path: '0' }, { path: '1' }];
+describe("extractMultiscales", () => {
+  const ds = [{ path: "0" }, { path: "1" }];
 
-  it('returns null when attrs has no multiscales', () => {
+  it("returns null when attrs has no multiscales", () => {
     expect(extractMultiscales({})).toBeNull();
-    expect(extractMultiscales({ foo: 'bar' })).toBeNull();
+    expect(extractMultiscales({ foo: "bar" })).toBeNull();
   });
 
-  it('reads v0.4 root-level multiscales', () => {
-    const attrs = { multiscales: [{ datasets: ds, version: '0.4' }] };
+  it("reads v0.4 root-level multiscales", () => {
+    const attrs = { multiscales: [{ datasets: ds, version: "0.4" }] };
     const ms = extractMultiscales(attrs);
     expect(ms).not.toBeNull();
     expect(ms!.datasets).toEqual(ds);
-    expect(ms!.version).toBe('0.4');
+    expect(ms!.version).toBe("0.4");
   });
 
-  it('reads v0.5 ome.multiscales', () => {
-    const attrs = { ome: { multiscales: [{ datasets: ds, version: '0.5' }] } };
+  it("reads v0.5 ome.multiscales", () => {
+    const attrs = { ome: { multiscales: [{ datasets: ds, version: "0.5" }] } };
     const ms = extractMultiscales(attrs);
     expect(ms).not.toBeNull();
     expect(ms!.datasets).toEqual(ds);
   });
 
-  it('prefers ome.multiscales over root-level multiscales', () => {
+  it("prefers ome.multiscales over root-level multiscales", () => {
     const attrs = {
-      ome: { multiscales: [{ datasets: [{ path: 'ome' }] }] },
-      multiscales: [{ datasets: [{ path: 'root' }] }],
+      ome: { multiscales: [{ datasets: [{ path: "ome" }] }] },
+      multiscales: [{ datasets: [{ path: "root" }] }],
     };
     const ms = extractMultiscales(attrs);
-    expect(ms!.datasets[0]!.path).toBe('ome');
+    expect(ms!.datasets[0]!.path).toBe("ome");
   });
 
-  it('returns null when ome object has no multiscales', () => {
+  it("returns null when ome object has no multiscales", () => {
     expect(extractMultiscales({ ome: {} })).toBeNull();
   });
 
-  it('returns null when multiscales array is empty', () => {
+  it("returns null when multiscales array is empty", () => {
     expect(extractMultiscales({ multiscales: [] })).toBeNull();
   });
 
-  it('always returns the first entry', () => {
+  it("always returns the first entry", () => {
     const attrs = {
       multiscales: [
-        { datasets: [{ path: 'first' }] },
-        { datasets: [{ path: 'second' }] },
+        { datasets: [{ path: "first" }] },
+        { datasets: [{ path: "second" }] },
       ],
     };
-    expect(extractMultiscales(attrs)!.datasets[0]!.path).toBe('first');
+    expect(extractMultiscales(attrs)!.datasets[0]!.path).toBe("first");
   });
 });
 
@@ -163,79 +178,79 @@ describe('extractMultiscales', () => {
 // validateZarrSupport
 // ---------------------------------------------------------------------------
 
-describe('validateZarrSupport', () => {
-  const spatialAxes = ['z', 'y', 'x'];
+describe("validateZarrSupport", () => {
+  const spatialAxes = ["z", "y", "x"];
   const shape3d = [512, 512, 512];
 
-  it('accepts uint8 with 3-d spatial axes', () => {
-    const ms = { datasets: [{ path: '0' }], axes: spatialAxes };
-    expect(validateZarrSupport(ms, shape3d, 'uint8')).toEqual([]);
+  it("accepts uint8 with 3-d spatial axes", () => {
+    const ms = { datasets: [{ path: "0" }], axes: spatialAxes };
+    expect(validateZarrSupport(ms, shape3d, "uint8")).toEqual([]);
   });
 
-  it('accepts uint16 with 3-d spatial axes', () => {
-    const ms = { datasets: [{ path: '0' }], axes: spatialAxes };
-    expect(validateZarrSupport(ms, shape3d, 'uint16')).toEqual([]);
+  it("accepts uint16 with 3-d spatial axes", () => {
+    const ms = { datasets: [{ path: "0" }], axes: spatialAxes };
+    expect(validateZarrSupport(ms, shape3d, "uint16")).toEqual([]);
   });
 
-  it('accepts float32', () => {
-    const ms = { datasets: [{ path: '0' }], axes: spatialAxes };
-    expect(validateZarrSupport(ms, shape3d, 'float32')).toEqual([]);
+  it("accepts float32", () => {
+    const ms = { datasets: [{ path: "0" }], axes: spatialAxes };
+    expect(validateZarrSupport(ms, shape3d, "float32")).toEqual([]);
   });
 
-  it('accepts float64 (read as float32)', () => {
-    const ms = { datasets: [{ path: '0' }], axes: spatialAxes };
-    expect(validateZarrSupport(ms, shape3d, 'float64')).toEqual([]);
+  it("accepts float64 (read as float32)", () => {
+    const ms = { datasets: [{ path: "0" }], axes: spatialAxes };
+    expect(validateZarrSupport(ms, shape3d, "float64")).toEqual([]);
   });
 
-  it('rejects int32', () => {
-    const ms = { datasets: [{ path: '0' }], axes: spatialAxes };
-    expect(validateZarrSupport(ms, shape3d, 'int32').length).toBeGreaterThan(0);
+  it("rejects int32", () => {
+    const ms = { datasets: [{ path: "0" }], axes: spatialAxes };
+    expect(validateZarrSupport(ms, shape3d, "int32").length).toBeGreaterThan(0);
   });
 
-  it('does not reject time-series datasets (warns, loads t=0)', () => {
-    const ms = { datasets: [{ path: '0' }], axes: ['t', 'z', 'y', 'x'] };
-    const reasons = validateZarrSupport(ms, [1, 512, 512, 512], 'uint16');
+  it("does not reject time-series datasets (warns, loads t=0)", () => {
+    const ms = { datasets: [{ path: "0" }], axes: ["t", "z", "y", "x"] };
+    const reasons = validateZarrSupport(ms, [1, 512, 512, 512], "uint16");
     expect(reasons).toEqual([]);
   });
 
-  it('does not reject multi-channel datasets (warns, loads ch=0)', () => {
-    const ms = { datasets: [{ path: '0' }], axes: ['c', 'z', 'y', 'x'] };
-    const reasons = validateZarrSupport(ms, [2, 512, 512, 512], 'uint16');
+  it("does not reject multi-channel datasets (warns, loads ch=0)", () => {
+    const ms = { datasets: [{ path: "0" }], axes: ["c", "z", "y", "x"] };
+    const reasons = validateZarrSupport(ms, [2, 512, 512, 512], "uint16");
     expect(reasons).toEqual([]);
   });
 
-  it('accepts absent axes (defaults to zyx)', () => {
-    const ms = { datasets: [{ path: '0' }] };
-    expect(validateZarrSupport(ms, shape3d, 'uint8')).toEqual([]);
+  it("accepts absent axes (defaults to zyx)", () => {
+    const ms = { datasets: [{ path: "0" }] };
+    expect(validateZarrSupport(ms, shape3d, "uint8")).toEqual([]);
   });
 
-  it('returns an empty array (no rejection) for v0.4 version string', () => {
-    const ms = { datasets: [{ path: '0' }], axes: spatialAxes, version: '0.4' };
-    expect(validateZarrSupport(ms, shape3d, 'uint16')).toEqual([]);
+  it("returns an empty array (no rejection) for v0.4 version string", () => {
+    const ms = { datasets: [{ path: "0" }], axes: spatialAxes, version: "0.4" };
+    expect(validateZarrSupport(ms, shape3d, "uint16")).toEqual([]);
   });
 
-  it('does not reject a 4-channel dataset and emits no warning', () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const ms = { datasets: [{ path: '0' }], axes: ['c', 'z', 'y', 'x'] };
-    const reasons = validateZarrSupport(ms, [4, 512, 512, 512], 'uint16');
-    expect(reasons).toEqual([]);
-    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringMatching(/channels/));
-    warnSpy.mockRestore();
-  });
-
-  it('does not warn for a 6-channel dataset (at the render cap)', () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const ms = { datasets: [{ path: '0' }], axes: ['c', 'z', 'y', 'x'] };
-    const reasons = validateZarrSupport(ms, [6, 512, 512, 512], 'uint16');
+  it("does not reject a 4-channel dataset and emits no warning", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const ms = { datasets: [{ path: "0" }], axes: ["c", "z", "y", "x"] };
+    const reasons = validateZarrSupport(ms, [4, 512, 512, 512], "uint16");
     expect(reasons).toEqual([]);
     expect(warnSpy).not.toHaveBeenCalledWith(expect.stringMatching(/channels/));
     warnSpy.mockRestore();
   });
 
-  it('does not reject a 7-channel dataset but warns that only 6 channels will be rendered', () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const ms = { datasets: [{ path: '0' }], axes: ['c', 'z', 'y', 'x'] };
-    const reasons = validateZarrSupport(ms, [7, 512, 512, 512], 'uint16');
+  it("does not warn for a 6-channel dataset (at the render cap)", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const ms = { datasets: [{ path: "0" }], axes: ["c", "z", "y", "x"] };
+    const reasons = validateZarrSupport(ms, [6, 512, 512, 512], "uint16");
+    expect(reasons).toEqual([]);
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringMatching(/channels/));
+    warnSpy.mockRestore();
+  });
+
+  it("does not reject a 7-channel dataset but warns that only 6 channels will be rendered", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const ms = { datasets: [{ path: "0" }], axes: ["c", "z", "y", "x"] };
+    const reasons = validateZarrSupport(ms, [7, 512, 512, 512], "uint16");
     // Should still be loadable — no rejection reasons
     expect(reasons).toEqual([]);
     // But it must have warned the user
@@ -243,10 +258,10 @@ describe('validateZarrSupport', () => {
     warnSpy.mockRestore();
   });
 
-  it('does not reject a 2-channel dataset (no warning needed)', () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const ms = { datasets: [{ path: '0' }], axes: ['c', 'z', 'y', 'x'] };
-    const reasons = validateZarrSupport(ms, [2, 512, 512, 512], 'uint16');
+  it("does not reject a 2-channel dataset (no warning needed)", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const ms = { datasets: [{ path: "0" }], axes: ["c", "z", "y", "x"] };
+    const reasons = validateZarrSupport(ms, [2, 512, 512, 512], "uint16");
     expect(reasons).toEqual([]);
     expect(warnSpy).not.toHaveBeenCalledWith(expect.stringMatching(/channels/));
     warnSpy.mockRestore();
@@ -257,98 +272,144 @@ describe('validateZarrSupport', () => {
 // isRemoteZarr
 // ---------------------------------------------------------------------------
 
-describe('isRemoteZarr', () => {
+describe("isRemoteZarr", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
   function stubFetch(handler: (url: string) => Response | Promise<Response>) {
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-      const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      return handler(href);
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const href =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        return handler(href);
+      }),
+    );
   }
 
   function jsonResponse(body: unknown, status = 200): Response {
     return new Response(JSON.stringify(body), {
       status,
-      headers: { 'content-type': 'application/json' },
+      headers: { "content-type": "application/json" },
     });
   }
 
-  it('detects Zarr v3 via zarr.json', async () => {
-    stubFetch(url => {
-      if (url.endsWith('/zarr.json')) {
-        return jsonResponse({ zarr_format: 3, node_type: 'group', attributes: {} });
+  it("detects Zarr v3 via zarr.json", async () => {
+    stubFetch((url) => {
+      if (url.endsWith("/zarr.json")) {
+        return jsonResponse({
+          zarr_format: 3,
+          node_type: "group",
+          attributes: {},
+        });
       }
       return new Response(null, { status: 404 });
     });
-    await expect(isRemoteZarr('https://example.com/volume')).resolves.toBe(true);
+    await expect(isRemoteZarr("https://example.com/volume")).resolves.toBe(
+      true,
+    );
   });
 
-  it('detects Zarr v2 via .zgroup', async () => {
-    stubFetch(url => {
-      if (url.endsWith('/.zgroup')) return jsonResponse({ zarr_format: 2 });
+  it("detects Zarr v2 via .zgroup", async () => {
+    stubFetch((url) => {
+      if (url.endsWith("/.zgroup")) return jsonResponse({ zarr_format: 2 });
       return new Response(null, { status: 404 });
     });
-    await expect(isRemoteZarr('https://example.com/volume/')).resolves.toBe(true);
+    await expect(isRemoteZarr("https://example.com/volume/")).resolves.toBe(
+      true,
+    );
   });
 
-  it('detects Zarr v2 array root via .zarray', async () => {
-    stubFetch(url => {
-      if (url.endsWith('/.zarray')) {
-        return jsonResponse({ zarr_format: 2, shape: [1, 2, 3], chunks: [1, 1, 1], dtype: '|u1' });
+  it("detects Zarr v2 array root via .zarray", async () => {
+    stubFetch((url) => {
+      if (url.endsWith("/.zarray")) {
+        return jsonResponse({
+          zarr_format: 2,
+          shape: [1, 2, 3],
+          chunks: [1, 1, 1],
+          dtype: "|u1",
+        });
       }
       return new Response(null, { status: 404 });
     });
-    await expect(isRemoteZarr('https://example.com/arr')).resolves.toBe(true);
+    await expect(isRemoteZarr("https://example.com/arr")).resolves.toBe(true);
   });
 
-  it('returns false when no zarr root metadata exists (e.g. sharded binary)', async () => {
+  it("returns false when no zarr root metadata exists (e.g. sharded binary)", async () => {
     stubFetch(() => new Response(null, { status: 404 }));
-    await expect(isRemoteZarr('https://example.com/sharded')).resolves.toBe(false);
+    await expect(isRemoteZarr("https://example.com/sharded")).resolves.toBe(
+      false,
+    );
   });
 
-  it('ignores non-zarr JSON at candidate keys', async () => {
-    stubFetch(url => {
-      if (url.endsWith('/zarr.json')) return jsonResponse({ foo: 'bar' });
+  it("ignores non-zarr JSON at candidate keys", async () => {
+    stubFetch((url) => {
+      if (url.endsWith("/zarr.json")) return jsonResponse({ foo: "bar" });
       return new Response(null, { status: 404 });
     });
-    await expect(isRemoteZarr('https://example.com/not-zarr')).resolves.toBe(false);
+    await expect(isRemoteZarr("https://example.com/not-zarr")).resolves.toBe(
+      false,
+    );
   });
 
-  it('rejects zarr.json with node_type but no zarr_format', async () => {
-    stubFetch(url => {
-      if (url.endsWith('/zarr.json')) return jsonResponse({ node_type: 'group', attributes: {} });
+  it("rejects zarr.json with node_type but no zarr_format", async () => {
+    stubFetch((url) => {
+      if (url.endsWith("/zarr.json"))
+        return jsonResponse({ node_type: "group", attributes: {} });
       return new Response(null, { status: 404 });
     });
-    await expect(isRemoteZarr('https://example.com/not-zarr')).resolves.toBe(false);
+    await expect(isRemoteZarr("https://example.com/not-zarr")).resolves.toBe(
+      false,
+    );
   });
 
-  it('rejects zarr.json with zarr_format 3 but no node_type', async () => {
-    stubFetch(url => {
-      if (url.endsWith('/zarr.json')) return jsonResponse({ zarr_format: 3 });
+  it("rejects zarr.json with zarr_format 3 but no node_type", async () => {
+    stubFetch((url) => {
+      if (url.endsWith("/zarr.json")) return jsonResponse({ zarr_format: 3 });
       return new Response(null, { status: 404 });
     });
-    await expect(isRemoteZarr('https://example.com/not-zarr')).resolves.toBe(false);
+    await expect(isRemoteZarr("https://example.com/not-zarr")).resolves.toBe(
+      false,
+    );
   });
 
-  it('treats HTML 200 responses as absent', async () => {
-    stubFetch(() => new Response('<html>nope</html>', {
-      status: 200,
-      headers: { 'content-type': 'text/html' },
-    }));
-    await expect(isRemoteZarr('https://example.com/missing')).resolves.toBe(false);
+  it("treats HTML 200 responses as absent", async () => {
+    stubFetch(
+      () =>
+        new Response("<html>nope</html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        }),
+    );
+    await expect(isRemoteZarr("https://example.com/missing")).resolves.toBe(
+      false,
+    );
   });
 
-  it('does not require .zarr in the URL path', async () => {
-    stubFetch(url => {
-      if (url.endsWith('/zarr.json')) {
-        return jsonResponse({ zarr_format: 3, node_type: 'group' });
+  it("does not fetch zarr keys for IMS URLs", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(isRemoteZarr("https://s3.example.com/scan.ims")).resolves.toBe(
+      false,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not require .zarr in the URL path", async () => {
+    stubFetch((url) => {
+      if (url.endsWith("/zarr.json")) {
+        return jsonResponse({ zarr_format: 3, node_type: "group" });
       }
       return new Response(null, { status: 404 });
     });
-    await expect(isRemoteZarr('https://cdn.example.com/datasets/beechnut')).resolves.toBe(true);
+    await expect(
+      isRemoteZarr("https://cdn.example.com/datasets/beechnut"),
+    ).resolves.toBe(true);
   });
 });

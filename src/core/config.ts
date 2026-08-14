@@ -3,7 +3,7 @@
 // Core constants
 export const LOGICAL_BRICK_SIZE = 64;
 export const PHYSICAL_BRICK_SIZE = 66; // 64 + 1 voxel padding on each side
-export const ATLAS_SIZE = 660;         // Grid slots * physical brick size - 528, 660, 792, etc.
+export const ATLAS_SIZE = 660; // Grid slots * physical brick size - 528, 660, 792, etc.
 export const MAX_BRICK_TRAVERSALS = 512; // Upper bound for shader loop termination
 /** Hard cap on simultaneously rendered channels (uniforms + atlas bindings). */
 export const MAX_CHANNELS = 6;
@@ -17,10 +17,7 @@ export const TOTAL_BRICK_SLOTS = GRID_SIZE * GRID_SIZE * GRID_SIZE;
 // For backward compatibility with existing code
 export const BRICK_SIZE = LOGICAL_BRICK_SIZE;
 
-// Atlas VRAM budget (bytes, ~1.3 GiB). A fixed 660³ atlas × many r16float
-// channels OOMs mobile GPUs; computeAtlasGrid shrinks the grid to fit.
-// Sized so 1–2 channels keep the full 660³ grid.
-export const DEFAULT_ATLAS_BUDGET_BYTES = 1_400_000_000;
+export const DEFAULT_ATLAS_BUDGET_BYTES = 3_000_000_000;
 
 // Smallest grid computeAtlasGrid may return — must still hold the pinned base
 // LOD plus a working set.
@@ -54,7 +51,9 @@ export const CONFIG = {
   MAX_CHANNELS,
 } as const;
 
-function computeDatasetGrid(dimensions: [number, number, number]): [number, number, number] {
+function computeDatasetGrid(
+  dimensions: [number, number, number],
+): [number, number, number] {
   return [
     Math.ceil(dimensions[0] / BRICK_SIZE),
     Math.ceil(dimensions[1] / BRICK_SIZE),

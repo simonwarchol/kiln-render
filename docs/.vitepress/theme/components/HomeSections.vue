@@ -7,8 +7,8 @@ import { withBase } from 'vitepress';
 // question for half the audience); rendering internals follow.
 const features = [
   {
-    title: 'OME-Zarr, no conversion needed',
-    body: 'Compatible multiscale OME-Zarr (NGFF v0.4/v0.5) datasets stream directly from a URL or the local filesystem, with no Kiln-specific conversion. Other volumes can be converted to Kiln’s compressed sharded binary format.',
+    title: 'OME-Zarr and Imaris, no conversion needed',
+    body: 'Compatible multiscale OME-Zarr (NGFF v0.4/v0.5) and Imaris 5.5 (.ims) datasets stream directly from a URL (or local Zarr on the filesystem), with no Kiln-specific conversion. Other volumes can be converted to Kiln’s compressed sharded binary format.',
   },
   {
     title: 'Bounded GPU residency',
