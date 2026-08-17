@@ -45,7 +45,6 @@ const viewer = await KilnViewer.create(canvas, url, {
   windowCenter: 0.35,   // 0–1 (16-bit window centre)
   windowWidth: 0.55,    // 0–1 (16-bit window width)
   isoValue: 0.2,        // 0–1 (isosurface threshold)
-  renderScale: 0.5,     // 0.25–1.0 (render resolution multiplier)
   maxPixelError: 2.0,   // LOD screen-space error threshold in pixels
   tfPreset: 'grayscale',// transfer function colour preset
   tfPoints: [{ x: 0, y: 0 }, { x: 1, y: 1 }], // TF opacity control points (overrides preset defaults)
@@ -73,7 +72,6 @@ viewer.mode = 'mip';
 viewer.windowCenter = 0.4;
 viewer.windowWidth = 0.3;
 viewer.isoValue = 0.25;
-viewer.renderScale = 0.5;
 
 // Direct access to subsystems
 viewer.camera;           // Camera
@@ -90,7 +88,7 @@ viewer.metadata;         // VolumeMetadata (dimensions, spacing, bitDepth, …)
 ```typescript
 const state = viewer.getState();
 // {
-//   mode, windowCenter, windowWidth, isoValue, renderScale,
+//   mode, windowCenter, windowWidth, isoValue,
 //   tfPreset, tfPoints, upAxis, cam, clipMin, clipMax,
 //   sliceX, sliceY, sliceZ, showSliceX, showSliceY, showSliceZ,
 //   showWireframe, showAxis

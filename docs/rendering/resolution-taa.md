@@ -1,17 +1,8 @@
-# Resolution scaling & TAA
+# Resolution & TAA
 
-## Resolution scaling
+## Resolution
 
-The compute shader can render at a reduced resolution to decrease the number of rays cast per frame. A configurable `renderScale` factor (0.25-1.0, default 0.5) multiplies the canvas dimensions to produce a smaller compute output texture. The blit pass then upscales this to the full canvas using bilinear filtering.
-
-```
-Canvas: 1920 × 1080
-renderScale: 0.5
-Compute texture: 960 × 540  (75% fewer pixels)
-Blit: bilinear upscale back to 1920 × 1080
-```
-
-The depth texture remains at full resolution for geometry overlays (wireframe, axis). The scaled dimensions are passed into the shader as `screenSize` so that ray generation and thread dispatch use the correct coordinate space.
+The compute shader always renders at full canvas resolution. The blit pass copies that output to the canvas. The depth texture stays at the same size for geometry overlays (wireframe, axis). Canvas dimensions are passed into the shader as `screenSize` so ray generation and thread dispatch use the correct coordinate space.
 
 ## Temporal jitter and accumulation
 

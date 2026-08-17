@@ -284,9 +284,20 @@ export function createRangeSlider(opts: {
   valueMax: number;
   format?: (v: number) => string;
   onChange: (min: number, max: number) => void;
-}): { el: HTMLElement; setValue(min: number, max: number): void } {
+}): {
+  el: HTMLElement;
+  setValue(min: number, max: number): void;
+  setBounds(min: number, max: number, step?: number): void;
+} {
+  let rangeMin = opts.min;
+  let rangeMax = opts.max;
+  let rangeStep = opts.step;
   const format = opts.format ?? ((v: number) => v.toFixed(2));
-  const pct = (v: number) => ((v - opts.min) / (opts.max - opts.min)) * 100;
+  const pct = (v: number) => {
+    const span = rangeMax - rangeMin;
+    if (span <= 0) return 0;
+    return ((v - rangeMin) / span) * 100;
+  };
 
   const el = document.createElement("div");
   el.className = "ctl-slider-row";
@@ -309,9 +320,9 @@ export function createRangeSlider(opts: {
     const input = document.createElement("input");
     input.type = "range";
     input.className = "ctl-range-input";
-    input.min = String(opts.min);
-    input.max = String(opts.max);
-    input.step = String(opts.step);
+    input.min = String(rangeMin);
+    input.max = String(rangeMax);
+    input.step = String(rangeStep);
     input.value = String(val);
     return input;
   };
@@ -358,6 +369,20 @@ export function createRangeSlider(opts: {
       maxInput.value = String(max);
       value.textContent = `${format(min)}–${format(max)}`;
       setFill(min, max);
+    },
+    setBounds(min: number, max: number, step?: number) {
+      rangeMin = min;
+      rangeMax = max;
+      if (step !== undefined) rangeStep = step;
+      for (const input of [minInput, maxInput]) {
+        input.min = String(rangeMin);
+        input.max = String(rangeMax);
+        input.step = String(rangeStep);
+        const cur = Number(input.value);
+        input.value = String(Math.min(rangeMax, Math.max(rangeMin, cur)));
+      }
+      setFill(Number(minInput.value), Number(maxInput.value));
+      value.textContent = `${format(Number(minInput.value))}–${format(Number(maxInput.value))}`;
     },
   };
 }

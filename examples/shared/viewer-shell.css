@@ -254,6 +254,160 @@ a:focus-visible {
   opacity: 1;
 }
 
+.local-reconnect-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.local-reconnect-card {
+  width: min(400px, calc(100vw - 32px));
+  padding: 20px 22px;
+  border-radius: 10px;
+  background: #1a1b1e;
+  color: #e8e8ea;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+.local-reconnect-card h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.local-reconnect-card p {
+  margin: 0 0 16px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: rgba(232, 232, 234, 0.75);
+}
+
+.local-reconnect-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.local-reconnect-actions button {
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: inherit;
+}
+
+.local-reconnect-grant {
+  background: #3b82f6 !important;
+  border-color: #3b82f6 !important;
+  color: #fff !important;
+}
+
+.local-reconnect-grant:hover {
+  filter: brightness(1.08);
+}
+
+.local-reconnect-skip:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.splat-viewer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.65);
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.splat-viewer-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(1100px, 100%);
+  height: min(780px, calc(100vh - 32px));
+  border-radius: 10px;
+  overflow: hidden;
+  background: #111;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+
+.splat-viewer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  background: #1a1b1e;
+  color: #e8e8ea;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.splat-viewer-close {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: inherit;
+}
+
+.splat-viewer-close:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.splat-viewer-frame {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: #000;
+}
+
+.splat-viewer-canvas-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: #0a0a0b;
+}
+
+.splat-viewer-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  cursor: grab;
+}
+
+.splat-viewer-canvas:active {
+  cursor: grabbing;
+}
+
+.splat-viewer-status {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(232, 232, 234, 0.7);
+  font-size: 13px;
+  pointer-events: none;
+}
+
 /* Pre-first-render only — ongoing streaming activity lives in the status strip. */
 #spinner {
   position: fixed;

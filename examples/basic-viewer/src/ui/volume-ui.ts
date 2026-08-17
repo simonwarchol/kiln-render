@@ -56,7 +56,6 @@ export class VolumeUI {
     windowCenter: 0.5,
     windowWidth: 1.0,
     densityScale: 1.0,
-    renderScale: 0.5,
     /** Manual Data LOD override (toggle off = Auto SSE) */
     dataLodManual: false,
     dataLod: 0,
@@ -95,7 +94,6 @@ export class VolumeUI {
     ReturnType<typeof createRangeSlider>,
   ];
   private clipSection!: HTMLElement;
-  private renderScaleSlider!: ReturnType<typeof createSlider>;
   private dataLodSlider!: ReturnType<typeof createSlider>;
   private jitterToggle!: ReturnType<typeof createToggle>;
   private taaToggle!: ReturnType<typeof createToggle>;
@@ -129,7 +127,6 @@ export class VolumeUI {
     this.params.showAxis = this.renderer.showAxis;
     this.params.windowCenter = this.renderer.windowCenter;
     this.params.windowWidth = this.renderer.windowWidth;
-    this.params.renderScale = this.renderer.renderScale;
     const initialForced = this.viewer.forcedLod;
     this.params.dataLodManual = initialForced !== null;
     this.params.dataLod = initialForced ?? this.viewer.finestStreamLod;
@@ -309,19 +306,6 @@ export class VolumeUI {
     );
     body.appendChild(advancedEl);
 
-    this.renderScaleSlider = createSlider({
-      label: "Render Scale",
-      min: 0.25,
-      max: 1.0,
-      step: 0.25,
-      value: this.params.renderScale,
-      format: (v) => v.toFixed(2),
-      onChange: (v) => {
-        this.viewer.renderScale = v;
-      },
-    });
-    advancedBody.appendChild(this.renderScaleSlider.el);
-
     this.jitterToggle = createToggle({
       label: "Jitter",
       value: this.params.enableJitter,
@@ -351,6 +335,48 @@ export class VolumeUI {
       },
     });
     advancedBody.appendChild(this.indirectionToggle.el);
+
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.className = "ctl-btn";
+    exportBtn.textContent = "Export Gaussian Splat";
+    exportBtn.title =
+      "Orbit-capture this render, train Gaussians with Brush, preview the trained PLY";
+    exportBtn.addEventListener("click", () => {
+      void this.runSplatExport(exportBtn);
+    });
+    advancedBody.appendChild(exportBtn);
+  }
+
+  private async runSplatExport(btn: HTMLButtonElement): Promise<void> {
+    const prev = btn.textContent;
+    btn.disabled = true;
+    try {
+      const { handoffToSuperSplat } = await import("kiln-render");
+      const outcome = await this.viewer.exportGaussianSplat({
+        onProgress: (_f, label) => {
+          btn.textContent = label;
+        },
+      });
+      await handoffToSuperSplat(outcome);
+      if (outcome.kind === "dataset-only") {
+        console.info("[Kiln]", outcome.reason);
+        btn.textContent = "Dataset saved — train in Brush";
+      } else {
+        btn.textContent = "Export done — trained splat open";
+      }
+      setTimeout(() => {
+        btn.textContent = prev;
+      }, 2500);
+    } catch (err) {
+      console.error("[Kiln] splat export failed", err);
+      btn.textContent = "Export failed";
+      setTimeout(() => {
+        btn.textContent = prev;
+      }, 2500);
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   /** Builds the persistent mode-options widgets once; updateVisibility() swaps which are shown. */
@@ -704,7 +730,6 @@ export class VolumeUI {
     this.params.windowCenter = this.renderer.windowCenter;
     this.params.windowWidth = this.renderer.windowWidth;
     this.params.densityScale = this.renderer.densityScale;
-    this.params.renderScale = this.viewer.renderScale;
     this.params.dataLodManual = this.viewer.forcedLod !== null;
     this.params.dataLod = this.viewer.forcedLod ?? this.viewer.finestStreamLod;
     this.params.upAxis = this.camera.getUpAxis();
@@ -736,7 +761,6 @@ export class VolumeUI {
     this.windowCenterSlider.setValue(this.params.windowCenter);
     this.windowWidthSlider.setValue(this.params.windowWidth);
     this.densitySlider.setValue(this.params.densityScale);
-    this.renderScaleSlider.setValue(this.params.renderScale);
     this.dataLodSlider.setChecked(!this.params.dataLodManual);
     this.dataLodSlider.setValue(this.params.dataLod);
     this.upAxisSelect.setValue(this.params.upAxis);

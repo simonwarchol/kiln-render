@@ -123,7 +123,6 @@ pnpm dev   # http://localhost:3000
 | `slice` | `x,y,z,showX,showY,showZ` | Slice plane positions and visibility |
 | `cam` | `rx,ry,dist,tx,ty,tz` | Camera state |
 | `up` | `x`, `y`, `z`, `-x`, `-y`, `-z` | Camera up axis |
-| `scale` | 0.25–1.0 | Render resolution |
 | `lod` | integer ≥ 0 | Force stream pyramid level (0 = finest; omit for Auto) |
 
 Channel state encodes each channel as `r,g,b,a,visible,windowMin,windowMax` (0–255 for RGB, 0–1 for the rest), separated by semicolons:

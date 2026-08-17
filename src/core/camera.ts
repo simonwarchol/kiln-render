@@ -1,8 +1,8 @@
 /** Arcball camera — mouse (orbit/pan/wheel) and touch (orbit/pinch/pan). */
 
-import { mat4 } from 'wgpu-matrix';
+import { mat4 } from "wgpu-matrix";
 
-export type UpAxis = 'x' | 'y' | 'z' | '-x' | '-y' | '-z';
+export type UpAxis = "x" | "y" | "z" | "-x" | "-y" | "-z";
 
 // Orbit distance clamp (normalized units), shared by mouse wheel and touch pinch
 // so the two paths can't drift — mobile must zoom in as close as desktop.
@@ -12,8 +12,8 @@ const MAX_DISTANCE = 10;
 export class Camera {
   position: Float32Array;
 
-  private target: [number, number, number] = [0, 0, 0];  // Pan target
-  private distance = 3.0;  // Distance from target in normalized units
+  private target: [number, number, number] = [0, 0, 0]; // Pan target
+  private distance = 3.0; // Distance from target in normalized units
   private rotationX = 0.3;
   private rotationY = 3.5;
   private isDragging = false;
@@ -32,7 +32,7 @@ export class Camera {
   private isTouchPanning = false;
 
   // Up vector configuration
-  private upAxis: UpAxis = '-y';
+  private upAxis: UpAxis = "-y";
   private upVector: [number, number, number] = [0, -1, 0];
 
   // Clamp away from poles to avoid degenerate view matrix
@@ -50,19 +50,19 @@ export class Camera {
     this.updatePosition();
 
     // Disable context menu on right-click
-    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
-    canvas.addEventListener('mousedown', (e) => {
+    canvas.addEventListener("mousedown", (e) => {
       this.lastX = e.clientX;
       this.lastY = e.clientY;
       if (e.button === 0) {
-        this.isDragging = true;  // Left click: orbit
+        this.isDragging = true; // Left click: orbit
       } else if (e.button === 2) {
-        this.isPanning = true;   // Right click: pan
+        this.isPanning = true; // Right click: pan
       }
     });
 
-    canvas.addEventListener('mousemove', (e) => {
+    canvas.addEventListener("mousemove", (e) => {
       if (!this.isDragging && !this.isPanning) return;
 
       const dx = e.clientX - this.lastX;
@@ -80,100 +80,123 @@ export class Camera {
       this.updatePosition();
     });
 
-    canvas.addEventListener('mouseup', () => {
+    canvas.addEventListener("mouseup", () => {
       this.isDragging = false;
       this.isPanning = false;
     });
-    canvas.addEventListener('mouseleave', () => {
+    canvas.addEventListener("mouseleave", () => {
       this.isDragging = false;
       this.isPanning = false;
     });
 
-    canvas.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      this.distance *= 1 + e.deltaY * 0.001;
-      this.distance = Math.max(MIN_DISTANCE, Math.min(MAX_DISTANCE, this.distance));
-      this.lastInteractionTime = performance.now();
-      this.updatePosition();
-    }, { passive: false });
+    canvas.addEventListener(
+      "wheel",
+      (e) => {
+        e.preventDefault();
+        this.distance *= 1 + e.deltaY * 0.001;
+        this.distance = Math.max(
+          MIN_DISTANCE,
+          Math.min(MAX_DISTANCE, this.distance),
+        );
+        this.lastInteractionTime = performance.now();
+        this.updatePosition();
+      },
+      { passive: false },
+    );
 
     // Touch controls
-    canvas.addEventListener('touchstart', (e) => {
-      e.preventDefault();
+    canvas.addEventListener(
+      "touchstart",
+      (e) => {
+        e.preventDefault();
 
-      // Update active touches map
-      for (const touch of Array.from(e.changedTouches)) {
-        this.activeTouches.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
-      }
-
-      if (e.touches.length === 1) {
-        // Single finger: start orbit
-        const touch = e.touches[0]!;
-        this.lastX = touch.clientX;
-        this.lastY = touch.clientY;
-        this.isDragging = true;
-        this.isTouchPanning = false;
-      } else if (e.touches.length === 2) {
-        // Two fingers: initialize pinch/pan state
-        const t1 = e.touches[0]!;
-        const t2 = e.touches[1]!;
-        this.lastPinchDistance = this.getTouchDistance(t1, t2);
-        this.lastTouchCenter = this.getTouchCenter(t1, t2);
-        this.isDragging = false;
-        this.isTouchPanning = true;
-      }
-    }, { passive: false });
-
-    canvas.addEventListener('touchmove', (e) => {
-      e.preventDefault();
-
-      // Update positions in map
-      for (const touch of Array.from(e.changedTouches)) {
-        if (this.activeTouches.has(touch.identifier)) {
-          this.activeTouches.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+        // Update active touches map
+        for (const touch of Array.from(e.changedTouches)) {
+          this.activeTouches.set(touch.identifier, {
+            x: touch.clientX,
+            y: touch.clientY,
+          });
         }
-      }
 
-      if (e.touches.length === 1 && this.isDragging) {
-        // Single finger orbit
-        const touch = e.touches[0]!;
-        const dx = touch.clientX - this.lastX;
-        const dy = touch.clientY - this.lastY;
-        this.lastX = touch.clientX;
-        this.lastY = touch.clientY;
-
-        this.applyOrbit(dx, dy);
-
-        this.lastInteractionTime = performance.now();
-        this.updatePosition();
-
-      } else if (e.touches.length === 2 && this.isTouchPanning) {
-        const t1 = e.touches[0]!;
-        const t2 = e.touches[1]!;
-
-        // Pinch zoom
-        const currentDistance = this.getTouchDistance(t1, t2);
-        if (this.lastPinchDistance > 0) {
-          const pinchRatio = this.lastPinchDistance / currentDistance;
-          this.distance *= pinchRatio;
-          this.distance = Math.max(MIN_DISTANCE, Math.min(MAX_DISTANCE, this.distance));
+        if (e.touches.length === 1) {
+          // Single finger: start orbit
+          const touch = e.touches[0]!;
+          this.lastX = touch.clientX;
+          this.lastY = touch.clientY;
+          this.isDragging = true;
+          this.isTouchPanning = false;
+        } else if (e.touches.length === 2) {
+          // Two fingers: initialize pinch/pan state
+          const t1 = e.touches[0]!;
+          const t2 = e.touches[1]!;
+          this.lastPinchDistance = this.getTouchDistance(t1, t2);
+          this.lastTouchCenter = this.getTouchCenter(t1, t2);
+          this.isDragging = false;
+          this.isTouchPanning = true;
         }
-        this.lastPinchDistance = currentDistance;
+      },
+      { passive: false },
+    );
 
-        // Two-finger pan
-        const currentCenter = this.getTouchCenter(t1, t2);
-        const dx = currentCenter.x - this.lastTouchCenter.x;
-        const dy = currentCenter.y - this.lastTouchCenter.y;
+    canvas.addEventListener(
+      "touchmove",
+      (e) => {
+        e.preventDefault();
 
-        if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
-          this.applyPan(dx, dy);
+        // Update positions in map
+        for (const touch of Array.from(e.changedTouches)) {
+          if (this.activeTouches.has(touch.identifier)) {
+            this.activeTouches.set(touch.identifier, {
+              x: touch.clientX,
+              y: touch.clientY,
+            });
+          }
         }
-        this.lastTouchCenter = currentCenter;
 
-        this.lastInteractionTime = performance.now();
-        this.updatePosition();
-      }
-    }, { passive: false });
+        if (e.touches.length === 1 && this.isDragging) {
+          // Single finger orbit
+          const touch = e.touches[0]!;
+          const dx = touch.clientX - this.lastX;
+          const dy = touch.clientY - this.lastY;
+          this.lastX = touch.clientX;
+          this.lastY = touch.clientY;
+
+          this.applyOrbit(dx, dy);
+
+          this.lastInteractionTime = performance.now();
+          this.updatePosition();
+        } else if (e.touches.length === 2 && this.isTouchPanning) {
+          const t1 = e.touches[0]!;
+          const t2 = e.touches[1]!;
+
+          // Pinch zoom
+          const currentDistance = this.getTouchDistance(t1, t2);
+          if (this.lastPinchDistance > 0) {
+            const pinchRatio = this.lastPinchDistance / currentDistance;
+            this.distance *= pinchRatio;
+            this.distance = Math.max(
+              MIN_DISTANCE,
+              Math.min(MAX_DISTANCE, this.distance),
+            );
+          }
+          this.lastPinchDistance = currentDistance;
+
+          // Two-finger pan
+          const currentCenter = this.getTouchCenter(t1, t2);
+          const dx = currentCenter.x - this.lastTouchCenter.x;
+          const dy = currentCenter.y - this.lastTouchCenter.y;
+
+          if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+            this.applyPan(dx, dy);
+          }
+          this.lastTouchCenter = currentCenter;
+
+          this.lastInteractionTime = performance.now();
+          this.updatePosition();
+        }
+      },
+      { passive: false },
+    );
 
     const handleTouchEnd = (e: TouchEvent) => {
       e.preventDefault();
@@ -201,18 +224,21 @@ export class Camera {
       }
     };
 
-    canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
-    canvas.addEventListener('touchcancel', handleTouchEnd, { passive: false });
+    canvas.addEventListener("touchend", handleTouchEnd, { passive: false });
+    canvas.addEventListener("touchcancel", handleTouchEnd, { passive: false });
   }
 
   private applyOrbit(dx: number, dy: number): void {
-    const baseAxis = this.upAxis.replace('-', '');
-    const isNegative = this.upAxis.startsWith('-');
-    let hSign = baseAxis === 'z' ? 1 : -1;
-    if (baseAxis === 'y' && isNegative) hSign = 1;
+    const baseAxis = this.upAxis.replace("-", "");
+    const isNegative = this.upAxis.startsWith("-");
+    let hSign = baseAxis === "z" ? 1 : -1;
+    if (baseAxis === "y" && isNegative) hSign = 1;
     this.rotationY += hSign * dx * 0.01;
     this.rotationX += dy * 0.01;
-    this.rotationX = Math.max(-Math.PI / 2 + this.poleEpsilon, Math.min(Math.PI / 2 - this.poleEpsilon, this.rotationX));
+    this.rotationX = Math.max(
+      -Math.PI / 2 + this.poleEpsilon,
+      Math.min(Math.PI / 2 - this.poleEpsilon, this.rotationX),
+    );
   }
 
   private applyPan(dx: number, dy: number): void {
@@ -246,26 +272,26 @@ export class Camera {
     const sinY = Math.sin(this.rotationY);
 
     // Determine sign for negative axes
-    const sign = this.upAxis.startsWith('-') ? -1 : 1;
-    const baseAxis = this.upAxis.replace('-', '') as 'x' | 'y' | 'z';
+    const sign = this.upAxis.startsWith("-") ? -1 : 1;
+    const baseAxis = this.upAxis.replace("-", "") as "x" | "y" | "z";
 
     // Orbit around target based on up axis
     // The "horizontal" rotation is around the up axis
     // The "vertical" rotation tilts toward/away from up
     switch (baseAxis) {
-      case 'x':
+      case "x":
         // X is up: orbit in YZ plane, tilt toward X
         this.position[0] = this.target[0] + sign * sinX * this.distance;
         this.position[1] = this.target[1] + cosY * cosX * this.distance;
         this.position[2] = this.target[2] + sinY * cosX * this.distance;
         break;
-      case 'y':
+      case "y":
         // Y is up (default): orbit in XZ plane, tilt toward Y
         this.position[0] = this.target[0] + sinY * cosX * this.distance;
         this.position[1] = this.target[1] + sign * sinX * this.distance;
         this.position[2] = this.target[2] + cosY * cosX * this.distance;
         break;
-      case 'z':
+      case "z":
         // Z is up: orbit in XY plane, tilt toward Z
         this.position[0] = this.target[0] + cosY * cosX * this.distance;
         this.position[1] = this.target[1] + sinY * cosX * this.distance;
@@ -275,7 +301,10 @@ export class Camera {
   }
 
   /** Get screen-space right and up vectors from view matrix for panning */
-  private getScreenSpaceVectors(): { right: [number, number, number]; up: [number, number, number] } {
+  private getScreenSpaceVectors(): {
+    right: [number, number, number];
+    up: [number, number, number];
+  } {
     const viewMatrix = this.getViewMatrix();
     // View matrix columns (column-major order): right is column 0, up is column 1
     return {
@@ -291,22 +320,22 @@ export class Camera {
   setUpAxis(axis: UpAxis): void {
     this.upAxis = axis;
     switch (axis) {
-      case 'x':
+      case "x":
         this.upVector = [1, 0, 0];
         break;
-      case '-x':
+      case "-x":
         this.upVector = [-1, 0, 0];
         break;
-      case 'y':
+      case "y":
         this.upVector = [0, 1, 0];
         break;
-      case '-y':
+      case "-y":
         this.upVector = [0, -1, 0];
         break;
-      case 'z':
+      case "z":
         this.upVector = [0, 0, 1];
         break;
-      case '-z':
+      case "-z":
         this.upVector = [0, 0, -1];
         break;
     }
@@ -327,13 +356,28 @@ export class Camera {
     return this.upAxis;
   }
 
+  getUpVector(): [number, number, number] {
+    return [...this.upVector];
+  }
+
   /** Get orbital state: [rotationX, rotationY, distance, targetX, targetY, targetZ] */
   getOrbitState(): [number, number, number, number, number, number] {
-    return [this.rotationX, this.rotationY, this.distance, this.target[0], this.target[1], this.target[2]];
+    return [
+      this.rotationX,
+      this.rotationY,
+      this.distance,
+      this.target[0],
+      this.target[1],
+      this.target[2],
+    ];
   }
 
   /** Set orbital state: [rotationX, rotationY, distance] or [rotationX, rotationY, distance, targetX, targetY, targetZ] */
-  setOrbitState(state: [number, number, number] | [number, number, number, number, number, number]): void {
+  setOrbitState(
+    state:
+      | [number, number, number]
+      | [number, number, number, number, number, number],
+  ): void {
     this.rotationX = state[0];
     this.rotationY = state[1];
     this.distance = Math.max(MIN_DISTANCE, Math.min(MAX_DISTANCE, state[2]));
@@ -343,17 +387,32 @@ export class Camera {
     this.updatePosition();
   }
 
-   isInteracting(): boolean {
-    return this.isDragging || this.isPanning || this.isTouchPanning
-      || performance.now() - this.lastInteractionTime < 200;
+  isInteracting(): boolean {
+    return (
+      this.isDragging ||
+      this.isPanning ||
+      this.isTouchPanning ||
+      performance.now() - this.lastInteractionTime < 200
+    );
   }
 
   getViewMatrix(): Float32Array {
-    return mat4.lookAt(this.position, this.target, this.upVector, this.viewScratch) as Float32Array;
+    return mat4.lookAt(
+      this.position,
+      this.target,
+      this.upVector,
+      this.viewScratch,
+    ) as Float32Array;
   }
 
   getProjectionMatrix(aspect: number): Float32Array {
-    return mat4.perspective(Math.PI / 4, aspect, 0.01, 100, this.projScratch) as Float32Array;
+    return mat4.perspective(
+      Math.PI / 4,
+      aspect,
+      0.01,
+      100,
+      this.projScratch,
+    ) as Float32Array;
   }
 }
 
@@ -372,7 +431,9 @@ export type FrustumPlanes = {
  * Uses Gribb/Hartmann method.
  */
 export function extractFrustumPlanes(viewProj: Float32Array): FrustumPlanes {
-  const normalizePlane = (p: [number, number, number, number]): [number, number, number, number] => {
+  const normalizePlane = (
+    p: [number, number, number, number],
+  ): [number, number, number, number] => {
     const len = Math.sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
     return [p[0] / len, p[1] / len, p[2] / len, p[3] / len];
   };
@@ -442,9 +503,16 @@ export function extractFrustumPlanes(viewProj: Float32Array): FrustumPlanes {
 export function isAABBInFrustum(
   min: [number, number, number],
   max: [number, number, number],
-  frustum: FrustumPlanes
+  frustum: FrustumPlanes,
 ): boolean {
-  const planes = [frustum.left, frustum.right, frustum.bottom, frustum.top, frustum.near, frustum.far];
+  const planes = [
+    frustum.left,
+    frustum.right,
+    frustum.bottom,
+    frustum.top,
+    frustum.near,
+    frustum.far,
+  ];
 
   for (const plane of planes) {
     // Find the positive vertex (furthest along plane normal)
@@ -460,4 +528,3 @@ export function isAABBInFrustum(
 
   return true;
 }
-

@@ -18,7 +18,7 @@ import {
   ImarisDataProvider,
   KilnViewer,
   LocalZarrDataProvider,
-  requestPermission,
+  queryReadPermission,
   UnsupportedDatasetError,
   type VolumeRenderMode,
 } from "kiln-render";
@@ -32,6 +32,7 @@ import {
   mountDatasetDialog,
   showDialogError,
 } from "../../shared/dataset-dialog.js";
+import { promptLocalFileReconnect } from "../../shared/local-reconnect.js";
 import { setupShareButton } from "../../shared/share-button.js";
 import { mountToast } from "../../shared/toast.js";
 import { mountTopBar } from "../../shared/top-bar.js";
@@ -43,7 +44,7 @@ import "../../shared/controls/controls.css";
 
 // Default volume source (can be overridden via ?dataset= URL parameter)
 const DEFAULT_VOLUME_SOURCE =
-  "https://d39zu0xtgv0613.cloudfront.net/chameleon-16bit";
+  "https://lsp-private-data.s3.amazonaws.com/235-minerva-1-5-paper/TLS-4.ims";
 
 // ?embed=1 — rendering only: no top bar, dataset dialog, controls/stats panel,
 // or share button. Camera orbit/pan/zoom still works — that's wired directly
@@ -71,7 +72,6 @@ function parseURLParams(): {
   tf?: string;
   up?: string;
   sse?: number;
-  scale?: number;
   /** Forced stream LOD (omit for Auto) */
   lod?: number;
   cam?:
@@ -205,7 +205,6 @@ function parseURLParams(): {
     tf: params.get("tf") ?? undefined,
     up: params.get("up") ?? undefined,
     sse: params.has("sse") ? Number(params.get("sse")) : undefined,
-    scale: params.has("scale") ? Number(params.get("scale")) : undefined,
     lod: params.has("lod") ? Number(params.get("lod")) : undefined,
     cam,
     clipMin,
@@ -241,15 +240,22 @@ async function main() {
   const storedImsHandle = await getStoredImsHandle();
 
   if (localMode === "ims" && storedImsHandle) {
-    const hasPermission = await requestPermission(storedImsHandle);
-    if (hasPermission) {
+    let granted = (await queryReadPermission(storedImsHandle)) === "granted";
+    if (!granted) {
+      // requestPermission needs a user gesture after reload — show a reconnect card.
+      granted = await promptLocalFileReconnect(storedImsHandle, "ims");
+    }
+    if (granted) {
       dataset = new ImarisDataProvider(await storedImsHandle.getFile());
     } else {
       dataset = volumeSource;
     }
-  } else if (localMode === "true" && storedHandle) {
-    const hasPermission = await requestPermission(storedHandle);
-    if (hasPermission) {
+  } else if ((localMode === "true" || localMode === "zarr") && storedHandle) {
+    let granted = (await queryReadPermission(storedHandle)) === "granted";
+    if (!granted) {
+      granted = await promptLocalFileReconnect(storedHandle, "zarr");
+    }
+    if (granted) {
       dataset = new LocalZarrDataProvider(storedHandle);
       isLocalZarr = true;
     } else {
@@ -271,7 +277,6 @@ async function main() {
     tfPoints: urlParams.tfPoints,
     upAxis: urlParams.up as UpAxis | undefined,
     cam: urlParams.cam,
-    renderScale: urlParams.scale,
     maxPixelError: urlParams.sse,
     forcedLod:
       urlParams.lod !== undefined && !Number.isNaN(urlParams.lod)
@@ -344,7 +349,6 @@ async function main() {
             p.set("dataset", volumeSource);
           p.set("up", state.upAxis);
           p.set("mode", state.mode);
-          p.set("scale", state.renderScale.toFixed(2));
           if (state.forcedLod !== null) p.set("lod", String(state.forcedLod));
           const [rx, ry, dist, tx, ty, tz] = state.cam;
           p.set(
@@ -397,7 +401,6 @@ async function main() {
               .join(","),
           );
           p.set("up", state.upAxis);
-          p.set("scale", state.renderScale.toFixed(2));
           if (state.forcedLod !== null) p.set("lod", String(state.forcedLod));
           const [rx, ry, dist, tx, ty, tz] = state.cam;
           p.set(

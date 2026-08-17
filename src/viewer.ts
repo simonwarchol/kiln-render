@@ -28,7 +28,7 @@ export interface ViewerOptions {
   densityScale?: number;
   /** Isosurface threshold (0–1) */
   isoValue?: number;
-  /** Render resolution scale (0.25–1) */
+  /** Ignored — rendering is always at full canvas resolution. */
   renderScale?: number;
   /** LOD screen-space error threshold in pixels */
   maxPixelError?: number;
@@ -78,6 +78,7 @@ export interface ViewerState {
   windowWidth: number;
   densityScale: number;
   isoValue: number;
+  /** Always 1 — rendering is at full canvas resolution. */
   renderScale: number;
   /** Forced stream LOD, or `null` for automatic SSE selection */
   forcedLod: number | null;
@@ -104,6 +105,7 @@ export class KilnViewer {
   readonly streamingManager: StreamingManager;
   readonly device: GPUDevice;
   readonly metadata: VolumeMetadata;
+  readonly config: DatasetConfig;
 
   /** Optional callback invoked at the start of every render frame. */
   onBeforeFrame?: () => void;
@@ -117,10 +119,10 @@ export class KilnViewer {
   private readonly resizeObserver: ResizeObserver;
   private rafHandle = 0;
   private resizeTimer = 0;
-  private userRenderScale: number;
   private disposed = false;
   private dirty = true;
   private lastCameraVersion = -1;
+  private paused = false;
 
   private constructor(
     device: GPUDevice,
@@ -132,7 +134,7 @@ export class KilnViewer {
     streamingManager: StreamingManager,
     dataProvider: DataProvider,
     metadata: VolumeMetadata,
-    userRenderScale: number,
+    config: DatasetConfig,
   ) {
     this.device = device;
     this.canvas = canvas;
@@ -143,7 +145,7 @@ export class KilnViewer {
     this.streamingManager = streamingManager;
     this.dataProvider = dataProvider;
     this.metadata = metadata;
-    this.userRenderScale = userRenderScale;
+    this.config = config;
 
     this.renderer.onDirty = () => {
       this.dirty = true;
@@ -352,9 +354,6 @@ export class KilnViewer {
       renderer.isoValue = options.isoValue;
       renderer.resetAccumulation();
     }
-    if (options.renderScale !== undefined) {
-      renderer.renderScale = options.renderScale;
-    }
     if (options.clipMin !== undefined) {
       renderer.clipMin.set(options.clipMin);
       renderer.resetAccumulation();
@@ -412,9 +411,6 @@ export class KilnViewer {
       );
     }
 
-    // Construct and return viewer
-    const userRenderScale = renderer.renderScale;
-
     const viewer = new KilnViewer(
       device,
       canvas,
@@ -425,7 +421,7 @@ export class KilnViewer {
       streamingManager,
       dataProvider,
       metadata,
-      userRenderScale,
+      config,
     );
 
     // When base LOD derives float/channel ranges, update renderer + metadata.
@@ -514,14 +510,12 @@ export class KilnViewer {
     this.renderer.resetAccumulation();
   }
 
+  /** Always 1. Setting this has no effect. */
   get renderScale(): number {
-    return this.userRenderScale;
+    return 1;
   }
-  set renderScale(value: number) {
-    this.userRenderScale = value;
-    // build the scale set now (off the gesture path) and re-render
-    this.renderer.prepareScale(value);
-    this.dirty = true;
+  set renderScale(_value: number) {
+    // Full resolution only.
   }
 
   /** Forced stream LOD (`null` = automatic SSE). 0 = finest. */
@@ -556,7 +550,7 @@ export class KilnViewer {
       windowWidth: this.renderer.windowWidth,
       densityScale: this.renderer.densityScale,
       isoValue: this.renderer.isoValue,
-      renderScale: this.userRenderScale,
+      renderScale: 1,
       forcedLod: this.streamingManager.forcedLod,
       tfPreset: this.transferFunction.preset,
       tfPoints: this.transferFunction.getOpacityPoints(),
@@ -592,6 +586,113 @@ export class KilnViewer {
     this.dataProvider.dispose();
   }
 
+  /** Pause / resume the RAF loop (used while capturing splat datasets). */
+  setPaused(paused: boolean): void {
+    this.paused = paused;
+    if (!paused && !this.disposed) {
+      this.dirty = true;
+      cancelAnimationFrame(this.rafHandle);
+      this.rafHandle = requestAnimationFrame(() => this.frame());
+    }
+  }
+
+  /**
+   * Capture one settled frame as RGBA8 (transparent background by default).
+   * Useful for custom export pipelines.
+   */
+  async captureFrame(opts?: {
+    settleFrames?: number;
+    transparentBackground?: boolean;
+  }): Promise<import("./export/capture-frame.js").CapturedFrame> {
+    const { captureRendererFrame } = await import("./export/capture-frame.js");
+    return captureRendererFrame(this.device, this.renderer, this.camera, opts);
+  }
+
+  /**
+   * Capture an orbit of the current renderer (viewer settings baked into PNGs),
+   * seed Brush with a voxel init.ply, train Gaussians, and return the result.
+   * The trained PLY is the product; init.ply is only a training seed.
+   */
+  async exportGaussianSplat(opts?: {
+    viewCount?: number;
+    settleFrames?: number;
+    /** 0 = finest seed LOD. Omit to auto-pick a coarse-enough seed. */
+    initLod?: number;
+    maxSplats?: number;
+    maxBatches?: number;
+    /**
+     * Long-side pixel count for captured views (default 1920). Independent of
+     * the window; render scale is forced to 1 for the capture.
+     */
+    captureMaxDim?: number;
+    onProgress?: (fraction: number, label: string) => void;
+  }): Promise<import("./export/brush-train.js").BrushTrainOutcome> {
+    const { captureSplatDataset, resolveCaptureSize } = await import(
+      "./export/splat-capture.js"
+    );
+    const { trainWithBrushOrPackage } = await import("./export/brush-train.js");
+    const { waitForBricksLoaded } = await import("./export/capture-frame.js");
+
+    const savedCanvasW = this.canvas.width;
+    const savedCanvasH = this.canvas.height;
+    const gpuMax = this.device.limits.maxTextureDimension2D;
+    const { width: capW, height: capH } = resolveCaptureSize(
+      this.canvas.clientWidth || savedCanvasW,
+      this.canvas.clientHeight || savedCanvasH,
+      opts?.captureMaxDim ?? 1920,
+      gpuMax,
+    );
+
+    this.setPaused(true);
+    try {
+      this.canvas.width = capW;
+      this.canvas.height = capH;
+      this.renderer.resize(capW, capH);
+      this.renderer.prepareScale(1);
+      this.renderer.activateScale(1);
+
+      await waitForBricksLoaded(
+        this.streamingManager,
+        this.camera,
+        this.canvas,
+      );
+
+      const onProgress = opts?.onProgress;
+      const dataset = await captureSplatDataset(
+        this.device,
+        this.renderer,
+        this.camera,
+        this.dataProvider,
+        this.config,
+        this.transferFunction,
+        {
+          viewCount: opts?.viewCount ?? 48,
+          settleFrames: opts?.settleFrames ?? 8,
+          includeInitPly: true,
+          initLod: opts?.initLod,
+          maxSplats: opts?.maxSplats ?? 150_000,
+          maxInitBricks: 64,
+          onProgress: (f, label) => onProgress?.(f * 0.55, label),
+          streaming: this.streamingManager,
+          canvas: this.canvas,
+          present: () => this.context.getCurrentTexture().createView(),
+        },
+      );
+      return trainWithBrushOrPackage(dataset, this.device, {
+        maxBatches: opts?.maxBatches ?? 60,
+        onProgress: (f, label) => onProgress?.(0.55 + f * 0.45, label),
+      });
+    } finally {
+      this.canvas.width = savedCanvasW;
+      this.canvas.height = savedCanvasH;
+      this.renderer.resize(savedCanvasW, savedCanvasH);
+      this.renderer.prepareScale(1);
+      this.renderer.activateScale(1);
+      this.setPaused(false);
+      this.dirty = true;
+    }
+  }
+
   private resize(): void {
     const maxDim = this.device.limits.maxTextureDimension2D;
     const width = Math.max(1, Math.min(this.canvas.clientWidth, maxDim));
@@ -600,17 +701,16 @@ export class KilnViewer {
       this.canvas.width = width;
       this.canvas.height = height;
       this.renderer.resize(width, height);
-      this.renderer.prepareScale(this.userRenderScale);
+      this.renderer.prepareScale(1);
       this.dirty = true;
     }
   }
 
   private frame(): void {
     if (this.disposed) return;
-
-    if (this.renderer.renderScale !== this.userRenderScale) {
-      this.renderer.activateScale(this.userRenderScale);
-      this.dirty = true;
+    if (this.paused) {
+      this.rafHandle = requestAnimationFrame(() => this.frame());
+      return;
     }
 
     if (this.camera.version !== this.lastCameraVersion) {

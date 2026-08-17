@@ -1,5 +1,5 @@
 /**
- * Local Zarr file picker and loader
+ * Local Zarr / Imaris file picker and loader (File System Access API).
  */
 
 import {
@@ -10,6 +10,10 @@ import {
   storeHandle,
 } from "./handle-storage.js";
 
+export type FsReadPermission = "granted" | "denied" | "prompt";
+
+type FsHandle = FileSystemDirectoryHandle | FileSystemFileHandle;
+
 export function isFileSystemAccessSupported(): boolean {
   return "showDirectoryPicker" in window;
 }
@@ -19,7 +23,13 @@ export async function promptForZarrDirectory(): Promise<FileSystemDirectoryHandl
     throw new Error("File System Access API not supported");
   }
 
-  const dirHandle = await (window as any).showDirectoryPicker({
+  const dirHandle = await (
+    window as unknown as {
+      showDirectoryPicker: (opts: {
+        mode?: string;
+      }) => Promise<FileSystemDirectoryHandle>;
+    }
+  ).showDirectoryPicker({
     mode: "read",
   });
 
@@ -56,12 +66,54 @@ export async function promptForImsFile(): Promise<FileSystemFileHandle> {
   return handle;
 }
 
+/** Query current read permission — does not require a user gesture. */
+export async function queryReadPermission(
+  handle: FsHandle,
+): Promise<FsReadPermission> {
+  try {
+    const status = await (
+      handle as unknown as {
+        queryPermission: (opts: { mode: string }) => Promise<string>;
+      }
+    ).queryPermission({ mode: "read" });
+    if (status === "granted" || status === "denied" || status === "prompt") {
+      return status;
+    }
+    return "prompt";
+  } catch {
+    return "denied";
+  }
+}
+
+/**
+ * Request read permission. Safe to call when already granted (no gesture needed).
+ * When the state is `prompt`, this MUST run inside a user gesture (click/tap).
+ */
+export async function requestPermission(handle: FsHandle): Promise<boolean> {
+  const current = await queryReadPermission(handle);
+  if (current === "granted") return true;
+  if (current === "denied") return false;
+  try {
+    const permission = await (
+      handle as unknown as {
+        requestPermission: (opts: { mode: string }) => Promise<string>;
+      }
+    ).requestPermission({ mode: "read" });
+    return permission === "granted";
+  } catch (err) {
+    // Common without a user activation: "User activation is required…"
+    console.warn("[Kiln] requestPermission failed:", err);
+    return false;
+  }
+}
+
 export async function getStoredHandle(): Promise<FileSystemDirectoryHandle | null> {
   const handle = await getHandle();
   if (!handle) return null;
 
   try {
-    await (handle as any).queryPermission({ mode: "read" });
+    // Touch the handle so invalid/stale IndexedDB entries are dropped.
+    await queryReadPermission(handle);
     return handle;
   } catch {
     await clearHandle();
@@ -74,17 +126,10 @@ export async function getStoredImsHandle(): Promise<FileSystemFileHandle | null>
   if (!handle) return null;
 
   try {
-    await (handle as any).queryPermission({ mode: "read" });
+    await queryReadPermission(handle);
     return handle;
   } catch {
     await clearHandle();
     return null;
   }
-}
-
-export async function requestPermission(
-  handle: FileSystemDirectoryHandle | FileSystemFileHandle,
-): Promise<boolean> {
-  const permission = await (handle as any).requestPermission({ mode: "read" });
-  return permission === "granted";
 }

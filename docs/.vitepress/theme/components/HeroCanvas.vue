@@ -44,7 +44,6 @@ onMounted(async () => {
         upAxis: '-y',
         cam: [0.07, 2.89, 1.328, -0.059, -0.008, -0.003],
         densityScale: 0.3,
-        renderScale: 0.75,
       },
     );
   } catch (e) {

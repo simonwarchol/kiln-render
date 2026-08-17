@@ -29,14 +29,29 @@ const viewer = await KilnViewer.create(canvas, new LocalZarrDataProvider(handle)
 
 ## Restoring a handle across page loads
 
-Handles are persisted in IndexedDB automatically when `promptForZarrDirectory()` is called. On subsequent visits:
+Handles are persisted in IndexedDB automatically when `promptForZarrDirectory()` is called. On subsequent visits, **permission often resets to `prompt`** and Chrome requires a user click before `requestPermission()` can succeed:
 
 ```typescript
+import {
+  getStoredHandle,
+  queryReadPermission,
+  requestPermission,
+} from 'kiln-render';
+
 const handle = await getStoredHandle();
-if (handle && await requestPermission(handle)) {
-  const viewer = await KilnViewer.create(canvas, new LocalZarrDataProvider(handle));
+if (handle) {
+  let ok = (await queryReadPermission(handle)) === 'granted';
+  if (!ok) {
+    // Must run inside a click/tap handler:
+    document.querySelector('#reconnect')!.addEventListener('click', async () => {
+      ok = await requestPermission(handle);
+      if (ok) { /* create LocalZarrDataProvider(handle) */ }
+    });
+  }
 }
 ```
+
+The basic-viewer shows an **Allow access** dialog automatically when `?local=true` / `?local=ims` needs re-authorization after a reload.
 
 To clear the stored handle:
 

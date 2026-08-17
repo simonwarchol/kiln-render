@@ -26,14 +26,14 @@ import { StatsPanel } from "../../../shared/stats-panel.js";
 /** Only 'dvr' | 'mip' | 'slice' are selectable via the Mode segmented control. */
 type BaseRenderMode = "dvr" | "mip" | "slice";
 
-// Default channel colors matching renderer defaults
+// Default channel colors matching renderer defaults (RGB primaries, then secondaries)
 const CHANNEL_COLOR_DEFAULTS = [
-  { r: 0, g: 0, b: 255 }, // ch0: blue
-  { r: 255, g: 255, b: 0 }, // ch1: yellow
-  { r: 255, g: 0, b: 0 }, // ch2: red
-  { r: 255, g: 255, b: 255 }, // ch3: white
-  { r: 0, g: 255, b: 255 }, // ch4: cyan
-  { r: 255, g: 0, b: 255 }, // ch5: magenta
+  { r: 255, g: 0, b: 0 }, // ch0: red
+  { r: 0, g: 255, b: 0 }, // ch1: green
+  { r: 0, g: 0, b: 255 }, // ch2: blue
+  { r: 0, g: 255, b: 255 }, // ch3: cyan
+  { r: 255, g: 0, b: 255 }, // ch4: magenta
+  { r: 255, g: 255, b: 0 }, // ch5: yellow
 ];
 
 export interface ChannelState {
@@ -42,8 +42,93 @@ export interface ChannelState {
   b: number; // 0-255
   a: number; // 0-1
   visible: boolean;
-  min: number; // 0-1 normalized
-  max: number; // 0-1 normalized
+  /** Window low — normalized 0–1 (share URL / renderer space) */
+  min: number;
+  /** Window high — normalized 0–1 (share URL / renderer space) */
+  max: number;
+}
+
+/** Per-channel display level in data units + the slider's full data span. */
+interface ChannelLevel {
+  /** Selected window low (data space) */
+  start: number;
+  /** Selected window high (data space) */
+  end: number;
+  /** Full data range low (slider min) */
+  dataMin: number;
+  /** Full data range high (slider max) */
+  dataMax: number;
+}
+
+function formatChannelValue(v: number, isFloat: boolean): string {
+  if (!isFloat) return String(Math.round(v));
+  const a = Math.abs(v);
+  if (a >= 100) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(2);
+  if (a === 0) return "0";
+  return v.toPrecision(3);
+}
+
+function channelStep(
+  dataMin: number,
+  dataMax: number,
+  isFloat: boolean,
+): number {
+  if (!isFloat) return 1;
+  const span = Math.max(1e-12, dataMax - dataMin);
+  return span / 1000;
+}
+
+function toNormalizedWindow(
+  start: number,
+  end: number,
+  dataMin: number,
+  dataMax: number,
+): { center: number; width: number; min: number; max: number } {
+  const range = Math.max(1e-12, dataMax - dataMin);
+  const min = Math.max(0, Math.min(1, (start - dataMin) / range));
+  const max = Math.max(0, Math.min(1, (end - dataMin) / range));
+  return {
+    min,
+    max,
+    center: (min + max) / 2,
+    width: Math.max(0.001, max - min),
+  };
+}
+
+function fromNormalizedWindow(
+  minN: number,
+  maxN: number,
+  dataMin: number,
+  dataMax: number,
+): { start: number; end: number } {
+  const range = dataMax - dataMin;
+  return {
+    start: dataMin + minN * range,
+    end: dataMin + maxN * range,
+  };
+}
+
+/** Resolve the full slider span for a channel from metadata. */
+function resolveChannelDataBounds(
+  metadata: VolumeMetadata,
+  channelIndex: number,
+): { dataMin: number; dataMax: number; start: number; end: number } {
+  const w = metadata.channelWindows?.[channelIndex];
+  if (w && w.max > w.min) {
+    return {
+      dataMin: w.min,
+      dataMax: w.max,
+      start: w.start,
+      end: w.end,
+    };
+  }
+  if (metadata.isFloat && metadata.dataRange) {
+    const [dataMin, dataMax] = metadata.dataRange;
+    return { dataMin, dataMax, start: dataMin, end: dataMax };
+  }
+  const dataMax = metadata.bitDepth === 16 ? 65535 : 255;
+  return { dataMin: 0, dataMax, start: 0, end: dataMax };
 }
 
 interface ChannelWidgets {
@@ -62,7 +147,6 @@ export class MultichannelUI {
   private params = {
     upAxis: "-y" as UpAxis,
     renderMode: "dvr" as BaseRenderMode,
-    renderScale: 0.5,
     /** Manual Data LOD override (toggle off = Auto SSE) */
     dataLodManual: false,
     dataLod: 0,
@@ -80,9 +164,10 @@ export class MultichannelUI {
   private channelParams: Array<{
     color: { r: number; g: number; b: number; a: number };
     visible: boolean;
-    level: { min: number; max: number };
+    level: ChannelLevel;
   }> = [];
   private channelWidgets: ChannelWidgets[] = [];
+  private readonly isFloat: boolean;
 
   private initialSlice?: {
     x: number;
@@ -106,7 +191,6 @@ export class MultichannelUI {
   private upAxisSelect!: ReturnType<typeof createSelect>;
   private wireframeToggle!: ReturnType<typeof createToggle>;
   private axesToggle!: ReturnType<typeof createToggle>;
-  private renderScaleSlider!: ReturnType<typeof createSlider>;
   private dataLodSlider!: ReturnType<typeof createSlider>;
 
   constructor(
@@ -124,6 +208,7 @@ export class MultichannelUI {
     this.viewer = viewer;
     this.renderer = viewer.renderer;
     this.camera = viewer.camera;
+    this.isFloat = viewer.metadata.isFloat ?? false;
 
     // Sync initial values
     this.initialSlice = initialSlice;
@@ -134,7 +219,6 @@ export class MultichannelUI {
     }
     this.params.showWireframe = this.renderer.showWireframe;
     this.params.showAxis = this.renderer.showAxis;
-    this.params.renderScale = this.renderer.renderScale;
     const initialForced = this.viewer.forcedLod;
     this.params.dataLodManual = initialForced !== null;
     this.params.dataLod = initialForced ?? this.viewer.finestStreamLod;
@@ -145,11 +229,23 @@ export class MultichannelUI {
     }
     for (let i = 0; i < this.renderer.numChannels; i++) {
       const restored = initialChannels?.[i];
+      const bounds = resolveChannelDataBounds(viewer.metadata, i);
       if (restored) {
+        const { start, end } = fromNormalizedWindow(
+          restored.min,
+          restored.max,
+          bounds.dataMin,
+          bounds.dataMax,
+        );
         this.channelParams.push({
           color: { r: restored.r, g: restored.g, b: restored.b, a: restored.a },
           visible: restored.visible,
-          level: { min: restored.min, max: restored.max },
+          level: {
+            start,
+            end,
+            dataMin: bounds.dataMin,
+            dataMax: bounds.dataMax,
+          },
         });
         this.renderer.setChannelColor(
           i,
@@ -158,11 +254,13 @@ export class MultichannelUI {
           restored.b / 255,
           restored.visible ? restored.a : 0,
         );
-        this.renderer.setChannelWindow(
-          i,
-          (restored.min + restored.max) / 2,
-          Math.max(0.001, restored.max - restored.min),
+        const win = toNormalizedWindow(
+          start,
+          end,
+          bounds.dataMin,
+          bounds.dataMax,
         );
+        this.renderer.setChannelWindow(i, win.center, win.width);
         this.viewer.streamingManager.setChannelEnabled(i, restored.visible);
       } else {
         const defaults = CHANNEL_COLOR_DEFAULTS[i] ?? {
@@ -171,14 +269,6 @@ export class MultichannelUI {
           b: 255,
         };
         const base = i * 4;
-        let min = 0,
-          max = 1;
-        const w = viewer.metadata.channelWindows?.[i];
-        if (w && w.max > w.min) {
-          const range = w.max - w.min;
-          min = Math.max(0, Math.min(1, (w.start - w.min) / range));
-          max = Math.max(0, Math.min(1, (w.end - w.min) / range));
-        }
         this.channelParams.push({
           color: {
             r: Math.round(
@@ -193,13 +283,20 @@ export class MultichannelUI {
             a: this.renderer.channelColors[base + 3] ?? 1.0,
           },
           visible: true,
-          level: { min, max },
+          level: {
+            start: bounds.start,
+            end: bounds.end,
+            dataMin: bounds.dataMin,
+            dataMax: bounds.dataMax,
+          },
         });
-        this.renderer.setChannelWindow(
-          i,
-          (min + max) / 2,
-          Math.max(0.001, max - min),
+        const win = toNormalizedWindow(
+          bounds.start,
+          bounds.end,
+          bounds.dataMin,
+          bounds.dataMax,
         );
+        this.renderer.setChannelWindow(i, win.center, win.width);
       }
     }
 
@@ -311,20 +408,49 @@ export class MultichannelUI {
     );
     body.appendChild(advancedEl);
 
-    this.renderScaleSlider = createSlider({
-      label: "Render Scale",
-      min: 0.25,
-      max: 1.0,
-      step: 0.25,
-      value: this.params.renderScale,
-      format: (v) => v.toFixed(2),
-      onChange: (v) => {
-        this.viewer.renderScale = v;
-      },
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.className = "ctl-btn";
+    exportBtn.textContent = "Export Gaussian Splat";
+    exportBtn.title =
+      "Orbit-capture this render, train Gaussians with Brush, preview the trained PLY";
+    exportBtn.addEventListener("click", () => {
+      void this.runSplatExport(exportBtn);
     });
-    advancedBody.appendChild(this.renderScaleSlider.el);
+    advancedBody.appendChild(exportBtn);
 
     this.updateVisibility();
+  }
+
+  private async runSplatExport(btn: HTMLButtonElement): Promise<void> {
+    const prev = btn.textContent;
+    btn.disabled = true;
+    try {
+      const { handoffToSuperSplat } = await import("kiln-render");
+      const outcome = await this.viewer.exportGaussianSplat({
+        onProgress: (_f, label) => {
+          btn.textContent = label;
+        },
+      });
+      await handoffToSuperSplat(outcome);
+      if (outcome.kind === "dataset-only") {
+        console.info("[Kiln]", outcome.reason);
+        btn.textContent = "Dataset saved — train in Brush";
+      } else {
+        btn.textContent = "Export done — trained splat open";
+      }
+      setTimeout(() => {
+        btn.textContent = prev;
+      }, 2500);
+    } catch (err) {
+      console.error("[Kiln] splat export failed", err);
+      btn.textContent = "Export failed";
+      setTimeout(() => {
+        btn.textContent = prev;
+      }, 2500);
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   private buildChannelRack(): void {
@@ -384,23 +510,29 @@ export class MultichannelUI {
       row.appendChild(name);
       row.appendChild(toggle.el);
 
-      // No per-channel "Level" label — the strip layout makes it obvious, and
-      // repeating the word four times was pure noise.
+      // Per-channel level in data units (full channel / dtype range on the track).
       const level = createRangeSlider({
         label: "",
-        min: 0,
-        max: 1,
-        step: 0.01,
-        valueMin: chParam.level.min,
-        valueMax: chParam.level.max,
-        onChange: (min, max) => {
-          chParam.level.min = min;
-          chParam.level.max = max;
-          this.renderer.setChannelWindow(
-            ch,
-            (min + max) / 2,
-            Math.max(0.001, max - min),
+        min: chParam.level.dataMin,
+        max: chParam.level.dataMax,
+        step: channelStep(
+          chParam.level.dataMin,
+          chParam.level.dataMax,
+          this.isFloat,
+        ),
+        valueMin: chParam.level.start,
+        valueMax: chParam.level.end,
+        format: (v) => formatChannelValue(v, this.isFloat),
+        onChange: (start, end) => {
+          chParam.level.start = start;
+          chParam.level.end = end;
+          const win = toNormalizedWindow(
+            start,
+            end,
+            chParam.level.dataMin,
+            chParam.level.dataMax,
           );
+          this.renderer.setChannelWindow(ch, win.center, win.width);
         },
       });
       level.el.classList.add("ctl-channel-level");
@@ -498,41 +630,66 @@ export class MultichannelUI {
   /**
    * Re-read per-channel window/level from metadata and update the UI sliders.
    * Called when ranges are derived after base LOD loading.
+   * Slider tracks use each channel's full data min/max; thumbs use start/end.
    */
   refreshChannelWindows(): void {
-    // Don't clobber URL-restored channel windows with auto-leveled values
-    if (this.channelsRestoredFromURL) return;
-
     const windows = this.viewer.metadata.channelWindows;
     if (!windows) return;
 
     for (let i = 0; i < this.channelParams.length; i++) {
       const w = windows[i];
       if (!w || w.max <= w.min) continue;
-      const range = w.max - w.min;
-      const min = Math.max(0, Math.min(1, (w.start - w.min) / range));
-      const max = Math.max(0, Math.min(1, (w.end - w.min) / range));
-      this.channelParams[i]!.level.min = min;
-      this.channelParams[i]!.level.max = max;
-      this.renderer.setChannelWindow(
-        i,
-        (min + max) / 2,
-        Math.max(0.001, max - min),
-      );
-      this.channelWidgets[i]?.level.setValue(min, max);
+      const chParam = this.channelParams[i]!;
+
+      let start = w.start;
+      let end = w.end;
+      // Keep share-URL window as a fraction of the (possibly updated) data span.
+      if (this.channelsRestoredFromURL) {
+        const n = toNormalizedWindow(
+          chParam.level.start,
+          chParam.level.end,
+          chParam.level.dataMin,
+          chParam.level.dataMax,
+        );
+        const mapped = fromNormalizedWindow(n.min, n.max, w.min, w.max);
+        start = mapped.start;
+        end = mapped.end;
+      }
+
+      chParam.level = {
+        dataMin: w.min,
+        dataMax: w.max,
+        start,
+        end,
+      };
+      const win = toNormalizedWindow(start, end, w.min, w.max);
+      this.renderer.setChannelWindow(i, win.center, win.width);
+      const widget = this.channelWidgets[i]?.level;
+      if (widget) {
+        widget.setBounds(w.min, w.max, channelStep(w.min, w.max, this.isFloat));
+        widget.setValue(start, end);
+      }
     }
   }
 
   getChannelState(): ChannelState[] {
-    return this.channelParams.map((ch) => ({
-      r: ch.color.r,
-      g: ch.color.g,
-      b: ch.color.b,
-      a: ch.color.a,
-      visible: ch.visible,
-      min: ch.level.min,
-      max: ch.level.max,
-    }));
+    return this.channelParams.map((ch) => {
+      const n = toNormalizedWindow(
+        ch.level.start,
+        ch.level.end,
+        ch.level.dataMin,
+        ch.level.dataMax,
+      );
+      return {
+        r: ch.color.r,
+        g: ch.color.g,
+        b: ch.color.b,
+        a: ch.color.a,
+        visible: ch.visible,
+        min: n.min,
+        max: n.max,
+      };
+    });
   }
 
   getSliceState(): {

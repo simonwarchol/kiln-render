@@ -2,20 +2,28 @@
  * Transfer function - maps density to RGBA color
  */
 
-export type TFPreset = 'grayscale' | 'grayscale-inverted' | 'hot' | 'cool' | 'viridis' | 'plasma' | 'coolwarm' | 'seismic';
+export type TFPreset =
+  | "grayscale"
+  | "grayscale-inverted"
+  | "hot"
+  | "cool"
+  | "viridis"
+  | "plasma"
+  | "coolwarm"
+  | "seismic";
 
 export interface OpacityPoint {
-  x: number;  // 0-1 density
-  y: number;  // 0-1 opacity
+  x: number; // 0-1 density
+  y: number; // 0-1 opacity
 }
 
 export class TransferFunction {
   private device: GPUDevice;
   private size = 256;
   texture: GPUTexture;
-  private colorData: Uint8Array;  // RGB only, no alpha
+  private colorData: Uint8Array; // RGB only, no alpha
   private opacityPoints: OpacityPoint[];
-  preset: TFPreset = 'grayscale';
+  preset: TFPreset = "grayscale";
 
   private histogram: Uint32Array | null = null;
 
@@ -26,19 +34,19 @@ export class TransferFunction {
     this.opacityPoints = [
       { x: 0.0, y: 0.0 },
       { x: 0.25, y: 0.0 },
-      { x: 1.0, y: 1.0 }
+      { x: 1.0, y: 1.0 },
     ];
 
     // Use 2D texture (256x1) instead of 1D for Safari compatibility
     // Safari doesn't support textureSampleLevel on 1D textures in compute shaders
     this.texture = device.createTexture({
       size: [this.size, 1],
-      format: 'rgba8unorm',
-      dimension: '2d',
+      format: "rgba8unorm",
+      dimension: "2d",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
 
-    this.setPreset('grayscale');
+    this.setPreset("grayscale");
   }
 
   setPreset(preset: TFPreset): void {
@@ -53,35 +61,39 @@ export class TransferFunction {
     }
 
     // Set preset-specific opacity curves
-    if (preset === 'seismic') {
+    if (preset === "seismic") {
       // Seismic: transparent in the middle (noise), opaque only at extreme reflections
       // Wide transparent band around 0.5 to eliminate noise, only show strongest peaks
       this.opacityPoints = [
-        { x: 0.0, y: 0.8 },   // Strong negative - high opacity
-        { x: 0.1, y: 0.2 },   // Moderate negative - low opacity
-        { x: 0.25, y: 0.0 },  // Weak negative - transparent
-        { x: 0.5, y: 0.0 },   // Zero amplitude - fully transparent
-        { x: 0.75, y: 0.0 },  // Weak positive - transparent
-        { x: 0.9, y: 0.2 },   // Moderate positive - low opacity
-        { x: 1.0, y: 0.8 },   // Strong positive - high opacity
+        { x: 0.0, y: 0.8 }, // Strong negative - high opacity
+        { x: 0.1, y: 0.2 }, // Moderate negative - low opacity
+        { x: 0.25, y: 0.0 }, // Weak negative - transparent
+        { x: 0.5, y: 0.0 }, // Zero amplitude - fully transparent
+        { x: 0.75, y: 0.0 }, // Weak positive - transparent
+        { x: 0.9, y: 0.2 }, // Moderate positive - low opacity
+        { x: 1.0, y: 0.8 }, // Strong positive - high opacity
       ];
     }
 
     this.updateTexture();
   }
 
-  private getPresetColor(preset: TFPreset, t: number): [number, number, number] {
+  private getPresetColor(
+    preset: TFPreset,
+    t: number,
+  ): [number, number, number] {
     switch (preset) {
-      case 'grayscale':
+      case "grayscale": {
         const v = Math.floor(t * 255);
         return [v, v, v];
+      }
 
-      case 'grayscale-inverted': {
+      case "grayscale-inverted": {
         const v = Math.floor((1 - t) * 255);
         return [v, v, v];
       }
 
-      case 'hot':
+      case "hot":
         // Black -> Red -> Yellow -> White
         if (t < 0.33) {
           return [Math.floor(t * 3 * 255), 0, 0];
@@ -91,67 +103,74 @@ export class TransferFunction {
           return [255, 255, Math.floor((t - 0.67) * 3 * 255)];
         }
 
-      case 'cool':
+      case "cool":
         // Cyan -> Magenta
-        return [
-          Math.floor(t * 255),
-          Math.floor((1 - t) * 255),
-          255
-        ];
+        return [Math.floor(t * 255), Math.floor((1 - t) * 255), 255];
 
-      case 'viridis':
+      case "viridis": {
         // Approximate viridis colormap
         const viridis = [
-          [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142],
-          [38, 130, 142], [31, 158, 137], [53, 183, 121], [109, 205, 89],
-          [180, 222, 44], [253, 231, 37]
+          [68, 1, 84],
+          [72, 40, 120],
+          [62, 74, 137],
+          [49, 104, 142],
+          [38, 130, 142],
+          [31, 158, 137],
+          [53, 183, 121],
+          [109, 205, 89],
+          [180, 222, 44],
+          [253, 231, 37],
         ];
         return this.interpolateColormap(viridis, t);
+      }
 
-      case 'plasma':
+      case "plasma": {
         // Approximate plasma colormap
         const plasma = [
-          [13, 8, 135], [75, 3, 161], [125, 3, 168], [168, 34, 150],
-          [203, 70, 121], [229, 107, 93], [248, 148, 65], [253, 195, 40],
-          [240, 249, 33]
+          [13, 8, 135],
+          [75, 3, 161],
+          [125, 3, 168],
+          [168, 34, 150],
+          [203, 70, 121],
+          [229, 107, 93],
+          [248, 148, 65],
+          [253, 195, 40],
+          [240, 249, 33],
         ];
         return this.interpolateColormap(plasma, t);
+      }
 
-      case 'coolwarm':
+      case "coolwarm":
         // Blue -> White -> Red
         if (t < 0.5) {
           const s = t * 2;
-          return [
-            Math.floor(s * 255),
-            Math.floor(s * 255),
-            255
-          ];
+          return [Math.floor(s * 255), Math.floor(s * 255), 255];
         } else {
           const s = (t - 0.5) * 2;
-          return [
-            255,
-            Math.floor((1 - s) * 255),
-            Math.floor((1 - s) * 255)
-          ];
+          return [255, Math.floor((1 - s) * 255), Math.floor((1 - s) * 255)];
         }
 
-      case 'seismic':
-      default:
+      case "seismic":
+      default: {
         // Seismic colormap: Cyan -> Blue -> Gray -> Orange -> Red -> Yellow
         // Diverging colormap centered at 0.5 (zero amplitude)
         const seismicColors = [
-          [0, 255, 255],     // 0.0 - Cyan (strong negative)
-          [0, 0, 255],       // 0.25 - Blue
-          [128, 128, 128],   // 0.5 - Gray (zero)
-          [255, 128, 0],     // 0.75 - Orange
-          [255, 0, 0],       // 0.875 - Red
-          [255, 255, 0],     // 1.0 - Yellow (strong positive)
+          [0, 255, 255], // 0.0 - Cyan (strong negative)
+          [0, 0, 255], // 0.25 - Blue
+          [128, 128, 128], // 0.5 - Gray (zero)
+          [255, 128, 0], // 0.75 - Orange
+          [255, 0, 0], // 0.875 - Red
+          [255, 255, 0], // 1.0 - Yellow (strong positive)
         ];
         return this.interpolateColormap(seismicColors, t);
+      }
     }
   }
 
-  private interpolateColormap(colors: number[][], t: number): [number, number, number] {
+  private interpolateColormap(
+    colors: number[][],
+    t: number,
+  ): [number, number, number] {
     const n = colors.length - 1;
     const idx = t * n;
     const i = Math.min(Math.floor(idx), n - 1);
@@ -163,7 +182,7 @@ export class TransferFunction {
     return [
       Math.floor(c0[0]! + f * (c1[0]! - c0[0]!)),
       Math.floor(c0[1]! + f * (c1[1]! - c0[1]!)),
-      Math.floor(c0[2]! + f * (c1[2]! - c0[2]!))
+      Math.floor(c0[2]! + f * (c1[2]! - c0[2]!)),
     ];
   }
 
@@ -186,15 +205,31 @@ export class TransferFunction {
     return [...this.opacityPoints];
   }
 
+  /** Sample TF colour + opacity at normalised intensity t ∈ [0, 1]. */
+  sampleRgba(t: number): [number, number, number, number] {
+    const u = Math.min(1, Math.max(0, t));
+    const i = Math.min(this.size - 1, Math.round(u * (this.size - 1)));
+    return [
+      (this.colorData[i * 3] ?? 0) / 255,
+      (this.colorData[i * 3 + 1] ?? 0) / 255,
+      (this.colorData[i * 3 + 2] ?? 0) / 255,
+      this.sampleOpacity(u),
+    ];
+  }
+
   private sampleOpacity(t: number): number {
     // Find surrounding points
     let i = 0;
-    while (i < this.opacityPoints.length - 1 && this.opacityPoints[i + 1]!.x < t) {
+    while (
+      i < this.opacityPoints.length - 1 &&
+      this.opacityPoints[i + 1]!.x < t
+    ) {
       i++;
     }
 
     const p0 = this.opacityPoints[i]!;
-    const p1 = this.opacityPoints[Math.min(i + 1, this.opacityPoints.length - 1)]!;
+    const p1 =
+      this.opacityPoints[Math.min(i + 1, this.opacityPoints.length - 1)]!;
 
     if (p0.x === p1.x) return p0.y;
 
@@ -218,7 +253,7 @@ export class TransferFunction {
       { texture: this.texture },
       data,
       { bytesPerRow: this.size * 4, rowsPerImage: 1 },
-      [this.size, 1]
+      [this.size, 1],
     );
   }
 
@@ -227,20 +262,24 @@ export class TransferFunction {
   }
 
   // Generate a canvas preview of the TF (for UI display)
-  renderPreview(canvas: HTMLCanvasElement, windowCenter?: number, windowWidth?: number): void {
-    const ctx = canvas.getContext('2d');
+  renderPreview(
+    canvas: HTMLCanvasElement,
+    windowCenter?: number,
+    windowWidth?: number,
+  ): void {
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
     const w = canvas.width;
     const h = canvas.height;
 
     // Clear
-    ctx.fillStyle = '#1a1a1a';
+    ctx.fillStyle = "#1a1a1a";
     ctx.fillRect(0, 0, w, h);
 
     // Draw checkerboard pattern
     const checkSize = 8;
-    ctx.fillStyle = '#2a2a2a';
+    ctx.fillStyle = "#2a2a2a";
     for (let y = 0; y < h; y += checkSize) {
       for (let x = 0; x < w; x += checkSize) {
         if ((Math.floor(x / checkSize) + Math.floor(y / checkSize)) % 2 === 0) {
@@ -268,7 +307,7 @@ export class TransferFunction {
     }
 
     // Draw opacity curve
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
     ctx.lineWidth = 2;
     ctx.beginPath();
     for (let x = 0; x < w; x++) {
@@ -284,20 +323,26 @@ export class TransferFunction {
     ctx.stroke();
 
     // Draw control points
-    ctx.fillStyle = '#fff';
+    ctx.fillStyle = "#fff";
     for (const point of this.opacityPoints) {
       const x = point.x * w;
       const y = h - point.y * h;
       ctx.beginPath();
       ctx.arc(x, y, 5, 0, Math.PI * 2);
       ctx.fill();
-      ctx.strokeStyle = '#000';
+      ctx.strokeStyle = "#000";
       ctx.lineWidth = 1;
       ctx.stroke();
     }
   }
 
-  private renderHistogram(ctx: CanvasRenderingContext2D, w: number, h: number, windowCenter?: number, windowWidth?: number): void {
+  private renderHistogram(
+    ctx: CanvasRenderingContext2D,
+    w: number,
+    h: number,
+    windowCenter?: number,
+    windowWidth?: number,
+  ): void {
     if (!this.histogram) return;
 
     // Calculate zoom/pan for windowed view
@@ -336,7 +381,7 @@ export class TransferFunction {
       const barHeight = normalizedHeight * h * 0.9;
 
       // Darker bars for data (blends with TF background)
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+      ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
       ctx.fillRect(x, h - barHeight, Math.max(1, barWidth), barHeight);
     }
 

@@ -1,12 +1,14 @@
-import { resolve } from "path";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
+
+const srcDir = fileURLToPath(new URL("./src", import.meta.url));
 
 export default defineConfig({
   // Don't copy public/ assets into the library output
   publicDir: false,
   build: {
     lib: {
-      entry: resolve(__dirname, "src/index.ts"),
+      entry: fileURLToPath(new URL("./src/index.ts", import.meta.url)),
       formats: ["es"],
       fileName: () => "kiln-render.js",
     },
@@ -18,6 +20,8 @@ export default defineConfig({
     // No externals: wgpu-matrix, zarrita, fflate, h5wasm are implementation
     // details that consumers should not need to install separately
     rollupOptions: {
+      // Optional peers — splat preview (playcanvas) and Brush training (brush-js).
+      external: ["playcanvas", "brush-js"],
       output: {
         // Keep all chunks in lib/ root — avoids Vite emitting duplicate
         // copies in lib/assets/ alongside the canonical lib/ versions
@@ -38,7 +42,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      "@kiln": resolve(__dirname, "src"),
+      "@kiln": srcDir,
     },
   },
 });

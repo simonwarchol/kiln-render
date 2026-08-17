@@ -27,12 +27,14 @@ export {
   preValidateRemoteIms,
   probeRemoteIms,
 } from "./data/imaris-validator.js";
+export type { FsReadPermission } from "./data/local-loader.js";
 // Local file loader utilities (File System Access API)
 export {
   getStoredHandle,
   getStoredImsHandle,
   promptForImsFile,
   promptForZarrDirectory,
+  queryReadPermission,
   requestPermission,
 } from "./data/local-loader.js";
 // Built-in providers
@@ -46,6 +48,24 @@ export {
   probeLocalZarr,
   probeRemoteZarr,
 } from "./data/zarr-validator.js";
+export type {
+  BrushTrainOutcome,
+  GaussianSplat,
+  OpenSplatViewerOptions,
+  SplatCaptureOptions,
+  SplatDatasetResult,
+} from "./export/index.js";
+// Gaussian splat export (Brush / SuperSplat pipeline)
+export {
+  BRUSH_DEMO_URL,
+  downloadBytes,
+  handoffToSuperSplat,
+  openBrushDemo,
+  openEmbeddedSplatViewer,
+  presentSplatPly,
+  SUPERSPLAT_EDITOR_URL,
+  writeGaussianPly,
+} from "./export/index.js";
 export type { ViewerOptions, ViewerState } from "./viewer.js";
 // Viewer
 export { KilnViewer } from "./viewer.js";

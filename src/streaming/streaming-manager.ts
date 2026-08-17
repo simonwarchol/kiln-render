@@ -185,7 +185,7 @@ export class StreamingManager {
   private projectionFactor = 0;
 
   // Max bricks to request at once (prevents runaway loading)
-  private maxDesiredBricks = 256;
+  private maxDesiredBricks = 1024;
 
   // Suspends load-queue draining when atlas is full; retries on next computeDesiredSet.
   private allocationStalled = false;
