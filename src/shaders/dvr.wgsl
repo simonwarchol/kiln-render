@@ -52,7 +52,7 @@ fn rayMarchDVR(
 
     for (var brickIter = 0u; brickIter < MAX_BRICK_TRAVERSALS; brickIter++) {
         if (t >= tEnd) { break; }
-        if (alpha > EARLY_EXIT_ALPHA) { break; }
+        if (alpha > uniforms.earlyExitAlpha) { break; }
 
         let brick = setupBrick(rayOrigin, rayDir, invDir, t, tEnd, normalizedSize, datasetSize);
 
@@ -105,7 +105,7 @@ fn rayMarchDVR(
                 composeSampleWindowed(density, extinctionScale, windowCenter, windowWidth, &color, &alpha);
             }
 
-            if (alpha > EARLY_EXIT_ALPHA) { break; }
+            if (alpha > uniforms.earlyExitAlpha) { break; }
             tSample += brick.stepSize;
         }
 

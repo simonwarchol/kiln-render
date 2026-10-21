@@ -769,3 +769,120 @@
     padding: 12px;
   }
 }
+
+/* --- Splats panel --- */
+
+.splat-panel-container {
+  position: fixed;
+  right: 8px;
+  top: 44px;
+  z-index: 1000;
+}
+
+.splat-progress {
+  height: 4px;
+  margin-top: 8px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.splat-progress-bar {
+  width: 0%;
+  height: 100%;
+  background: #4f8cff;
+  transition: width 0.2s ease;
+}
+
+.splat-status {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-dim, rgba(220, 220, 228, 0.7));
+  word-break: break-word;
+}
+
+.splat-file-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.splat-file-row .ctl-btn {
+  text-align: center;
+}
+
+/* --- Channel picker --- */
+
+.channel-picker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 2px 0 6px;
+  font-size: 11px;
+  color: var(--text-dim, rgba(220, 220, 228, 0.7));
+}
+
+.channel-picker-row .ctl-btn {
+  width: auto;
+  margin: 0;
+  padding: 3px 8px;
+}
+
+.channel-picker-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.channel-picker-dialog {
+  width: min(420px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+  padding: 14px 16px;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: #1d1e22;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.channel-picker-dialog h3 {
+  margin: 0 0 4px;
+  font-size: 13px;
+}
+
+.channel-picker-dialog p {
+  margin: 0 0 10px;
+  color: var(--text-dim, rgba(220, 220, 228, 0.7));
+}
+
+.channel-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.channel-picker-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.channel-picker-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.channel-picker-actions .ctl-btn {
+  width: auto;
+  margin: 0;
+}

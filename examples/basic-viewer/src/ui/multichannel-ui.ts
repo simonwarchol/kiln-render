@@ -350,6 +350,7 @@ export class MultichannelUI {
     body.appendChild(this.modeControl.el);
 
     this.mountLodControls(body);
+    this.mountDensityControl(body);
 
     this.modeSwap = createSwapRegion();
     body.appendChild(this.modeSwap.el);
@@ -401,56 +402,7 @@ export class MultichannelUI {
     });
     sceneSection.appendChild(this.axesToggle.el);
 
-    // --- Advanced (collapsed by default) ---
-    const { el: advancedEl, body: advancedBody } = createCollapsible(
-      "Advanced",
-      false,
-    );
-    body.appendChild(advancedEl);
-
-    const exportBtn = document.createElement("button");
-    exportBtn.type = "button";
-    exportBtn.className = "ctl-btn";
-    exportBtn.textContent = "Export Gaussian Splat";
-    exportBtn.title =
-      "Orbit-capture this render, train Gaussians with Brush, preview the trained PLY";
-    exportBtn.addEventListener("click", () => {
-      void this.runSplatExport(exportBtn);
-    });
-    advancedBody.appendChild(exportBtn);
-
     this.updateVisibility();
-  }
-
-  private async runSplatExport(btn: HTMLButtonElement): Promise<void> {
-    const prev = btn.textContent;
-    btn.disabled = true;
-    try {
-      const { handoffToSuperSplat } = await import("kiln-render");
-      const outcome = await this.viewer.exportGaussianSplat({
-        onProgress: (_f, label) => {
-          btn.textContent = label;
-        },
-      });
-      await handoffToSuperSplat(outcome);
-      if (outcome.kind === "dataset-only") {
-        console.info("[Kiln]", outcome.reason);
-        btn.textContent = "Dataset saved — train in Brush";
-      } else {
-        btn.textContent = "Export done — trained splat open";
-      }
-      setTimeout(() => {
-        btn.textContent = prev;
-      }, 2500);
-    } catch (err) {
-      console.error("[Kiln] splat export failed", err);
-      btn.textContent = "Export failed";
-      setTimeout(() => {
-        btn.textContent = prev;
-      }, 2500);
-    } finally {
-      btn.disabled = false;
-    }
   }
 
   private buildChannelRack(): void {
@@ -502,7 +454,8 @@ export class MultichannelUI {
 
       const name = document.createElement("span");
       name.className = "ctl-channel-name";
-      name.textContent = `Channel ${ch}`;
+      name.textContent =
+        this.viewer.metadata.channelNames?.[ch] ?? `Channel ${ch}`;
 
       // Identity (swatch + name) reads left-to-right; the visibility toggle
       // right-aligns with every other control in the panel grid.
@@ -713,6 +666,30 @@ export class MultichannelUI {
   recordFrame(): void {
     this.stats.recordFrame();
     this.syncAutoLod();
+  }
+
+  /** Exponential density slider: 0.01 … 2 (DVR extinction scale). */
+  private mountDensityControl(parent: HTMLElement): void {
+    const toSlider = (d: number) => Math.log(d / 0.01) / Math.log(200);
+    const fromSlider = (v: number) => 0.01 * 200 ** v;
+    const slider = createSlider({
+      label: "Density",
+      min: 0,
+      max: 1,
+      step: 0.001,
+      value: toSlider(Math.max(0.01, Math.min(2, this.renderer.densityScale))),
+      format: (v) => fromSlider(v).toFixed(fromSlider(v) < 0.1 ? 3 : 2),
+      onChange: (v) => {
+        this.renderer.densityScale = fromSlider(v);
+        this.renderer.resetAccumulation();
+      },
+    });
+    parent.appendChild(slider.el);
+  }
+
+  /** Insert an element (e.g. a channel picker) above the channel rack. */
+  addChannelHeader(el: HTMLElement): void {
+    this.channelRackEl.prepend(el);
   }
 
   private mountLodControls(parent: HTMLElement): void {

@@ -17,7 +17,7 @@ export default defineConfig({
     target: "esnext",
     // Don't minify — consumers' bundlers handle that
     minify: false,
-    // No externals: wgpu-matrix, zarrita, fflate, h5wasm are implementation
+    // No externals: wgpu-matrix, zarrita, fflate are implementation
     // details that consumers should not need to install separately
     rollupOptions: {
       // Optional peers — splat preview (playcanvas) and Brush training (brush-js).

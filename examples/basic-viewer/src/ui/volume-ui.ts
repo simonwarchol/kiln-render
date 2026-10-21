@@ -335,48 +335,6 @@ export class VolumeUI {
       },
     });
     advancedBody.appendChild(this.indirectionToggle.el);
-
-    const exportBtn = document.createElement("button");
-    exportBtn.type = "button";
-    exportBtn.className = "ctl-btn";
-    exportBtn.textContent = "Export Gaussian Splat";
-    exportBtn.title =
-      "Orbit-capture this render, train Gaussians with Brush, preview the trained PLY";
-    exportBtn.addEventListener("click", () => {
-      void this.runSplatExport(exportBtn);
-    });
-    advancedBody.appendChild(exportBtn);
-  }
-
-  private async runSplatExport(btn: HTMLButtonElement): Promise<void> {
-    const prev = btn.textContent;
-    btn.disabled = true;
-    try {
-      const { handoffToSuperSplat } = await import("kiln-render");
-      const outcome = await this.viewer.exportGaussianSplat({
-        onProgress: (_f, label) => {
-          btn.textContent = label;
-        },
-      });
-      await handoffToSuperSplat(outcome);
-      if (outcome.kind === "dataset-only") {
-        console.info("[Kiln]", outcome.reason);
-        btn.textContent = "Dataset saved — train in Brush";
-      } else {
-        btn.textContent = "Export done — trained splat open";
-      }
-      setTimeout(() => {
-        btn.textContent = prev;
-      }, 2500);
-    } catch (err) {
-      console.error("[Kiln] splat export failed", err);
-      btn.textContent = "Export failed";
-      setTimeout(() => {
-        btn.textContent = prev;
-      }, 2500);
-    } finally {
-      btn.disabled = false;
-    }
   }
 
   /** Builds the persistent mode-options widgets once; updateVisibility() swaps which are shown. */

@@ -187,6 +187,7 @@ export default defineConfig({
           { text: "Compositing modes", link: "/rendering/compositing" },
           { text: "Multichannel", link: "/rendering/multichannel" },
           { text: "Resolution & TAA", link: "/rendering/resolution-taa" },
+          { text: "Gaussian splats", link: "/rendering/splats" },
         ],
       },
       {

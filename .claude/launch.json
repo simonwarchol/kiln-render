@@ -1,0 +1,24 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "kiln-dev",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "BROWSER=none exec pnpm dev --port 3000 --strictPort"
+      ],
+      "port": 3000
+    },
+    {
+      "name": "minerva-kiln-dev",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "cd ../minerva-core-ui-kiln && BROWSER=none exec pnpm dev --port 3001 --strictPort"
+      ],
+      "port": 3001,
+      "url": "https://localhost:3001"
+    }
+  ]
+}

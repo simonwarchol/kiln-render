@@ -3,7 +3,7 @@
  * Uses LRU eviction when full, tracking brick metadata for indirection cleanup.
  */
 
-import { GRID_SIZE } from '../core/config.js';
+import { GRID_SIZE } from "../core/config.js";
 
 // Slots touched within this many frames are protected from eviction.
 // Prevents thrash when atlas is under pressure — a freshly loaded brick
@@ -125,14 +125,22 @@ export class AtlasAllocator {
     return this.slotMetadata[slotIndex] ?? null;
   }
 
-  // cheap pre-dispatch check for the streaming manager's backpressure
-  hasEvictableSlot(currentFrame: number): boolean {
+  // cheap pre-dispatch check for the streaming manager's backpressure.
+  // `keepKeys` is the current desired set: bricks not in it can be evicted
+  // immediately even if they were touched this frame.
+  hasEvictableSlot(
+    currentFrame: number,
+    keepKeys?: ReadonlySet<string>,
+  ): boolean {
     if (this.freeList.length > 0) return true;
-    return this.findLRUSlot(currentFrame) !== -1;
+    return this.findLRUSlot(currentFrame, keepKeys) !== -1;
   }
 
   /** Allocate a slot, evicting the LRU slot if the atlas is full. */
-  allocate(frame: number = 0): AllocationResult | null {
+  allocate(
+    frame: number = 0,
+    keepKeys?: ReadonlySet<string>,
+  ): AllocationResult | null {
     // Try free list first
     if (this.freeList.length > 0) {
       const idx = this.freeList.pop()!;
@@ -142,12 +150,12 @@ export class AtlasAllocator {
       return {
         slot: this.indexToSlot(idx),
         slotIndex: idx,
-        evicted: null
+        evicted: null,
       };
     }
 
     // Atlas is full - find LRU slot to evict
-    const victim = this.findLRUSlot(frame);
+    const victim = this.findLRUSlot(frame, keepKeys);
     if (victim === -1) {
       // nothing evictable right now (all pinned or recently touched)
       // bricks stay desired and retry
@@ -163,33 +171,49 @@ export class AtlasAllocator {
     return {
       slot: this.indexToSlot(victim),
       slotIndex: victim,
-      evicted
+      evicted,
     };
   }
 
   /**
-   * Find the least recently used slot (skips pinned and recently-touched slots)
+   * Find an eviction victim. Bricks still in `keepKeys` are protected for
+   * MIN_EVICTION_AGE frames; bricks that left the desired set are eligible
+   * immediately so closer missing bricks can load.
    */
-  private findLRUSlot(currentFrame: number): number {
-    let oldestFrame = Infinity;
-    let victimIdx = -1;
+  private findLRUSlot(
+    currentFrame: number,
+    keepKeys?: ReadonlySet<string>,
+  ): number {
+    let droppedOldest = Infinity;
+    let droppedIdx = -1;
+    let keptOldest = Infinity;
+    let keptIdx = -1;
 
     for (let i = 0; i < this.totalSlots; i++) {
       if (this.pinned.has(i)) continue;
       if (!this.used.has(i)) continue;
 
       const frameNum = this.lastUsedFrame[i] ?? 0;
+      const kept = keepKeys
+        ? keepKeys.has(this.slotMetadata[i]?.key ?? "")
+        : true;
 
-      // Skip recently-touched slots to prevent thrash
+      if (!kept) {
+        if (frameNum < droppedOldest) {
+          droppedOldest = frameNum;
+          droppedIdx = i;
+        }
+        continue;
+      }
+
       if (currentFrame - frameNum < MIN_EVICTION_AGE) continue;
-
-      if (frameNum < oldestFrame) {
-        oldestFrame = frameNum;
-        victimIdx = i;
+      if (frameNum < keptOldest) {
+        keptOldest = frameNum;
+        keptIdx = i;
       }
     }
 
-    return victimIdx;
+    return droppedIdx !== -1 ? droppedIdx : keptIdx;
   }
 
   /**
@@ -199,7 +223,9 @@ export class AtlasAllocator {
     const idx = this.slotToIndex(slot);
 
     if (!this.used.has(idx)) {
-      console.warn(`AtlasAllocator: slot [${slot.x},${slot.y},${slot.z}] not in use`);
+      console.warn(
+        `AtlasAllocator: slot [${slot.x},${slot.y},${slot.z}] not in use`,
+      );
       return;
     }
 
@@ -258,14 +284,16 @@ export class AtlasAllocator {
    * Get all currently allocated slots
    */
   getAllocatedSlots(): AtlasSlot[] {
-    return Array.from(this.used).map(idx => this.indexToSlot(idx));
+    return Array.from(this.used).map((idx) => this.indexToSlot(idx));
   }
 
   /**
    * Convert slot coordinates to flat index
    */
   slotToIndex(slot: AtlasSlot): number {
-    return slot.x + slot.y * this.gridSize + slot.z * this.gridSize * this.gridSize;
+    return (
+      slot.x + slot.y * this.gridSize + slot.z * this.gridSize * this.gridSize
+    );
   }
 
   /**

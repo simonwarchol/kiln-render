@@ -4,18 +4,56 @@
  */
 
 import { Camera, type UpAxis } from "./core/camera.js";
-import { computeAtlasGrid, DatasetConfig } from "./core/config.js";
+import {
+  adapterMemoryHints,
+  computeAtlasGrid,
+  DatasetConfig,
+  guessAtlasBudgetBytes,
+  MIN_GRID_SIZE,
+  nextSmallerAtlasGrid,
+  PHYSICAL_BRICK_SIZE,
+  readDeviceMemoryGiB,
+} from "./core/config.js";
 import { Renderer, type VolumeRenderMode } from "./core/renderer.js";
 import { type TFPreset, TransferFunction } from "./core/transfer-function.js";
 import { detectBest16BitFormat } from "./core/volume.js";
 import { VolumeResources } from "./core/volume-resources.js";
-import type { DataProvider, VolumeMetadata } from "./data/data-provider.js";
+import type {
+  BitDepth,
+  DataProvider,
+  VolumeMetadata,
+} from "./data/data-provider.js";
 import { ImarisDataProvider } from "./data/imaris-provider.js";
 import { isRemoteIms, looksLikeImsUrl } from "./data/imaris-validator.js";
 import { ShardedDataProvider } from "./data/sharded-provider.js";
 import { ZarrDataProvider } from "./data/zarr-provider.js";
 import { isRemoteZarr } from "./data/zarr-validator.js";
+import {
+  cloudFromParams,
+  type GaussianCloud,
+  readPly,
+  writePly,
+} from "./splat/cloud.js";
+import {
+  type CapturedViews,
+  captureViews,
+  evaluateCloud,
+  fitVolume,
+  type SplatBuildHost,
+  type SplatBuildOptions,
+  trainCloud,
+} from "./splat/splat-builder.js";
+import { SplatLayer } from "./splat/splat-layer.js";
+import {
+  type Box,
+  chooseTiles,
+  mergeTileParams,
+  tileBoxes,
+} from "./splat/tiles.js";
 import { StreamingManager } from "./streaming/streaming-manager.js";
+
+/** What the canvas shows: the volume, the splats, or both side by side. */
+export type DisplayMode = "volume" | "splats" | "split";
 
 export interface ViewerOptions {
   /** Initial render mode */
@@ -30,6 +68,11 @@ export interface ViewerOptions {
   isoValue?: number;
   /** Ignored — rendering is always at full canvas resolution. */
   renderScale?: number;
+  /**
+   * Canvas pixels per CSS pixel (default 1). Pass `devicePixelRatio` for a
+   * sharp image on high-DPI screens; LOD selection follows the pixel count.
+   */
+  pixelRatio?: number;
   /** LOD screen-space error threshold in pixels */
   maxPixelError?: number;
   /**
@@ -38,8 +81,10 @@ export interface ViewerOptions {
    */
   forcedLod?: number | null;
   /**
-   * Atlas VRAM budget in bytes (default ~1.3 GiB). The grid shrinks to fit;
-   * lower it for constrained mobile GPUs, raise it to keep 660³ for many channels.
+   * Atlas VRAM budget in bytes. When omitted, Kiln buckets the adapter
+   * (fallback / small maxBufferSize or ≤4 GiB RAM / full discrete cap).
+   * The grid shrinks to fit; lower it for constrained GPUs, raise it to keep
+   * 660³ for many channels.
    */
   atlasBudgetBytes?: number;
   /** Axis-aligned clip minimum, normalised 0–1 */
@@ -98,6 +143,144 @@ export interface ViewerState {
   showAxis: boolean;
 }
 
+const ATLAS_GRID_CAP_KEY = "kiln-atlas-grid-cap";
+
+async function requestKilnDevice(adapter: GPUAdapter): Promise<GPUDevice> {
+  const limits = adapter.limits;
+  // Optional: subgroups speed up splat-training reductions; timestamp-query
+  // enables GpuProfiler.
+  const features = (
+    ["subgroups", "timestamp-query"] as GPUFeatureName[]
+  ).filter((f) => adapter.features.has(f));
+  return adapter.requestDevice({
+    requiredFeatures: features,
+    requiredLimits: {
+      maxBufferSize: limits.maxBufferSize,
+      maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize,
+      maxTextureDimension3D: limits.maxTextureDimension3D,
+      maxStorageBuffersPerShaderStage: limits.maxStorageBuffersPerShaderStage,
+      maxTextureArrayLayers: limits.maxTextureArrayLayers,
+      maxComputeWorkgroupStorageSize: limits.maxComputeWorkgroupStorageSize,
+    },
+  });
+}
+
+function readStoredAtlasGridCap(): number | undefined {
+  try {
+    const n = Number(sessionStorage.getItem(ATLAS_GRID_CAP_KEY));
+    if (Number.isInteger(n) && n >= MIN_GRID_SIZE && n <= 32) return n;
+  } catch {
+    /* private mode */
+  }
+  return undefined;
+}
+
+function storeAtlasGridCap(gridSize: number): void {
+  try {
+    sessionStorage.setItem(ATLAS_GRID_CAP_KEY, String(gridSize));
+  } catch {
+    /* private mode */
+  }
+}
+
+async function createVolumeResourcesFittingDevice(
+  adapter: GPUAdapter,
+  device: GPUDevice,
+  bitDepth: BitDepth,
+  textureFormat: GPUTextureFormat,
+  config: DatasetConfig,
+  numChannels: number,
+  startGridSize: number,
+): Promise<{
+  device: GPUDevice;
+  resources: VolumeResources;
+  gridSize: number;
+}> {
+  let gpu = device;
+  let gridSize = startGridSize;
+
+  for (;;) {
+    let lost: GPUDeviceLostInfo | undefined;
+    void gpu.lost.then((info) => {
+      lost = info;
+    });
+    try {
+      const resources = new VolumeResources(
+        gpu,
+        bitDepth,
+        textureFormat,
+        config,
+        numChannels,
+        gridSize,
+      );
+      await gpu.queue.onSubmittedWorkDone();
+      if (lost && lost.reason !== "destroyed") {
+        resources.destroy();
+        throw new Error(lost.message || "GPU device lost");
+      }
+      return { device: gpu, resources, gridSize };
+    } catch (err) {
+      const next = nextSmallerAtlasGrid(gridSize);
+      if (next === null) throw err;
+      console.warn(
+        `[Kiln] atlas ${gridSize}³ failed (${err instanceof Error ? err.message : String(err)}); retrying ${next}³`,
+      );
+      storeAtlasGridCap(next);
+      if (lost && lost.reason !== "destroyed") {
+        gpu = await requestKilnDevice(adapter);
+      }
+      gridSize = next;
+    }
+  }
+}
+
+/** Options for {@link KilnViewer.generateSplats}. */
+export interface GenerateSplatsOptions extends SplatBuildOptions {
+  /**
+   * Render mode the splats reproduce (default: the displayed one, or volume
+   * rendering for other modes). MIP builds max-blended splats.
+   */
+  renderMode?: "dvr" | "mip" | "iso";
+  /** Volume-rendering density (default: the displayed one). */
+  density?: number;
+  /** Clip box to build from, 0–1 per axis (default: the displayed one). */
+  region?: Box;
+  /**
+   * Split this many of the longest axes in two and build each tile with its
+   * own close-up views, for finer detail; `targetCount` is shared.
+   */
+  tileSplits?: number;
+  /** Called as each tile starts. */
+  onTile?: (index: number, count: number) => void;
+}
+
+/**
+ * Raw display window [start, end] within the normalisation range [lo, hi]
+ * → the renderer's centre/width (fractions of the range).
+ */
+function setChannelWindowFromRange(
+  renderer: Renderer,
+  ch: number,
+  w: { start: number; end: number },
+  lo: number,
+  hi: number,
+): void {
+  const range = hi - lo;
+  if (!(range > 0)) return;
+  const center = Math.max(0, Math.min(1, ((w.start + w.end) / 2 - lo) / range));
+  const width = Math.max(0.01, Math.min(1, (w.end - w.start) / range));
+  renderer.setChannelWindow(ch, center, width);
+}
+
+/** Viewer currently presenting to each canvas. */
+const canvasOwner = new WeakMap<HTMLCanvasElement, KilnViewer>();
+
+/**
+ * Fit density for MIP builds. MIP ignores density, but the fit derives
+ * opacity from it; this starts max-blended splats near MIP brightness.
+ */
+const MIP_FIT_DENSITY = 1;
+
 export class KilnViewer {
   readonly renderer: Renderer;
   readonly camera: Camera;
@@ -113,8 +296,17 @@ export class KilnViewer {
   /** Callback invoked when float/channel ranges are derived during base LOD loading. */
   onChannelWindowsChanged?: () => void;
 
+  /** Splat display mode (see `displayMode`). */
+  private displayMode_: DisplayMode = "volume";
+  /** Split position as a fraction of the canvas width (split mode). */
+  private splitFraction_ = 0.5;
+  private splatLayer: SplatLayer | null = null;
+  private lastSplatVersion = -1;
+  private building = false;
+
   private readonly dataProvider: DataProvider;
   private readonly context: GPUCanvasContext;
+  private readonly canvasFormat: GPUTextureFormat;
   private readonly canvas: HTMLCanvasElement;
   private readonly resizeObserver: ResizeObserver;
   private rafHandle = 0;
@@ -123,6 +315,7 @@ export class KilnViewer {
   private dirty = true;
   private lastCameraVersion = -1;
   private paused = false;
+  private pixelRatio_ = 1;
 
   private constructor(
     device: GPUDevice,
@@ -139,6 +332,11 @@ export class KilnViewer {
     this.device = device;
     this.canvas = canvas;
     this.context = context;
+    this.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    // The newest viewer on a canvas owns it: a previous one being disposed
+    // (or still finishing its create) never reconfigures it.
+    canvasOwner.set(canvas, this);
+    context.configure({ device, format: this.canvasFormat });
     this.renderer = renderer;
     this.camera = camera;
     this.transferFunction = transferFunction;
@@ -159,7 +357,7 @@ export class KilnViewer {
       ) as unknown as number;
     });
     this.resizeObserver.observe(canvas);
-    this.resize(); // Ensure correct dimensions before first frame
+    this.resize();
 
     this.rafHandle = requestAnimationFrame(() => this.frame());
   }
@@ -176,19 +374,12 @@ export class KilnViewer {
     });
     if (!adapter) throw new Error("WebGPU not supported");
 
-    const adapterLimits = adapter.limits;
-    const device = await adapter.requestDevice({
-      requiredLimits: {
-        maxBufferSize: adapterLimits.maxBufferSize,
-        maxStorageBufferBindingSize: adapterLimits.maxStorageBufferBindingSize,
-        maxTextureDimension3D: adapterLimits.maxTextureDimension3D,
-      },
-    });
+    let device = await requestKilnDevice(adapter);
 
     const format = navigator.gpu.getPreferredCanvasFormat();
     const context = canvas.getContext("webgpu");
     if (!context) throw new Error("Failed to get WebGPU canvas context");
-    context.configure({ device, format });
+    // Configured by the constructor, once nothing can be awaited any more.
 
     // Data provider
     let dataProvider: DataProvider;
@@ -253,29 +444,43 @@ export class KilnViewer {
       metadata.voxelSpacing,
     );
 
-    // Shrink the atlas grid with channel count so total atlas VRAM fits the
-    // budget — a fixed 660³ × many channels OOMs mobile GPUs at startup.
+    // Atlas grid: adapter-class budget (unless the caller set one), then shrink
+    // if allocation fails or the device is lost — the only hard VRAM signal.
     const bytesPerVoxel = textureFormat === "r8unorm" ? 1 : 2;
-    const { gridSize, atlasSize } = computeAtlasGrid(
+    const hints = adapterMemoryHints(adapter, readDeviceMemoryGiB());
+    const budgetBytes =
+      options.atlasBudgetBytes ?? guessAtlasBudgetBytes(hints);
+    let { gridSize, atlasSize } = computeAtlasGrid(
       metadata.numChannels,
       bytesPerVoxel,
-      options.atlasBudgetBytes,
+      budgetBytes,
     );
-    const atlasVramMB = Math.round(
-      (metadata.numChannels * atlasSize ** 3 * bytesPerVoxel) / 1e6,
-    );
-    console.log(
-      `[Kiln] atlas grid ${gridSize}³ (${atlasSize}³ voxels) × ${metadata.numChannels} channel(s) ≈ ${atlasVramMB} MB VRAM`,
-    );
-
-    // Construct subsystems
-    const resources = new VolumeResources(
+    const storedCap = readStoredAtlasGridCap();
+    if (storedCap !== undefined && storedCap < gridSize) {
+      gridSize = storedCap;
+      atlasSize = gridSize * PHYSICAL_BRICK_SIZE;
+    }
+    const created = await createVolumeResourcesFittingDevice(
+      adapter,
       device,
       effectiveBitDepth,
       textureFormat,
       config,
       metadata.numChannels,
       gridSize,
+    );
+    device = created.device;
+    const resources = created.resources;
+    gridSize = created.gridSize;
+    atlasSize = gridSize * PHYSICAL_BRICK_SIZE;
+    const atlasVramMB = Math.round(
+      (metadata.numChannels * atlasSize ** 3 * bytesPerVoxel) / 1e6,
+    );
+    console.log(
+      `[Kiln] atlas grid ${gridSize}³ (${atlasSize}³ voxels) × ${metadata.numChannels} channel(s) ≈ ${atlasVramMB} MB VRAM` +
+        ` (budget ${(budgetBytes / 1e6).toFixed(0)} MB` +
+        `${hints.isFallbackAdapter ? ", fallback adapter" : ""}` +
+        `${hints.deviceMemoryGiB !== undefined ? `, deviceMemory=${hints.deviceMemoryGiB} GiB` : ""})`,
     );
     const renderer = new Renderer(device, format, resources, config);
 
@@ -310,16 +515,15 @@ export class KilnViewer {
         if (!w) continue;
         const lo = dataRange ? dataRange[0] : w.min;
         const hi = dataRange ? dataRange[1] : w.max;
-        const range = hi - lo;
-        if (range > 0) {
-          const center = Math.max(
-            0,
-            Math.min(1, ((w.start + w.end) / 2 - lo) / range),
-          );
-          const width = Math.max(0.01, Math.min(1, (w.end - w.start) / range));
-          renderer.setChannelWindow(ch, center, width);
-        }
+        setChannelWindowFromRange(renderer, ch, w, lo, hi);
       }
+    }
+
+    // Default channel colours from the file (e.g. Imaris DataSetInfo).
+    if (metadata.channelColors) {
+      metadata.channelColors.forEach(([r, g, b], ch) => {
+        if (ch < metadata.numChannels) renderer.setChannelColor(ch, r, g, b, 1);
+      });
     }
 
     // Pass float32 data range to renderer for GPU normalization.
@@ -423,6 +627,9 @@ export class KilnViewer {
       metadata,
       config,
     );
+    if (options.pixelRatio !== undefined)
+      viewer.pixelRatio = options.pixelRatio;
+    streamingManager.clipBox = { min: renderer.clipMin, max: renderer.clipMax };
 
     // When base LOD derives float/channel ranges, update renderer + metadata.
     // Wired after construction so onChannelWindowsChanged can notify external UI.
@@ -435,26 +642,21 @@ export class KilnViewer {
       if (opts.channelRanges && metadata.channelWindows) {
         for (let ch = 0; ch < opts.channelRanges.length; ch++) {
           const w = metadata.channelWindows[ch];
-          if (!w) continue;
-          const range = w.max - w.min;
-          if (range > 0) {
-            const center = Math.max(
-              0,
-              Math.min(1, ((w.start + w.end) / 2 - w.min) / range),
-            );
-            const width = Math.max(
-              0.01,
-              Math.min(1, (w.end - w.start) / range),
-            );
-            renderer.setChannelWindow(ch, center, width);
-          }
+          if (w) setChannelWindowFromRange(renderer, ch, w, w.min, w.max);
         }
         renderer.resetAccumulation();
       }
       viewer.onChannelWindowsChanged?.();
     });
 
-    device.lost.then(() => viewer.dispose());
+    const atlasGridSize = gridSize;
+    device.lost.then((info) => {
+      if (info.reason === "destroyed") return;
+      console.warn(`[Kiln] GPU device lost (${info.reason}): ${info.message}`);
+      const next = nextSmallerAtlasGrid(atlasGridSize);
+      if (next !== null) storeAtlasGridCap(next);
+      viewer.dispose();
+    });
 
     return viewer;
   }
@@ -508,6 +710,18 @@ export class KilnViewer {
   set floatMax(value: number) {
     this.renderer.floatMax = value;
     this.renderer.resetAccumulation();
+  }
+
+  /** Canvas pixels per CSS pixel (see {@link ViewerOptions.pixelRatio}). */
+  get pixelRatio(): number {
+    return this.pixelRatio_;
+  }
+  set pixelRatio(value: number) {
+    const next = Math.max(0.25, Math.min(4, value || 1));
+    if (next === this.pixelRatio_) return;
+    this.pixelRatio_ = next;
+    this.resize();
+    this.streamingManager.forceUpdate(this.camera, this.canvas);
   }
 
   /** Always 1. Setting this has no effect. */
@@ -580,10 +794,21 @@ export class KilnViewer {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.splatLayer?.destroy();
     cancelAnimationFrame(this.rafHandle);
     clearTimeout(this.resizeTimer);
     this.resizeObserver.disconnect();
+    this.renderer.resources.destroy();
+    try {
+      this.device.destroy();
+    } catch {
+      /* already lost */
+    }
     this.dataProvider.dispose();
+    if (canvasOwner.get(this.canvas) === this) {
+      canvasOwner.delete(this.canvas);
+      this.context.unconfigure();
+    }
   }
 
   /** Pause / resume the RAF loop (used while capturing splat datasets). */
@@ -596,108 +821,236 @@ export class KilnViewer {
     }
   }
 
-  /**
-   * Capture one settled frame as RGBA8 (transparent background by default).
-   * Useful for custom export pipelines.
-   */
-  async captureFrame(opts?: {
-    settleFrames?: number;
-    transparentBackground?: boolean;
-  }): Promise<import("./export/capture-frame.js").CapturedFrame> {
-    const { captureRendererFrame } = await import("./export/capture-frame.js");
-    return captureRendererFrame(this.device, this.renderer, this.camera, opts);
+  // ── Gaussian splats ────────────────────────────────────────────────────────
+
+  /** The splat layer (created on first use). */
+  get splats(): SplatLayer {
+    if (!this.splatLayer) {
+      this.splatLayer = new SplatLayer(this.device, this.canvasFormat);
+    }
+    return this.splatLayer;
+  }
+
+  /** Number of splats currently loaded (0 when none). */
+  get splatCount(): number {
+    return this.splatLayer?.gaussianCount ?? 0;
+  }
+
+  get displayMode(): DisplayMode {
+    return this.displayMode_;
+  }
+  set displayMode(mode: DisplayMode) {
+    this.displayMode_ = mode;
+    this.renderer.resetAccumulation();
+    this.dirty = true;
+  }
+
+  /** Split divider position, 0–1 of the canvas width. */
+  get splitFraction(): number {
+    return this.splitFraction_;
+  }
+  set splitFraction(v: number) {
+    this.splitFraction_ = Math.min(1, Math.max(0, v));
+    this.dirty = true;
+  }
+
+  /** Show a Gaussian cloud (from `generateSplats`, `readPly`, …). */
+  setSplats(cloud: GaussianCloud | null): void {
+    this.splats.setCloud(cloud);
+    this.dirty = true;
+  }
+
+  /** Load a 3DGS .ply (binary little-endian) and show it. */
+  loadSplatPly(bytes: Uint8Array | ArrayBuffer): GaussianCloud {
+    const cloud = readPly(
+      bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
+    );
+    this.setSplats(cloud);
+    return cloud;
+  }
+
+  /** Current splats as a 3DGS .ply, or null if none. */
+  exportSplatPly(): Uint8Array | null {
+    const cloud = this.splatLayer?.cloud;
+    return cloud ? writePly(cloud) : null;
+  }
+
+  private buildHost(): SplatBuildHost {
+    return {
+      device: this.device,
+      renderer: this.renderer,
+      camera: this.camera,
+      streaming: this.streamingManager,
+      provider: this.dataProvider,
+      metadata: this.metadata,
+      config: this.config,
+      transferFunction: this.transferFunction,
+      canvas: this.canvas,
+      presentView: () => this.context.getCurrentTexture().createView(),
+    };
   }
 
   /**
-   * Capture an orbit of the current renderer (viewer settings baked into PNGs),
-   * seed Brush with a voxel init.ply, train Gaussians, and return the result.
-   * The trained PLY is the product; init.ply is only a training seed.
+   * Turn the volume — with its current channels, colours, windows and
+   * transfer function, in `renderMode` at `density` inside `region` (each
+   * defaulting to what is displayed) — into Gaussian splats: a direct
+   * moment-matched fit from the voxels, optionally refined on the GPU against
+   * renders of the same volume. The viewer's render state is restored after;
+   * the result is shown and returned.
    */
-  async exportGaussianSplat(opts?: {
-    viewCount?: number;
-    settleFrames?: number;
-    /** 0 = finest seed LOD. Omit to auto-pick a coarse-enough seed. */
-    initLod?: number;
-    maxSplats?: number;
-    maxBatches?: number;
-    /**
-     * Long-side pixel count for captured views (default 1920). Independent of
-     * the window; render scale is forced to 1 for the capture.
-     */
-    captureMaxDim?: number;
-    onProgress?: (fraction: number, label: string) => void;
-  }): Promise<import("./export/brush-train.js").BrushTrainOutcome> {
-    const { captureSplatDataset, resolveCaptureSize } = await import(
-      "./export/splat-capture.js"
-    );
-    const { trainWithBrushOrPackage } = await import("./export/brush-train.js");
-    const { waitForBricksLoaded } = await import("./export/capture-frame.js");
-
-    const savedCanvasW = this.canvas.width;
-    const savedCanvasH = this.canvas.height;
-    const gpuMax = this.device.limits.maxTextureDimension2D;
-    const { width: capW, height: capH } = resolveCaptureSize(
-      this.canvas.clientWidth || savedCanvasW,
-      this.canvas.clientHeight || savedCanvasH,
-      opts?.captureMaxDim ?? 1920,
-      gpuMax,
-    );
-
-    this.setPaused(true);
+  async generateSplats(
+    opts: GenerateSplatsOptions = {},
+  ): Promise<GaussianCloud> {
+    if (this.building) throw new Error("A splat build is already running");
+    this.building = true;
+    const r = this.renderer;
+    const saved = {
+      mode: r.volumeRenderMode,
+      density: r.densityScale,
+      clipMin: Float32Array.from(r.clipMin),
+      clipMax: Float32Array.from(r.clipMax),
+      forcedLod: this.forcedLod,
+      display: this.displayMode_,
+    };
+    const mode =
+      opts.renderMode ??
+      (saved.mode === "mip" || saved.mode === "iso" ? saved.mode : "dvr");
+    // Splats reproduce what is rendered: MIP needs max-blended splats.
+    const blend = opts.blend ?? (mode === "mip" ? "max" : "alpha");
+    const region: Box = opts.region ?? {
+      min: [saved.clipMin[0]!, saved.clipMin[1]!, saved.clipMin[2]!],
+      max: [saved.clipMax[0]!, saved.clipMax[1]!, saved.clipMax[2]!],
+    };
     try {
-      this.canvas.width = capW;
-      this.canvas.height = capH;
-      this.renderer.resize(capW, capH);
-      this.renderer.prepareScale(1);
-      this.renderer.activateScale(1);
-
-      await waitForBricksLoaded(
-        this.streamingManager,
-        this.camera,
-        this.canvas,
+      if (r.volumeRenderMode !== mode) this.mode = mode;
+      r.densityScale =
+        mode === "mip" ? MIP_FIT_DENSITY : (opts.density ?? saved.density);
+      this.displayMode_ = "volume";
+      this.forcedLod = null; // build at screen-matched detail
+      const boxes = tileBoxes(
+        chooseTiles(this.config.normalizedSize, opts.tileSplits ?? 0),
+        region,
       );
-
-      const onProgress = opts?.onProgress;
-      const dataset = await captureSplatDataset(
-        this.device,
-        this.renderer,
-        this.camera,
-        this.dataProvider,
-        this.config,
-        this.transferFunction,
-        {
-          viewCount: opts?.viewCount ?? 48,
-          settleFrames: opts?.settleFrames ?? 8,
-          includeInitPly: true,
-          initLod: opts?.initLod,
-          maxSplats: opts?.maxSplats ?? 150_000,
-          maxInitBricks: 64,
-          onProgress: (f, label) => onProgress?.(f * 0.55, label),
-          streaming: this.streamingManager,
-          canvas: this.canvas,
-          present: () => this.context.getCurrentTexture().createView(),
-        },
+      const targetCount = Math.ceil(
+        (opts.targetCount ?? 1_000_000) / boxes.length,
       );
-      return trainWithBrushOrPackage(dataset, this.device, {
-        maxBatches: opts?.maxBatches ?? 60,
-        onProgress: (f, label) => onProgress?.(0.55 + f * 0.45, label),
+      const parts: Array<GaussianCloud & { core: Box }> = [];
+      for (const [i, box] of boxes.entries()) {
+        opts.onTile?.(i, boxes.length);
+        r.clipMin.set(box.train.min);
+        r.clipMax.set(box.train.max);
+        r.resetAccumulation();
+        const cloud = await this.buildSplats({ ...opts, blend, targetCount });
+        parts.push({ ...cloud, core: box.core });
+      }
+      const first = parts[0]!;
+      if (parts.length === 1) return first;
+      const merged = mergeTileParams(parts, this.config.normalizedSize);
+      const cloud = cloudFromParams(merged.params, merged.count, {
+        blend,
+        worldScale: first.worldScale,
+        worldUnit: first.worldUnit,
       });
+      this.setSplats(cloud);
+      return cloud;
     } finally {
-      this.canvas.width = savedCanvasW;
-      this.canvas.height = savedCanvasH;
-      this.renderer.resize(savedCanvasW, savedCanvasH);
-      this.renderer.prepareScale(1);
-      this.renderer.activateScale(1);
+      r.clipMin.set(saved.clipMin);
+      r.clipMax.set(saved.clipMax);
+      r.densityScale = saved.density;
+      if (r.volumeRenderMode !== saved.mode) this.mode = saved.mode;
+      this.forcedLod = saved.forcedLod;
+      this.displayMode_ = saved.display;
+      r.resetAccumulation();
+      this.building = false;
+    }
+  }
+
+  /** Fit (+ train, + evaluate) the region inside the current clip box. */
+  private async buildSplats(opts: SplatBuildOptions): Promise<GaussianCloud> {
+    const host = this.buildHost();
+    const blend = opts.blend ?? "alpha";
+    let views: CapturedViews | null = null;
+    let evalViews: CapturedViews | null = null;
+    try {
+      let cloud = await fitVolume(host, opts);
+      this.setSplats(cloud);
+      const train = opts.train !== false && cloud.count > 0;
+      const nEval = cloud.count > 0 ? (opts.evaluateViews ?? 0) : 0;
+      this.setPaused(true);
+      if (train) views = await captureViews(host, opts);
+      if (nEval > 0) {
+        evalViews = await captureViews(host, {
+          ...opts,
+          views: nEval,
+          viewSeed: 7919,
+          onProgress: (p) =>
+            opts.onProgress?.({
+              ...p,
+              label: `Held-out ${p.label.toLowerCase()}`,
+            }),
+        });
+      }
+      if (views) {
+        cloud = await trainCloud(this.device, cloud, views, {
+          ...opts,
+          onPreview: (params, count) => {
+            this.splats.setExternal(params, count, blend);
+            this.renderNow();
+            opts.onPreview?.(params, count);
+          },
+        });
+        this.setSplats(cloud);
+      }
+      // setSplats uploaded the cloud: evaluate that buffer.
+      const params = this.splats.paramsBuffer;
+      const psnr =
+        evalViews && params
+          ? await evaluateCloud(
+              this.device,
+              params,
+              cloud.count,
+              evalViews,
+              this.renderer.background,
+              blend,
+            )
+          : undefined;
+      opts.onProgress?.({
+        stage: "done",
+        fraction: 1,
+        label:
+          `${cloud.count.toLocaleString()} Gaussians` +
+          (psnr !== undefined ? ` · ${psnr.toFixed(1)} dB PSNR vs volume` : ""),
+        gaussians: cloud.count,
+        psnr,
+      });
+      return cloud;
+    } finally {
+      views?.texture.destroy();
+      evalViews?.texture.destroy();
       this.setPaused(false);
       this.dirty = true;
     }
   }
 
+  /** Render one frame immediately (used for previews while paused). */
+  renderNow(): void {
+    this.renderFrame();
+  }
+
   private resize(): void {
     const maxDim = this.device.limits.maxTextureDimension2D;
-    const width = Math.max(1, Math.min(this.canvas.clientWidth, maxDim));
-    const height = Math.max(1, Math.min(this.canvas.clientHeight, maxDim));
-    if (this.canvas.width !== width || this.canvas.height !== height) {
+    const r = this.pixelRatio_;
+    const width = Math.max(
+      1,
+      Math.min(Math.round(this.canvas.clientWidth * r), maxDim),
+    );
+    const height = Math.max(
+      1,
+      Math.min(Math.round(this.canvas.clientHeight * r), maxDim),
+    );
+    // Compared with the renderer (not the canvas element): a new viewer on a
+    // canvas that already has the right size still sizes its renderer.
+    if (this.renderer.width !== width || this.renderer.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
       this.renderer.resize(width, height);
@@ -707,7 +1060,7 @@ export class KilnViewer {
   }
 
   private frame(): void {
-    if (this.disposed) return;
+    if (this.disposed || canvasOwner.get(this.canvas) !== this) return;
     if (this.paused) {
       this.rafHandle = requestAnimationFrame(() => this.frame());
       return;
@@ -721,17 +1074,61 @@ export class KilnViewer {
     // Always run streaming (may trigger onDirty via resetAccumulation)
     this.streamingManager.update(this.camera, this.canvas);
 
+    const splatVersion = this.splatLayer?.version ?? -1;
+    if (splatVersion !== this.lastSplatVersion) {
+      this.lastSplatVersion = splatVersion;
+      this.dirty = true;
+    }
+
     // Determine if we need to render
+    const volumeVisible = this.displayMode_ !== "splats";
     const needsRender =
-      this.dirty || this.camera.isInteracting() || !this.renderer.isConverged;
+      this.dirty ||
+      this.camera.isInteracting() ||
+      (volumeVisible && !this.renderer.isConverged);
 
     if (needsRender) {
       this.dirty = false;
       this.onBeforeFrame?.();
-      const view = this.context.getCurrentTexture().createView();
-      this.renderer.render(view, this.camera);
+      this.renderFrame();
     }
 
     this.rafHandle = requestAnimationFrame(() => this.frame());
+  }
+
+  private renderFrame(): void {
+    const view = this.context.getCurrentTexture().createView();
+    const mode = this.displayMode_;
+    const hasSplats = (this.splatLayer?.gaussianCount ?? 0) > 0;
+    if (mode === "volume" || !hasSplats) {
+      this.renderer.render(view, this.camera);
+      return;
+    }
+    const bg = this.renderer.background;
+    if (mode === "splats") {
+      this.splats.render(
+        view,
+        this.camera,
+        this.canvas.width,
+        this.canvas.height,
+        {
+          background: bg,
+        },
+      );
+      return;
+    }
+    // split: volume everywhere, splats right of the divider
+    this.renderer.render(view, this.camera);
+    this.splats.render(
+      view,
+      this.camera,
+      this.canvas.width,
+      this.canvas.height,
+      {
+        background: bg,
+        splitX: Math.round(this.splitFraction_ * this.canvas.width),
+        clear: false,
+      },
+    );
   }
 }

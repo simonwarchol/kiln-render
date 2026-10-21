@@ -18,6 +18,10 @@ export type {
 } from "./data/data-provider.js";
 export { UnsupportedDatasetError } from "./data/data-provider.js";
 export { clearHandle } from "./data/handle-storage.js";
+export type {
+  ImarisProviderOptions,
+  ImsChannelInfo,
+} from "./data/imaris-provider.js";
 export { ImarisDataProvider } from "./data/imaris-provider.js";
 export type { ImsProbeResult } from "./data/imaris-validator.js";
 export {
@@ -48,24 +52,21 @@ export {
   probeLocalZarr,
   probeRemoteZarr,
 } from "./data/zarr-validator.js";
+// Gaussian splats
+export type { GaussianCloud } from "./splat/cloud.js";
+export { createCloud, readPly, writePly } from "./splat/cloud.js";
+export type { SplatBlend } from "./splat/gpu/rasterizer.js";
 export type {
-  BrushTrainOutcome,
-  GaussianSplat,
-  OpenSplatViewerOptions,
-  SplatCaptureOptions,
-  SplatDatasetResult,
-} from "./export/index.js";
-// Gaussian splat export (Brush / SuperSplat pipeline)
-export {
-  BRUSH_DEMO_URL,
-  downloadBytes,
-  handoffToSuperSplat,
-  openBrushDemo,
-  openEmbeddedSplatViewer,
-  presentSplatPly,
-  SUPERSPLAT_EDITOR_URL,
-  writeGaussianPly,
-} from "./export/index.js";
-export type { ViewerOptions, ViewerState } from "./viewer.js";
+  BuildProgress,
+  BuildStage,
+  SplatBuildOptions,
+} from "./splat/splat-builder.js";
+export { SplatLayer } from "./splat/splat-layer.js";
+export type {
+  DisplayMode,
+  GenerateSplatsOptions,
+  ViewerOptions,
+  ViewerState,
+} from "./viewer.js";
 // Viewer
 export { KilnViewer } from "./viewer.js";

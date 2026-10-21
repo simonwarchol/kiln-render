@@ -73,11 +73,19 @@ export interface VolumeMetadata {
     max: number;
   };
   /** Per-channel window/level metadata (optional, from OMERO or similar) */
-  channelWindows?: Array<{ start: number; end: number; min: number; max: number } | undefined>;
+  channelWindows?: Array<
+    { start: number; end: number; min: number; max: number } | undefined
+  >;
+  /** Per-channel display names (optional, e.g. Imaris DataSetInfo) */
+  channelNames?: string[];
+  /** Per-channel default display colours, linear RGB 0–1 (optional) */
+  channelColors?: Array<[number, number, number]>;
   /** Number of channels in the volume (1 for single-channel, N for multi-channel) */
   numChannels: number;
   /** Whether source data is floating-point (float32/float64) */
   isFloat?: boolean;
+  /** Voxel type in the file, e.g. "float32", "uint16" (bricks are normalised). */
+  sourceDataType?: string;
   /** Data range [min, max] in original float values, used for normalisation to [0, 65535] */
   dataRange?: [number, number];
   /** Compression codec used by the zarr array (e.g. 'zstd', 'blosc/lz4', 'gzip', 'none') */
@@ -121,8 +129,8 @@ export interface NetworkStats {
  */
 export class UnsupportedDatasetError extends Error {
   constructor(public readonly reasons: string[]) {
-    super(reasons.join('; '));
-    this.name = 'UnsupportedDatasetError';
+    super(reasons.join("; "));
+    this.name = "UnsupportedDatasetError";
   }
 }
 
@@ -146,16 +154,34 @@ export interface DataProvider {
   getBrickGrid(lod: number): [number, number, number];
 
   /** Load a single brick's voxel data with inline statistics. */
-  loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex?: number, signal?: AbortSignal): Promise<BrickLoadResult | null>;
+  loadBrick(
+    lod: number,
+    bx: number,
+    by: number,
+    bz: number,
+    channelIndex?: number,
+    signal?: AbortSignal,
+  ): Promise<BrickLoadResult | null>;
 
   /** Check if a brick is empty (below threshold). */
-  isBrickEmpty(lod: number, bx: number, by: number, bz: number, maxThreshold?: number): Promise<boolean>;
+  isBrickEmpty(
+    lod: number,
+    bx: number,
+    by: number,
+    bz: number,
+    maxThreshold?: number,
+  ): Promise<boolean>;
 
   /**
    * Get statistics for a specific brick
    * Returns null if stats are not available
    */
-  getBrickStats(lod: number, bx: number, by: number, bz: number): Promise<BrickStats | null>;
+  getBrickStats(
+    lod: number,
+    bx: number,
+    by: number,
+    bz: number,
+  ): Promise<BrickStats | null>;
 
   /**
    * Get network/loading statistics

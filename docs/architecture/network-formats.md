@@ -57,7 +57,9 @@ The **ZarrDataProvider** (`src/data/zarr-provider.ts`) loads OME-Zarr volumes di
 
 ### Imaris streaming
 
-The **ImarisDataProvider** (`src/data/imaris-provider.ts`) loads Imaris 5.5 HDF5 (`.ims`) over HTTP Range requests via h5wasm in Web Workers. Each `ResolutionLevel` is a 3D chunked volume (Z is part of the pyramid). Workers hyperslab a 66³ brick (plus ghost) from `/DataSet/ResolutionLevel N/TimePoint 0/Channel C/Data`.
+The **ImarisDataProvider** (`src/data/imaris-provider.ts`) loads Imaris 5.5 HDF5 (`.ims`) with a pure-TypeScript async HDF5 reader (`src/data/hdf5/`): metadata and chunk indexes are read on the main thread with cached Range reads, and chunk bytes are fetched (coalesced `fetch()` Range requests), inflated and resampled into bricks in Web Workers. Each `ResolutionLevel` is a 3D chunked volume (Z is part of the pyramid). Workers assemble a 66³ brick (plus ghost) from `/DataSet/ResolutionLevel N/TimePoint 0/Channel C/Data`.
+
+Chunk bytes go through one main-thread fetcher (de-duplicated, coalesced, LRU + persistent copy in the Origin Private File System). Each chunk has an owner worker that inflates it once and serves the sub-regions bricks need, and any worker box-resamples the pieces into a brick, so a chunk shared by several neighbouring bricks through their ghost borders is decoded once. Bricks whose chunks are all unallocated are empty without any fetch; `isBrickEmpty` also inherits emptiness from zero-max ancestors. See [Imaris](/data/imaris).
 
 ## 16-bit and float32 volume support
 

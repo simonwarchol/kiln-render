@@ -1,21 +1,21 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { AtlasAllocator } from '../src/streaming/atlas-allocator.js';
-import { GRID_SIZE, TOTAL_BRICK_SLOTS } from '../src/core/config.js';
+import { beforeEach, describe, expect, it } from "vitest";
+import { GRID_SIZE, TOTAL_BRICK_SLOTS } from "../src/core/config.js";
+import { AtlasAllocator } from "../src/streaming/atlas-allocator.js";
 
-describe('AtlasAllocator', () => {
+describe("AtlasAllocator", () => {
   let allocator: AtlasAllocator;
 
   beforeEach(() => {
     allocator = new AtlasAllocator();
   });
 
-  it('should start with all slots free', () => {
+  it("should start with all slots free", () => {
     expect(allocator.freeCount).toBe(TOTAL_BRICK_SLOTS);
     expect(allocator.usedCount).toBe(0);
     expect(allocator.isFull).toBe(false);
   });
 
-  it('should allocate a slot', () => {
+  it("should allocate a slot", () => {
     const result = allocator.allocate();
     expect(result).not.toBeNull();
     expect(result!.slot).toBeDefined();
@@ -25,7 +25,7 @@ describe('AtlasAllocator', () => {
     expect(allocator.freeCount).toBe(TOTAL_BRICK_SLOTS - 1);
   });
 
-  it('should return unique slots', () => {
+  it("should return unique slots", () => {
     const slots = new Set<string>();
     for (let i = 0; i < 10; i++) {
       const result = allocator.allocate();
@@ -36,7 +36,7 @@ describe('AtlasAllocator', () => {
     }
   });
 
-  it('should free a slot', () => {
+  it("should free a slot", () => {
     const result = allocator.allocate()!;
     expect(allocator.usedCount).toBe(1);
 
@@ -45,7 +45,7 @@ describe('AtlasAllocator', () => {
     expect(allocator.freeCount).toBe(TOTAL_BRICK_SLOTS);
   });
 
-  it('should reuse freed slots', () => {
+  it("should reuse freed slots", () => {
     const result1 = allocator.allocate()!;
     allocator.free(result1.slot);
 
@@ -55,7 +55,7 @@ describe('AtlasAllocator', () => {
     expect(result2.slot.z).toBe(result1.slot.z);
   });
 
-  it('should evict LRU when full', () => {
+  it("should evict LRU when full", () => {
     // Allocate all slots
     for (let i = 0; i < TOTAL_BRICK_SLOTS; i++) {
       const result = allocator.allocate(i); // Use frame number
@@ -66,7 +66,7 @@ describe('AtlasAllocator', () => {
         bx: i,
         by: 0,
         bz: 0,
-        key: `brick-${i}`
+        key: `brick-${i}`,
       });
     }
 
@@ -76,10 +76,10 @@ describe('AtlasAllocator', () => {
     const result = allocator.allocate(TOTAL_BRICK_SLOTS);
     expect(result).not.toBeNull();
     expect(result!.evicted).not.toBeNull();
-    expect(result!.evicted!.key).toBe('brick-0');
+    expect(result!.evicted!.key).toBe("brick-0");
   });
 
-  it('should reset properly', () => {
+  it("should reset properly", () => {
     // Allocate some slots
     for (let i = 0; i < 100; i++) {
       allocator.allocate();
@@ -91,7 +91,7 @@ describe('AtlasAllocator', () => {
     expect(allocator.freeCount).toBe(TOTAL_BRICK_SLOTS);
   });
 
-  it('should return all allocated slots', () => {
+  it("should return all allocated slots", () => {
     allocator.allocate();
     allocator.allocate();
     allocator.allocate();
@@ -100,7 +100,7 @@ describe('AtlasAllocator', () => {
     expect(allocated.length).toBe(3);
   });
 
-  it('should have valid slot coordinates', () => {
+  it("should have valid slot coordinates", () => {
     for (let i = 0; i < Math.min(100, TOTAL_BRICK_SLOTS); i++) {
       const result = allocator.allocate()!;
       expect(result.slot.x).toBeGreaterThanOrEqual(0);
@@ -112,19 +112,27 @@ describe('AtlasAllocator', () => {
     }
   });
 
-  describe('pinning', () => {
-    it('should not evict pinned slots', () => {
+  describe("pinning", () => {
+    it("should not evict pinned slots", () => {
       // Allocate all slots
       const firstResult = allocator.allocate(0)!;
       allocator.setMetadata(firstResult.slotIndex, {
-        lod: 0, bx: 0, by: 0, bz: 0, key: 'first'
+        lod: 0,
+        bx: 0,
+        by: 0,
+        bz: 0,
+        key: "first",
       });
       allocator.pin(firstResult.slotIndex);
 
       for (let i = 1; i < TOTAL_BRICK_SLOTS; i++) {
         const result = allocator.allocate(i)!;
         allocator.setMetadata(result.slotIndex, {
-          lod: 0, bx: i, by: 0, bz: 0, key: `brick-${i}`
+          lod: 0,
+          bx: i,
+          by: 0,
+          bz: 0,
+          key: `brick-${i}`,
         });
       }
 
@@ -132,10 +140,10 @@ describe('AtlasAllocator', () => {
       const newResult = allocator.allocate(TOTAL_BRICK_SLOTS);
       expect(newResult).not.toBeNull();
       expect(newResult!.evicted).not.toBeNull();
-      expect(newResult!.evicted!.key).not.toBe('first');
+      expect(newResult!.evicted!.key).not.toBe("first");
     });
 
-    it('should track pinned count', () => {
+    it("should track pinned count", () => {
       const r1 = allocator.allocate()!;
       const r2 = allocator.allocate()!;
 
@@ -150,13 +158,17 @@ describe('AtlasAllocator', () => {
     });
   });
 
-  describe('LRU eviction', () => {
-    it('should evict least recently used slot', () => {
+  describe("LRU eviction", () => {
+    it("should evict least recently used slot", () => {
       // Allocate all slots with different frame times
       for (let i = 0; i < TOTAL_BRICK_SLOTS; i++) {
         const result = allocator.allocate(i * 10)!;
         allocator.setMetadata(result.slotIndex, {
-          lod: 0, bx: i, by: 0, bz: 0, key: `brick-${i}`
+          lod: 0,
+          bx: i,
+          by: 0,
+          bz: 0,
+          key: `brick-${i}`,
         });
       }
 
@@ -165,7 +177,32 @@ describe('AtlasAllocator', () => {
 
       // Next allocation should evict slot 1 (frame 10, not slot 0 which is now recent)
       const result = allocator.allocate(10001);
-      expect(result!.evicted!.key).toBe('brick-1');
+      expect(result!.evicted!.key).toBe("brick-1");
+    });
+
+    it("evicts bricks that left the desired set even if recently touched", () => {
+      const small = new AtlasAllocator(2);
+      for (let i = 0; i < small.totalSlots; i++) {
+        const result = small.allocate(0)!;
+        small.setMetadata(result.slotIndex, {
+          lod: 0,
+          bx: i,
+          by: 0,
+          bz: 0,
+          key: `brick-${i}`,
+        });
+        small.touch(result.slotIndex, 5);
+      }
+
+      expect(small.allocate(5)).toBeNull();
+      expect(small.hasEvictableSlot(5)).toBe(false);
+
+      const keep = new Set<string>();
+      for (let i = 1; i < small.totalSlots; i++) keep.add(`brick-${i}`);
+      expect(small.hasEvictableSlot(5, keep)).toBe(true);
+      const result = small.allocate(5, keep);
+      expect(result).not.toBeNull();
+      expect(result!.evicted!.key).toBe("brick-0");
     });
   });
 });

@@ -1,8 +1,25 @@
 /**
- * ImarisDataProvider — streams Imaris 5.5 (.ims) HDF5 over HTTP Range or a local File.
+ * ImarisDataProvider — streams Imaris 5.5 (.ims) files over async HTTP Range
+ * requests (or a local File) with a pure-TS HDF5 reader.
+ *
+ * - Metadata and chunk indexes are read on the main thread (small, cached
+ *   page reads); bulk chunk bytes are fetched, decoded and assembled into
+ *   bricks by a worker pool.
+ * - Exposes a virtual isotropic pyramid over Imaris' anisotropic levels
+ *   (see imaris/ims-layout.ts).
+ * - Values are normalised per channel to [0, 1] using the file's histogram
+ *   range, so all dtypes land in the same r16float space and the default
+ *   display windows come straight from the Imaris ColorRange.
+ * - Up to MAX_CHANNELS of the file's channels are active at once; choose
+ *   them with `channels`.
  */
 
-import { LOGICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE } from "../core/config.js";
+import {
+  LOGICAL_BRICK_SIZE,
+  MAX_CHANNELS,
+  PHYSICAL_BRICK_SIZE,
+} from "../core/config.js";
+import { ByteLru } from "../utils/byte-lru.js";
 import type {
   BrickLoadResult,
   BrickStats,
@@ -12,73 +29,550 @@ import type {
   VolumeMetadata,
 } from "./data-provider.js";
 import { UnsupportedDatasetError } from "./data-provider.js";
-import { ImarisWorkerPool } from "./imaris-worker-pool.js";
-import { NetworkTracker } from "./network-tracker.js";
+import {
+  blobRangeSource,
+  cachedRangeSource,
+  type Hdf5AttrValue,
+  type Hdf5ChunkRef,
+  Hdf5Dataset,
+  Hdf5File,
+  Hdf5Group,
+  httpRangeSource,
+  type RangeSource,
+} from "./hdf5/index.js";
+import { ChunkFetcher } from "./imaris/chunk-fetcher.js";
+import { imsBrickIsEmpty } from "./imaris/empty-bricks.js";
+import type {
+  ImsAssembleRequest,
+  ImsBrickResponse,
+  ImsExtractRequest,
+  ImsExtractResponse,
+  ImsPiece,
+} from "./imaris/ims-brick-worker.js";
+import ImsBrickWorkerInline from "./imaris/ims-brick-worker.ts?worker&inline";
+import {
+  axisSampling,
+  overlappingChunks,
+  planVirtualPyramid,
+  type SourceLevel,
+  type Vec3,
+  type VirtualLevel,
+  WORKER_CHUNK_BUDGET,
+} from "./imaris/ims-layout.js";
+import { NetworkTracker, RollingAvg } from "./network-tracker.js";
 
-const MAX_STATS_ENTRIES = 100_000;
+const MAX_STATS_ENTRIES = 200_000;
+
+/** One channel as described by the file (all channels, not just active ones). */
+export interface ImsChannelInfo {
+  index: number;
+  name: string;
+  /** Display colour, linear 0–1 */
+  color: [number, number, number];
+  /** Normalisation range used for this channel (raw units) */
+  range: [number, number];
+  /** Imaris display range (raw units) */
+  displayRange: [number, number] | null;
+}
+
+export interface ImarisProviderOptions {
+  /** Source channel indices to load (≤ MAX_CHANNELS). Default: the first ones. */
+  channels?: number[];
+  /** Time point to load (default 0). */
+  timepoint?: number;
+  /** Worker count (default: min(hardwareConcurrency, 6)). */
+  workers?: number;
+  /** Keep fetched chunks in the Origin Private File System across sessions (default true). */
+  persistentCache?: boolean;
+}
+
+function createWorker(): Worker {
+  if (import.meta.env.DEV) {
+    return new Worker(
+      new URL("./imaris/ims-brick-worker.ts", import.meta.url),
+      {
+        type: "module",
+      },
+    );
+  }
+  return new ImsBrickWorkerInline();
+}
+
+function attrString(v: Hdf5AttrValue | undefined): string | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v === "string") return v.replace(/\0+$/, "").trim();
+  if (Array.isArray(v)) return v.map(String).join("").trim();
+  return String(v);
+}
+
+function attrNumber(v: Hdf5AttrValue | undefined): number | undefined {
+  const s = attrString(v);
+  if (s === undefined || s === "") return undefined;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function attrNumbers(v: Hdf5AttrValue | undefined): number[] | undefined {
+  const s = attrString(v);
+  if (!s) return undefined;
+  const parts = s
+    .split(/[\s,]+/)
+    .filter(Boolean)
+    .map(Number);
+  return parts.length > 0 && parts.every(Number.isFinite) ? parts : undefined;
+}
+
+/** Chunk → owning worker (each chunk is decoded and cached by one worker). */
+function ownerOf(address: number, n: number): number {
+  let h = Math.floor(address / 4096) ^ (address % 4096);
+  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
+  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
+  return ((h ^ (h >>> 16)) >>> 0) % n;
+}
+
+interface DatasetIndex {
+  dataset: Hdf5Dataset;
+  /** chunk shape [x, y, z] */
+  chunkShape: Vec3;
+  /** chunk grid [x, y, z] */
+  grid: Vec3;
+  chunks: Map<number, Hdf5ChunkRef>;
+}
 
 export class ImarisDataProvider implements DataProvider {
   private readonly tracker = new NetworkTracker();
-  private workerPool: ImarisWorkerPool | null = null;
+  private file: Hdf5File | null = null;
   private metadata: VolumeMetadata | null = null;
+  private pyramid: VirtualLevel[] = [];
+  private sourceLevels: SourceLevel[] = [];
   private readonly brickStatsCache = new Map<string, BrickStats>();
-  private targetFormat: "r8unorm" | "r16unorm" | "r16float" = "r16float";
+  private readonly datasetIndex = new Map<string, Promise<DatasetIndex>>();
+  private format: "f16" | "u8" = "f16";
+  private workers: Worker[] = [];
+  private fetcher: ChunkFetcher | null = null;
+  private requestId = 0;
+  private readonly pending = new Map<
+    number,
+    {
+      resolve: (r: ImsBrickResponse | ImsExtractResponse) => void;
+      reject: (e: Error) => void;
+    }
+  >();
+  /** Approximate mirror of each worker's owned-chunk LRU: address → bytes. */
+  /** Per worker: chunks it holds decoded (address → bytes), as an LRU like its own. */
+  private ownerMirror: Array<ByteLru<number, number>> = [];
+  private nextAssembler = 0;
+  private readonly fetchAvg = new RollingAvg();
+  private readonly assemblyAvg = new RollingAvg();
+  private readonly queueAvg = new RollingAvg();
+  private readonly timepoint: number;
 
-  constructor(private readonly source: string | File) {}
+  /** Every channel in the file (names, colours, ranges). */
+  allChannels: ImsChannelInfo[] = [];
+  /** Source channel index for each active slot. */
+  activeChannels: number[] = [];
+
+  constructor(
+    private readonly source: string | File,
+    private readonly options: ImarisProviderOptions = {},
+  ) {
+    this.timepoint = options.timepoint ?? 0;
+  }
 
   async setTargetFormat(
     format: "r8unorm" | "r16unorm" | "r16float",
   ): Promise<void> {
-    this.targetFormat = format;
-    await this.workerPool?.setTargetFormat(format);
+    this.format = format === "r8unorm" ? "u8" : "f16";
   }
 
-  async setFloatRange(min: number, max: number): Promise<void> {
-    if (this.metadata) this.metadata.dataRange = [min, max];
-    await this.workerPool?.setFloatRange(min, max);
+  async setFloatRange(): Promise<void> {
+    // Values are normalised per channel in the worker; nothing to do.
+  }
+
+  private rangeSource(): RangeSource {
+    if (typeof this.source !== "string") return blobRangeSource(this.source);
+    // Retry transient network failures (TypeError "Failed to fetch", 5xx).
+    const inner = httpRangeSource(this.source);
+    return {
+      stats: inner.stats,
+      async read(offset, length, signal) {
+        let lastErr: unknown;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          try {
+            return await inner.read(offset, length, signal);
+          } catch (e) {
+            lastErr = e;
+            if (signal?.aborted) throw e;
+            const msg = e instanceof Error ? e.message : String(e);
+            if (/HTTP 4\d\d|ignored the HTTP Range/.test(msg)) throw e;
+            await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
+          }
+        }
+        throw lastErr;
+      },
+    };
   }
 
   async initialize(): Promise<VolumeMetadata> {
     if (this.metadata) return this.metadata;
+    const raw = this.rangeSource();
+    const meta = cachedRangeSource(raw, {
+      pageSize: 16 * 1024,
+      maxPages: 8192,
+    });
+    // Imaris writes its group/attribute metadata at the head of the file:
+    // one up-front read turns ~30 serial round trips into one.
+    await meta.read(0, 1024 * 1024).catch(() => undefined);
+    const file = await Hdf5File.open(raw, { meta });
+    this.file = file;
 
-    this.workerPool = new ImarisWorkerPool();
-    const info = await this.workerPool.init(this.source);
-    if (info.reasons.length > 0) {
-      this.workerPool.terminate();
-      this.workerPool = null;
-      throw new UnsupportedDatasetError(info.reasons);
+    const reasons: string[] = [];
+    const dataSet = await file.get("/DataSet");
+    if (!(dataSet instanceof Hdf5Group)) {
+      throw new UnsupportedDatasetError([
+        "Not an Imaris 5.5 file (missing /DataSet group)",
+      ]);
+    }
+    const levelNames = (await dataSet.keys())
+      .map((k) => ({ k, m: /^Resolution ?Level (\d+)$/.exec(k) }))
+      .filter((e) => e.m)
+      .sort((a, b) => Number(a.m![1]) - Number(b.m![1]));
+    const tp = `TimePoint ${this.timepoint}`;
+
+    // Source levels (ImageSize attrs of channel 0)
+    const sources: SourceLevel[] = [];
+    const ch0Attrs: Array<Record<string, Hdf5AttrValue>> = [];
+    const levelAttrs = await Promise.all(
+      levelNames.map(async ({ k }) => {
+        const g = await file.get(`/DataSet/${k}/${tp}/Channel 0`);
+        return g instanceof Hdf5Group ? g.attrs() : null;
+      }),
+    );
+    for (let i = 0; i < levelNames.length; i++) {
+      const a = levelAttrs[i];
+      if (!a) break;
+      const x = attrNumber(a.ImageSizeX);
+      const y = attrNumber(a.ImageSizeY);
+      const z = attrNumber(a.ImageSizeZ);
+      if (!x || !y || !z) break;
+      sources.push({ index: Number(levelNames[i]!.m![1]), dims: [x, y, z] });
+      ch0Attrs.push(a);
+    }
+    if (sources.length === 0) {
+      throw new UnsupportedDatasetError([
+        `IMS file has no ResolutionLevel / ${tp} / Channel 0 data`,
+      ]);
+    }
+    this.sourceLevels = sources;
+    if (sources[0]!.dims[2] < 2) {
+      reasons.push("IMS volume is not 3D (ImageSizeZ must be greater than 1)");
     }
 
-    if (this.targetFormat !== "r16float") {
-      await this.workerPool.setTargetFormat(this.targetFormat);
+    const tpGroup = await file.get(`/DataSet/${levelNames[0]!.k}/${tp}`);
+    const channelCount =
+      tpGroup instanceof Hdf5Group
+        ? (await tpGroup.keys()).filter((k) => /^Channel \d+$/.test(k)).length
+        : 1;
+
+    // Header only: the chunk index is read lazily, per level, on first use.
+    const probe = await file.get(
+      `/DataSet/ResolutionLevel ${sources[0]!.index}/TimePoint ${this.timepoint}/Channel 0/Data`,
+    );
+    if (!(probe instanceof Hdf5Dataset)) {
+      throw new Error("IMS dataset missing for the finest level");
     }
+    const dt = probe.dtype;
+    if (
+      !(
+        (dt.class === "uint" && (dt.size === 1 || dt.size === 2)) ||
+        (dt.class === "int" && dt.size === 2) ||
+        (dt.class === "float" && dt.size === 4)
+      ) ||
+      !dt.littleEndian
+    ) {
+      reasons.push(
+        `Data type ${dt.class}${dt.size * 8}${dt.littleEndian ? "" : " (big-endian)"} is not supported`,
+      );
+    }
+    if (reasons.length > 0) throw new UnsupportedDatasetError(reasons);
+
+    // Channel descriptions
+    const info = await file.get("/DataSetInfo");
+    const infoGroup = info instanceof Hdf5Group ? info : null;
+    const typeMax = dt.class === "float" ? 1 : 2 ** (dt.size * 8) - 1;
+    this.allChannels = await Promise.all(
+      Array.from({ length: channelCount }, async (_, c) => {
+        const levelAttrs: Record<string, Hdf5AttrValue> =
+          c === 0
+            ? ch0Attrs[0]!
+            : await (async () => {
+                const g = await file.get(
+                  `/DataSet/${levelNames[0]!.k}/${tp}/Channel ${c}`,
+                );
+                return g instanceof Hdf5Group ? g.attrs() : {};
+              })();
+        const infoCh = infoGroup ? await infoGroup.get(`Channel ${c}`) : null;
+        const ia = infoCh instanceof Hdf5Group ? await infoCh.attrs() : {};
+        const hMin = attrNumber(levelAttrs.HistogramMin);
+        const hMax = attrNumber(levelAttrs.HistogramMax);
+        let lo = hMin ?? 0;
+        let hi = hMax ?? typeMax;
+        if (dt.class !== "float") lo = Math.max(0, lo);
+        if (!(hi > lo)) hi = lo + 1;
+        const rgb = attrNumbers(ia.Color);
+        const color: [number, number, number] =
+          rgb && rgb.length >= 3
+            ? [
+                Math.min(1, Math.max(0, rgb[0]!)),
+                Math.min(1, Math.max(0, rgb[1]!)),
+                Math.min(1, Math.max(0, rgb[2]!)),
+              ]
+            : [1, 1, 1];
+        const cr = attrNumbers(ia.ColorRange);
+        const name = attrString(ia.Name);
+        return {
+          index: c,
+          name: name && name !== "(name not specified)" ? name : `Channel ${c}`,
+          color,
+          range: [lo, hi] as [number, number],
+          displayRange:
+            cr && cr.length >= 2
+              ? ([cr[0]!, cr[1]!] as [number, number])
+              : null,
+        };
+      }),
+    );
+
+    const requested = (this.options.channels ?? [])
+      .filter((c) => Number.isInteger(c) && c >= 0 && c < channelCount)
+      .filter((c, i, arr) => arr.indexOf(c) === i);
+    this.activeChannels = (
+      requested.length > 0
+        ? requested
+        : Array.from({ length: channelCount }, (_, i) => i)
+    ).slice(0, MAX_CHANNELS);
+    if (channelCount > MAX_CHANNELS && requested.length === 0) {
+      console.info(
+        `[Kiln] IMS has ${channelCount} channels; showing ${MAX_CHANNELS} at a time (choose with the channel picker)`,
+      );
+    }
+
+    // Geometry
+    let voxelSpacing: [number, number, number] | undefined;
+    let name = "ims";
+    const image = infoGroup ? await infoGroup.get("Image") : null;
+    if (image instanceof Hdf5Group) {
+      const a = await image.attrs();
+      const [sx, sy, sz] = sources[0]!.dims;
+      const ext = (i: number) => {
+        const lo = attrNumber(a[`ExtMin${i}`]);
+        const hi = attrNumber(a[`ExtMax${i}`]);
+        return lo !== undefined && hi !== undefined
+          ? Math.abs(hi - lo)
+          : undefined;
+      };
+      const dx = ext(0);
+      const dy = ext(1);
+      const dz = ext(2);
+      if (dx && dy && dz) voxelSpacing = [dx / sx, dy / sy, dz / sz];
+      const n = attrString(a.Name);
+      if (n && n !== "(name not specified)") name = n;
+    }
+    if (name === "ims" && typeof this.source === "string") {
+      name = decodeURIComponent(this.source.split("/").pop() ?? "ims");
+    } else if (name === "ims" && typeof this.source !== "string") {
+      name = this.source.name;
+    }
+
+    this.pyramid = planVirtualPyramid(sources);
+    const active = this.activeChannels.map((c) => this.allChannels[c]!);
+    // Windows in raw data units over the normalisation range; the viewer maps
+    // them to the normalised [0, 1] atlas values.
+    const windowFor = (ch: ImsChannelInfo) => {
+      const [lo, hi] = ch.range;
+      const [a, b] = ch.displayRange ?? ch.range;
+      const start = Math.min(hi, Math.max(lo, a));
+      const end = Math.min(hi, Math.max(start + (hi - lo) * 1e-3, b));
+      return { start, end, min: lo, max: hi };
+    };
 
     this.metadata = {
-      name: info.name,
-      dimensions: info.dimensions,
-      voxelSpacing: info.voxelSpacing,
+      name,
+      dimensions: sources[0]!.dims,
+      voxelSpacing,
       brickSize: LOGICAL_BRICK_SIZE,
       physicalBrickSize: PHYSICAL_BRICK_SIZE,
-      maxLod: Math.max(0, info.levels.length - 1),
-      levels: info.levels,
-      bitDepth: info.bitDepth,
-      numChannels: info.numChannels,
-      isFloat: info.isFloat,
-      dataRange: info.isFloat ? [0, 1] : undefined,
-      compression: info.compression,
+      maxLod: this.pyramid.length - 1,
+      levels: this.pyramid.map((l) => ({
+        lod: l.lod,
+        dimensions: l.dims,
+        brickGrid: l.brickGrid,
+        brickCount: l.brickGrid[0] * l.brickGrid[1] * l.brickGrid[2],
+      })),
+      bitDepth: this.format === "u8" ? 8 : 16,
+      window: active[0] ? windowFor(active[0]) : undefined,
+      channelWindows: active.map(windowFor),
+      channelNames: active.map((c) => c.name),
+      channelColors: active.map((c) => c.color),
+      numChannels: Math.max(1, active.length),
+      isFloat: false,
+      compression: probe.filters.map((f) => f.name).join("+") || "none",
+      sourceDataType: `${dt.class}${dt.size * 8}`,
     };
+
+    const n = Math.max(
+      1,
+      Math.min(
+        this.options.workers ?? (navigator.hardwareConcurrency || 4) - 1,
+        8,
+      ),
+    );
+    this.fetcher = new ChunkFetcher(raw, {
+      persistKey:
+        typeof this.source === "string" &&
+        this.options.persistentCache !== false
+          ? new URL(this.source, location.href).href
+          : undefined,
+    });
+    for (let i = 0; i < n; i++) {
+      const w = createWorker();
+      w.onmessage = (e: MessageEvent<ImsBrickResponse | ImsExtractResponse>) =>
+        this.onWorkerMessage(e.data);
+      w.onerror = (e) => console.error("[Kiln] IMS worker error", e.message);
+      this.workers.push(w);
+      this.ownerMirror.push(new ByteLru(WORKER_CHUNK_BUDGET * 0.9, (b) => b));
+    }
+
+    // Prefetch chunk indexes for the active channels at the coarsest levels.
+    const coarse = this.pyramid[this.pyramid.length - 1]!.source;
+    await Promise.all(
+      this.activeChannels.map((c) => this.openDataset(coarse, c)),
+    );
     return this.metadata;
   }
 
-  getMetadata(): VolumeMetadata {
-    if (!this.metadata) {
-      throw new Error("Metadata not loaded. Call initialize() first.");
+  private onWorkerMessage(msg: ImsBrickResponse | ImsExtractResponse): void {
+    const p = this.pending.get(msg.id);
+    if (!p) return;
+    this.pending.delete(msg.id);
+    if (msg.error) p.reject(new Error(msg.error));
+    else p.resolve(msg);
+  }
+
+  private call<T extends ImsBrickResponse | ImsExtractResponse>(
+    worker: Worker,
+    msg: ImsExtractRequest | ImsAssembleRequest,
+    transfer: Transferable[] = [],
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(msg.id, {
+        resolve: resolve as (r: ImsBrickResponse | ImsExtractResponse) => void,
+        reject,
+      });
+      worker.postMessage(msg, transfer);
+    });
+  }
+
+  /**
+   * Get the sub-region of one chunk (normalised float16) from its owner,
+   * sending the compressed bytes only when the owner doesn't have it.
+   */
+  private async extract(
+    idx: DatasetIndex,
+    ref: Hdf5ChunkRef,
+    region: [number, number, number, number, number, number],
+    norm: [number, number],
+    stats: { bytes: number; requests: number },
+  ): Promise<Uint16Array> {
+    const w = ownerOf(ref.address, this.workers.length);
+    const worker = this.workers[w]!;
+    const decodedBytes =
+      idx.chunkShape[0] * idx.chunkShape[1] * idx.chunkShape[2] * 2;
+    const send = async (withBytes: boolean): Promise<ImsExtractResponse> => {
+      let bytes: Uint8Array | null = null;
+      if (withBytes) {
+        const f = this.fetcher!;
+        const b0 = f.stats.bytesFetched;
+        const r0 = f.stats.requests;
+        bytes = (await f.get([{ address: ref.address, size: ref.size }]))[0]!;
+        stats.bytes += f.stats.bytesFetched - b0;
+        stats.requests += f.stats.requests - r0;
+      }
+      const msg: ImsExtractRequest = {
+        type: "extract",
+        id: ++this.requestId,
+        address: ref.address,
+        bytes,
+        filters: idx.dataset.filters,
+        filterMask: ref.filterMask,
+        dtype: {
+          class: idx.dataset.dtype.class as "int" | "uint" | "float",
+          size: idx.dataset.dtype.size,
+        },
+        chunkShape: idx.chunkShape,
+        normLo: norm[0],
+        normHi: norm[1],
+        region,
+      };
+      return this.call<ImsExtractResponse>(worker, msg);
+    };
+    let res = await send(!this.ownerMirror[w]!.has(ref.address));
+    if (res.missing) {
+      this.ownerMirror[w]!.delete(ref.address);
+      res = await send(true);
     }
+    if (res.error || !res.data)
+      throw new Error(res.error ?? "IMS chunk extract failed");
+    this.ownerMirror[w]!.set(ref.address, decodedBytes);
+    return new Uint16Array(res.data);
+  }
+
+  private openDataset(level: number, channel: number): Promise<DatasetIndex> {
+    const key = `${level}:${channel}`;
+    let p = this.datasetIndex.get(key);
+    if (!p) {
+      p = (async () => {
+        const file = this.file!;
+        const ds = await file.get(
+          `/DataSet/ResolutionLevel ${level}/TimePoint ${this.timepoint}/Channel ${channel}/Data`,
+        );
+        if (!(ds instanceof Hdf5Dataset)) {
+          throw new Error(
+            `IMS dataset missing for level ${level} channel ${channel}`,
+          );
+        }
+        const cs = ds.chunkShape ?? ds.shape;
+        const chunkShape: Vec3 = [cs[2]!, cs[1]!, cs[0]!];
+        const grid: Vec3 = [
+          Math.ceil(ds.shape[2]! / chunkShape[0]),
+          Math.ceil(ds.shape[1]! / chunkShape[1]),
+          Math.ceil(ds.shape[0]! / chunkShape[2]),
+        ];
+        const chunks = new Map<number, Hdf5ChunkRef>();
+        if (ds.chunkShape) {
+          for (const ref of await ds.chunks()) {
+            const cz = Math.floor(ref.offset[0]! / chunkShape[2]);
+            const cy = Math.floor(ref.offset[1]! / chunkShape[1]);
+            const cx = Math.floor(ref.offset[2]! / chunkShape[0]);
+            chunks.set((cz * grid[1] + cy) * grid[0] + cx, ref);
+          }
+        }
+        return { dataset: ds, chunkShape, grid, chunks };
+      })();
+      p.catch(() => this.datasetIndex.delete(key));
+      this.datasetIndex.set(key, p);
+    }
+    return p;
+  }
+
+  getMetadata(): VolumeMetadata {
+    if (!this.metadata)
+      throw new Error("Metadata not loaded. Call initialize() first.");
     return this.metadata;
   }
 
   getBrickGrid(lod: number): [number, number, number] {
-    const level = this.getMetadata().levels.find((l) => l.lod === lod);
+    const level = this.pyramid[lod];
     if (!level) throw new Error(`LOD level ${lod} not found`);
     return level.brickGrid;
   }
@@ -91,41 +585,108 @@ export class ImarisDataProvider implements DataProvider {
     channelIndex = 0,
     signal?: AbortSignal,
   ): Promise<BrickLoadResult | null> {
-    const level = this.metadata?.levels.find((l) => l.lod === lod);
-    if (!this.metadata || !level || !this.workerPool) return null;
-    if (
-      bx < 0 ||
-      bx >= level.brickGrid[0] ||
-      by < 0 ||
-      by >= level.brickGrid[1] ||
-      bz < 0 ||
-      bz >= level.brickGrid[2]
-    ) {
+    const level = this.pyramid[lod];
+    const channel = this.activeChannels[channelIndex];
+    if (!this.metadata || !level || channel === undefined) return null;
+    const [gx, gy, gz] = level.brickGrid;
+    if (bx < 0 || by < 0 || bz < 0 || bx >= gx || by >= gy || bz >= gz)
       return null;
-    }
 
     try {
-      const result = await this.workerPool.loadBrick(
-        lod,
-        bx,
-        by,
-        bz,
-        channelIndex,
-        signal,
+      const idx = await this.openDataset(level.source, channel);
+      const src = this.sourceLevels.find((s) => s.index === level.source)!;
+      const sx = axisSampling(bx, level.dims[0], src.dims[0], level.ratio[0]);
+      const sy = axisSampling(by, level.dims[1], src.dims[1], level.ratio[1]);
+      const sz = axisSampling(bz, level.dims[2], src.dims[2], level.ratio[2]);
+      const lo: Vec3 = [sx.lo, sy.lo, sz.lo];
+      const hi: Vec3 = [sx.hi, sy.hi, sz.hi];
+      const P = PHYSICAL_BRICK_SIZE;
+      const info = this.allChannels[channel]!;
+      const norm: [number, number] = [info.range[0], info.range[1]];
+      const t0 = performance.now();
+      const stats = { bytes: 0, requests: 0 };
+      const jobs: Array<Promise<ImsPiece>> = [];
+      const [csx, csy, csz] = idx.chunkShape;
+      for (const [cx, cy, cz] of overlappingChunks(lo, hi, idx.chunkShape)) {
+        const ref = idx.chunks.get((cz * idx.grid[1] + cy) * idx.grid[0] + cx);
+        if (!ref) continue; // unallocated → zeros
+        const x0 = Math.max(lo[0], cx * csx);
+        const y0 = Math.max(lo[1], cy * csy);
+        const z0 = Math.max(lo[2], cz * csz);
+        const x1 = Math.min(hi[0], (cx + 1) * csx);
+        const y1 = Math.min(hi[1], (cy + 1) * csy);
+        const z1 = Math.min(hi[2], (cz + 1) * csz);
+        const region: [number, number, number, number, number, number] = [
+          x0 - cx * csx,
+          y0 - cy * csy,
+          z0 - cz * csz,
+          x1 - cx * csx,
+          y1 - cy * csy,
+          z1 - cz * csz,
+        ];
+        jobs.push(
+          this.extract(idx, ref, region, norm, stats).then((data) => ({
+            x0,
+            y0,
+            z0,
+            sx: x1 - x0,
+            sy: y1 - y0,
+            sz: z1 - z0,
+            data,
+          })),
+        );
+      }
+      if (jobs.length === 0) {
+        const empty = { min: 0, max: 0, avg: 0 };
+        this.cacheBrickStats(lod, bx, by, bz, empty);
+        return {
+          data:
+            this.format === "u8"
+              ? new Uint8Array(P * P * P)
+              : new Uint16Array(P * P * P),
+          ...empty,
+        };
+      }
+      const pieces = await Promise.all(jobs);
+      if (signal?.aborted) return null;
+      const tPieces = performance.now();
+      this.tracker.record(stats.bytes, stats.requests);
+      const assembler =
+        this.workers[this.nextAssembler++ % this.workers.length]!;
+      const result = await this.call<ImsBrickResponse>(
+        assembler,
+        {
+          type: "assemble",
+          id: ++this.requestId,
+          pieces,
+          lo,
+          hi,
+          rx: sx.ranges,
+          ry: sy.ranges,
+          rz: sz.ranges,
+          format: this.format,
+        },
+        pieces.map((p) => p.data.buffer as ArrayBuffer),
       );
-      this.cacheBrickStats(lod, bx, by, bz, {
-        min: result.min,
-        max: result.max,
-        avg: result.avg,
-      });
-      this.tracker.record(
-        result.chunkBytesFetched ?? result.data.byteLength,
-        result.chunkRequestsIssued ?? 1,
-      );
-      return result;
+      if (result.error || !result.data)
+        throw new Error(result.error ?? "IMS brick assembly failed");
+      this.fetchAvg.add(tPieces - t0);
+      this.assemblyAvg.add(result.assemblyMs);
+      this.queueAvg.add(performance.now() - tPieces - result.assemblyMs);
+      const brickStats = { min: result.min, max: result.max, avg: result.avg };
+      this.cacheBrickStats(lod, bx, by, bz, brickStats);
+      const data =
+        this.format === "u8"
+          ? new Uint8Array(result.data)
+          : new Uint16Array(result.data);
+      return { data, ...brickStats };
     } catch (e) {
-      if (e instanceof DOMException && e.name === "AbortError") return null;
-      console.warn(`Failed to load brick lod${lod}:${bx}-${by}-${bz}:`, e);
+      if (signal?.aborted) return null;
+      if (e instanceof Error && e.message === "cancelled") return null;
+      console.warn(
+        `[Kiln] IMS brick lod${lod}:${bx}-${by}-${bz} ch${channelIndex} failed:`,
+        e,
+      );
       return null;
     }
   }
@@ -137,8 +698,16 @@ export class ImarisDataProvider implements DataProvider {
     bz: number,
     maxThreshold?: number,
   ): Promise<boolean> {
-    const stats = await this.getBrickStats(lod, bx, by, bz);
-    return !!stats && stats.max < (maxThreshold ?? 1);
+    return imsBrickIsEmpty({
+      lod,
+      bx,
+      by,
+      bz,
+      maxLod: this.metadata?.maxLod ?? lod,
+      threshold: maxThreshold ?? 1,
+      getStats: (l, x, y, z) =>
+        this.brickStatsCache.get(`${l}:${x}/${y}/${z}`) ?? null,
+    });
   }
 
   async getBrickStats(
@@ -155,22 +724,27 @@ export class ImarisDataProvider implements DataProvider {
   }
 
   getPipelineTimings(): PipelineTimings {
-    return (
-      this.workerPool?.getPipelineTimings() ?? {
-        avgQueueMs: 0,
-        avgFetchMs: 0,
-        avgAssemblyMs: 0,
-        avgUploadMs: 0,
-        sampleCount: 0,
-      }
-    );
+    return {
+      avgQueueMs: this.queueAvg.value,
+      avgFetchMs: this.fetchAvg.value,
+      avgAssemblyMs: this.assemblyAvg.value,
+      avgUploadMs: 0,
+      sampleCount: this.fetchAvg.count,
+    };
   }
 
   dispose(): void {
+    for (const w of this.workers) w.terminate();
+    this.workers = [];
+    this.ownerMirror = [];
+    this.fetcher?.clear();
+    this.fetcher = null;
+    for (const p of this.pending.values()) p.reject(new Error("cancelled"));
+    this.pending.clear();
     this.brickStatsCache.clear();
-    this.workerPool?.terminate();
-    this.workerPool = null;
+    this.datasetIndex.clear();
     this.metadata = null;
+    this.file = null;
   }
 
   private cacheBrickStats(
@@ -188,7 +762,7 @@ export class ImarisDataProvider implements DataProvider {
         ? {
             min: Math.min(existing.min, stats.min),
             max: Math.max(existing.max, stats.max),
-            avg: (existing.avg + stats.avg) / 2,
+            avg: Math.max(existing.avg, stats.avg),
           }
         : stats,
     );

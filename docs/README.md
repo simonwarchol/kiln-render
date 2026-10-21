@@ -12,7 +12,7 @@ New to Kiln? Start with the **[Introduction](guide/introduction.md)** — what i
 
 ### Data
 - [OME-Zarr](data/ome-zarr.md) — supported formats and requirements
-- [Imaris](data/imaris.md) — 3D .ims over HTTPS/S3
+- [Imaris](data/imaris.md) — 3D .ims over HTTPS/S3 (async HDF5 reader, channel picker)
 - [Local files](data/local-files.md) — File System Access API
 - [Sharded binary](data/sharded-binary.md) — conversion CLI and format
 - [Hosting](data/hosting.md) — S3, local dev, CDN
@@ -23,6 +23,7 @@ New to Kiln? Start with the **[Introduction](guide/introduction.md)** — what i
 - [Compositing modes](rendering/compositing.md) — DVR/MIP/ISO/slice
 - [Multichannel](rendering/multichannel.md) — per-channel controls and limits
 - [Resolution & TAA](rendering/resolution-taa.md)
+- [Gaussian splats](rendering/splats.md) — fit, train and play back splats from the volume
 
 ### Architecture
 - [System overview](architecture/overview.md) — the layer stack

@@ -112,6 +112,12 @@ export class Renderer {
   // Compute output is always full canvas resolution.
   renderScale = 1;
 
+  /** Premultiplied background composited behind the volume (alpha 0 = transparent). */
+  readonly background = new Float32Array([0.05, 0.05, 0.05, 1]);
+
+  /** DVR stops marching once accumulated alpha exceeds this. */
+  earlyExitAlpha = 0.95;
+
   // Overlay pipelines (rasterized wireframe, axis, slice)
   private wireframePipeline: GPURenderPipeline;
   private axisPipeline: GPURenderPipeline;
@@ -549,6 +555,14 @@ export class Renderer {
     }
   }
 
+  /** Render target size in pixels (1×1 until the first resize). */
+  get width(): number {
+    return this.screenWidth;
+  }
+  get height(): number {
+    return this.screenHeight;
+  }
+
   resize(width: number, height: number) {
     this.screenWidth = width;
     this.screenHeight = height;
@@ -600,7 +614,9 @@ export class Renderer {
     const width = Math.max(1, Math.round(this.screenWidth * scale));
     const height = Math.max(1, Math.round(this.screenHeight * scale));
     const usage =
-      GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
+      GPUTextureUsage.STORAGE_BINDING |
+      GPUTextureUsage.TEXTURE_BINDING |
+      GPUTextureUsage.COPY_SRC;
 
     const outputTexture = this.device.createTexture({
       size: [width, height],
@@ -779,35 +795,23 @@ export class Renderer {
     }
   }
 
-  /** Get depth view for external renderers (debug wireframes, etc) */
-  getDepthView(): GPUTextureView {
-    return this.depthView;
-  }
-
-  get captureWidth(): number {
-    return this.screenWidth;
-  }
-
-  get captureHeight(): number {
-    return this.screenHeight;
-  }
-
-  /** Texture view currently used as the blit source (TAA accum or direct compute). */
-  getBlitSourceView(): GPUTextureView {
-    if (this.enableTAA) {
-      return this.active.accumViews[(1 - this.active.accumIndex) as 0 | 1]!;
-    }
-    return this.active.outputView;
-  }
-
-  /** Get view-projection matrix for external renderers */
-  getViewProjMatrix(camera: Camera): Float32Array {
-    const aspect = this.depthTexture.width / this.depthTexture.height;
-    const view = camera.getViewMatrix();
-    const proj = camera.getProjectionMatrix(aspect);
-    const out = new Float32Array(16);
-    mat4.multiply(proj, view, out);
-    return out;
+  /**
+   * Copy the current volume result (TAA-accumulated if enabled; rgba16float,
+   * premultiplied over `background`) into layer `layer` of `dst`.
+   */
+  copyResultTo(
+    encoder: GPUCommandEncoder,
+    dst: GPUTexture,
+    layer: number,
+  ): void {
+    const src = this.enableTAA
+      ? this.active.accumTextures[(1 - this.active.accumIndex) as 0 | 1]
+      : this.active.outputTexture;
+    encoder.copyTextureToTexture(
+      { texture: src },
+      { texture: dst, origin: [0, 0, layer] },
+      [Math.min(src.width, dst.width), Math.min(src.height, dst.height), 1],
+    );
   }
 
   private renderCompute(
@@ -861,6 +865,8 @@ export class Renderer {
     d.set(this.channelColors, o.channelColors / 4);
     d.set(this.channelWindowCenter, o.channelWindowCenter / 4);
     d.set(this.channelWindowWidth, o.channelWindowWidth / 4);
+    d.set(this.background, o.background / 4);
+    d[o.earlyExitAlpha / 4] = this.earlyExitAlpha;
     this.device.queue.writeBuffer(
       this.computeUniformBuffer,
       0,

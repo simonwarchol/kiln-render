@@ -17,11 +17,73 @@ export const TOTAL_BRICK_SLOTS = GRID_SIZE * GRID_SIZE * GRID_SIZE;
 // For backward compatibility with existing code
 export const BRICK_SIZE = LOGICAL_BRICK_SIZE;
 
-export const DEFAULT_ATLAS_BUDGET_BYTES = 3_000_000_000;
+/** Leaves GPU headroom for splat generation/training next to the atlas. */
+export const DEFAULT_ATLAS_BUDGET_BYTES = 2_000_000_000;
+
+/** Software rasterizer — `computeAtlasGrid` clamps this to `MIN_GRID_SIZE`. */
+export const ATLAS_BUDGET_FALLBACK_BYTES = 1;
+
+/** iGPU / low-RAM class: middle of the 512 MiB–1 GiB band. */
+export const ATLAS_BUDGET_CONSTRAINED_BYTES = 768 * 1024 * 1024;
+
+const MIB = 1024 * 1024;
+const SMALL_BUFFER_BYTES = 512 * MIB;
+const LARGE_BUFFER_BYTES = 1024 * MIB;
+
+/** Adapter signals we can read without a VRAM query. */
+export interface AdapterMemoryHints {
+  maxBufferSize: number;
+  isFallbackAdapter?: boolean;
+  /** `navigator.deviceMemory` (GiB buckets), when the browser exposes it. */
+  deviceMemoryGiB?: number;
+}
+
+/**
+ * Pick an atlas byte budget from device class. Leaves headroom for the
+ * compositor, other tabs, TAA, and 1920 capture — not a free-VRAM estimate.
+ */
+export function guessAtlasBudgetBytes(hints: AdapterMemoryHints): number {
+  if (hints.isFallbackAdapter) return ATLAS_BUDGET_FALLBACK_BYTES;
+  const tinyRam =
+    hints.deviceMemoryGiB !== undefined && hints.deviceMemoryGiB <= 4;
+  if (hints.maxBufferSize <= SMALL_BUFFER_BYTES || tinyRam) {
+    return ATLAS_BUDGET_CONSTRAINED_BYTES;
+  }
+  if (hints.maxBufferSize >= LARGE_BUFFER_BYTES) {
+    return DEFAULT_ATLAS_BUDGET_BYTES;
+  }
+  return ATLAS_BUDGET_CONSTRAINED_BYTES;
+}
+
+export function adapterMemoryHints(
+  adapter: GPUAdapter,
+  deviceMemoryGiB?: number,
+): AdapterMemoryHints {
+  const info = adapter.info as { isFallbackAdapter?: boolean } | undefined;
+  const legacy = adapter as GPUAdapter & { isFallbackAdapter?: boolean };
+  return {
+    maxBufferSize: adapter.limits.maxBufferSize,
+    isFallbackAdapter:
+      info?.isFallbackAdapter === true || legacy.isFallbackAdapter === true,
+    deviceMemoryGiB,
+  };
+}
+
+export function readDeviceMemoryGiB(): number | undefined {
+  const memory = (navigator as Navigator & { deviceMemory?: number })
+    .deviceMemory;
+  return typeof memory === "number" && memory > 0 ? memory : undefined;
+}
 
 // Smallest grid computeAtlasGrid may return — must still hold the pinned base
 // LOD plus a working set.
 export const MIN_GRID_SIZE = 6;
+
+/** Drop one atlas grid step; `null` when already at `MIN_GRID_SIZE`. */
+export function nextSmallerAtlasGrid(gridSize: number): number | null {
+  const next = gridSize - 1;
+  return next >= MIN_GRID_SIZE ? next : null;
+}
 
 /**
  * Largest atlas grid (slots/axis) whose VRAM (numChannels × atlasSize³ ×
@@ -103,4 +165,18 @@ export class DatasetConfig {
     this.datasetGrid = computeDatasetGrid(dimensions);
     this.normalizedSize = computeNormalizedSize(dimensions, voxelSpacing);
   }
+}
+
+/** Clip box (0–1 per axis) → world-space AABB, as the shaders clip. */
+export function clipToWorld(
+  normalizedSize: readonly number[],
+  clipMin: ArrayLike<number>,
+  clipMax: ArrayLike<number>,
+): { lo: [number, number, number]; hi: [number, number, number] } {
+  const at = (c: ArrayLike<number>, a: number, d: number) =>
+    ((c[a] ?? d) - 0.5) * normalizedSize[a]!;
+  return {
+    lo: [at(clipMin, 0, 0), at(clipMin, 1, 0), at(clipMin, 2, 0)],
+    hi: [at(clipMax, 0, 1), at(clipMax, 1, 1), at(clipMax, 2, 1)],
+  };
 }

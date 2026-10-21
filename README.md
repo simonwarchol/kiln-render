@@ -1,18 +1,18 @@
 # Kiln
 
-A WebGPU-native out-of-core volume rendering system for large virtualized volumetric datasets.
+A WebGPU viewer for large microscopy volumes — **Imaris (`.ims`)** first, OME-Zarr too — that streams multi-gigabyte files over HTTP at interactive framerates, **turns the volume into 3D Gaussian splats** in the browser, and plays the splats back side by side with the volume.
 
-Kiln streams multi-gigabyte volumes over HTTP, rendering them at interactive framerates using a bounded GPU residency/atlas cache and virtual-texture indirection. It handles single-channel and multichannel OME-Zarr datasets (up to 6 channels).
+- **Imaris over plain HTTPS/S3** — a built-in async HDF5 reader fetches only the chunks it needs (coalesced `Range` requests, a shared de-duplicating fetcher, persistent OPFS chunk store, one decode per chunk), so a 2.6 GB, 18-channel float32 `.ims` shows a first image within seconds (≈8 s from a cold start against S3 in our tests, dominated by HDF5 metadata round trips) and refines progressively; revisits come from the local cache. Pick any 6 channels to render; names, colours and display ranges come from the file.
+- **Volume → splats** — fit anisotropic Gaussians directly to the voxels (seconds), then refine them on the GPU against Kiln's own volume renders (differentiable tile rasterizer, L1 + D-SSIM, Adam, densification). No Python/CUDA/external trainer.
+- **Playback** — splats render with the same camera as the volume (*Volume / Split / Splats*), and save/load as standard 3DGS `.ply` (SuperSplat, PlayCanvas, Brush…).
 
-> **v0.4.1** — Multichannel rendering is in **beta**; see [Multichannel](docs/rendering/multichannel.md) for details and known limitations.
+```text
+https://<host>/kiln-render/app/?dataset=https://lsp-public-data.s3.amazonaws.com/yapp-2023-3d-melanoma/LSP22408.ims
+```
 
-**Documentation:** New to Kiln? Start with the [Guide](docs/guide/introduction.md), or browse the [full docs index](docs/README.md).
+**Documentation:** [Guide](docs/guide/introduction.md) · [Imaris](docs/data/imaris.md) · [Gaussian splats](docs/rendering/splats.md) · [full index](docs/README.md).
 
----
-
-[![Chameleon CT scan — 2160 MB, 1024 × 1024 × 1080 @ 16-bit](https://github.com/user-attachments/assets/f5da8ea1-a924-4ba6-9f29-6f6c18369405)](https://simonwarchol.com/kiln-render/app/?mode=dvr&wc=0.35&ww=0.55&iso=0.20&tf=grayscale&up=-y&scale=0.5&cam=0.070%2C3.630%2C3.930%2C0.108%2C0.001%2C-0.066)
-
-*Chameleon CT scan — 2160 MB, 1024 × 1024 × 1080 @ 16-bit · [Live demo →](https://simonwarchol.com/kiln-render/app/?mode=dvr&wc=0.35&ww=0.55&iso=0.20&tf=grayscale&up=-y&scale=0.5&cam=0.070%2C3.630%2C3.930%2C0.108%2C0.001%2C-0.066) · [Gallery →](https://simonwarchol.com/kiln-render/gallery.html)*
+Kiln started as [MPanknin/kiln-render](https://github.com/MPanknin/kiln-render), an out-of-core OME-Zarr volume renderer (bounded GPU brick atlas, virtual-texture indirection, SSE-based LOD).
 
 ## Install
 
@@ -50,14 +50,28 @@ try {
 
 `KilnViewer.create()` initialises WebGPU, sets up streaming, and starts the render loop; it rejects with a descriptive error if WebGPU is unavailable (hence the `try/catch`). See the [Quick start](docs/guide/quick-start.md) for `ViewerOptions`, viewer properties, state serialisation, and cleanup.
 
+## Splats from code
+
+```js
+const cloud = await viewer.generateSplats({
+  targetCount: 1_000_000, // fitted splats (training may densify)
+  iterations: 3000,       // 0 / train: false → fit only
+  onProgress: (p) => console.log(p.stage, p.label),
+});
+viewer.displayMode = "split"; // "volume" | "splats" | "split"
+const ply = viewer.exportSplatPly();
+```
+
+See [Gaussian splats](docs/rendering/splats.md) for how the fit and training work.
+
 ## Features
 
-- **Out-of-core streaming** — Fixed VRAM footprint, SSE-based LOD selection, LRU brick cache
-- **Multichannel rendering** — Up to 6 channels with per-channel colour, windowing, and visibility controls ([details](docs/rendering/multichannel.md))
-- **OME-Zarr & Kiln binary** — Stream from S3, CDN, or load local files (OME-Zarr v0.4/v0.5, uint8/uint16/float32)
-- **Local filesystem** — Load local `.zarr` / `.ome.zarr` directories via the File System Access API (Chrome/Edge)
-- **uint8, uint16 & float32 input** — `uint16` and `float32` are converted to `r16float` for GPU storage, with window/level controls
-- **Compute shader raymarching** — Brick-aware DVR (with density scale), MIP, isosurface, and slice plane rendering
+- **Imaris 5.5 `.ims`** — remote (CORS `GET` + `Range` only; no `HEAD` needed) or local; any channel count (6 rendered at once, picker in the demo); uint8/uint16/int16/float32; gzip/shuffle/LZ4
+- **Gaussian splats** — direct volume fit, GPU photometric refinement, built-in WebGPU splat renderer, `.ply` import/export
+- **Out-of-core streaming** — fixed VRAM footprint, SSE-based LOD selection, LRU brick cache
+- **Multichannel rendering** — up to 6 channels with per-channel colour, windowing, and visibility controls ([details](docs/rendering/multichannel.md))
+- **OME-Zarr & Kiln binary** — stream from S3, CDN, or load local files (OME-Zarr v0.4/v0.5, uint8/uint16/float32)
+- **Compute shader raymarching** — brick-aware DVR (with density scale), MIP, isosurface, and slice plane rendering
 
 ## Developing from source
 

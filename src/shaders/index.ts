@@ -3,32 +3,43 @@
  * complete shader programs (compute, blit, overlays).
  */
 
-import { CONFIG } from '../core/config.js';
-import { COMPUTE_UNIFORMS, SLICE_UNIFORMS } from './uniform-layout.js';
-
+import { CONFIG } from "../core/config.js";
+import accumulateWGSL from "./accumulate.wgsl?raw";
+import axisWGSL from "./axis.wgsl?raw";
+import blitWGSL from "./blit.wgsl?raw";
 // Import WGSL shader sources
-import commonWGSL from './common.wgsl?raw';
-import samplingWGSL from './sampling.wgsl?raw';
-import compositingWGSL from './compositing.wgsl?raw';
-import raymarchingWGSL from './raymarching.wgsl?raw';
-import dvrWGSL from './dvr.wgsl?raw';
-import mipWGSL from './mip.wgsl?raw';
-import isoWGSL from './iso.wgsl?raw';
-import lodDebugWGSL from './lod-debug.wgsl?raw';
-import wireframeWGSL from './wireframe.wgsl?raw';
-import axisWGSL from './axis.wgsl?raw';
-import blitWGSL from './blit.wgsl?raw';
-import accumulateWGSL from './accumulate.wgsl?raw';
-import slicePlanesWGSL from './slice-planes.wgsl?raw';
+import commonWGSL from "./common.wgsl?raw";
+import compositingWGSL from "./compositing.wgsl?raw";
+import dvrWGSL from "./dvr.wgsl?raw";
+import isoWGSL from "./iso.wgsl?raw";
+import lodDebugWGSL from "./lod-debug.wgsl?raw";
+import mipWGSL from "./mip.wgsl?raw";
+import raymarchingWGSL from "./raymarching.wgsl?raw";
+import samplingWGSL from "./sampling.wgsl?raw";
+import slicePlanesWGSL from "./slice-planes.wgsl?raw";
+import { COMPUTE_UNIFORMS, SLICE_UNIFORMS } from "./uniform-layout.js";
+import wireframeWGSL from "./wireframe.wgsl?raw";
 
 // Inject rendering constants into shader source. Atlas size is per-viewer (the
 // atlas may be budget-shrunk), so it's passed in rather than read from CONFIG.
-function injectConfig(shader: string, atlasSize: number = CONFIG.ATLAS_SIZE): string {
+function injectConfig(
+  shader: string,
+  atlasSize: number = CONFIG.ATLAS_SIZE,
+): string {
   return shader
-    .replace(/LOGICAL_BRICK_SIZE: f32 = \d+\.0/, `LOGICAL_BRICK_SIZE: f32 = ${CONFIG.LOGICAL_BRICK_SIZE}.0`)
-    .replace(/PHYSICAL_BRICK_SIZE: f32 = \d+\.0/, `PHYSICAL_BRICK_SIZE: f32 = ${CONFIG.PHYSICAL_BRICK_SIZE}.0`)
+    .replace(
+      /LOGICAL_BRICK_SIZE: f32 = \d+\.0/,
+      `LOGICAL_BRICK_SIZE: f32 = ${CONFIG.LOGICAL_BRICK_SIZE}.0`,
+    )
+    .replace(
+      /PHYSICAL_BRICK_SIZE: f32 = \d+\.0/,
+      `PHYSICAL_BRICK_SIZE: f32 = ${CONFIG.PHYSICAL_BRICK_SIZE}.0`,
+    )
     .replace(/ATLAS_SIZE: f32 = \d+\.0/, `ATLAS_SIZE: f32 = ${atlasSize}.0`)
-    .replace(/MAX_BRICK_TRAVERSALS: u32 = \d+u/, `MAX_BRICK_TRAVERSALS: u32 = ${CONFIG.MAX_BRICK_TRAVERSALS}u`);
+    .replace(
+      /MAX_BRICK_TRAVERSALS: u32 = \d+u/,
+      `MAX_BRICK_TRAVERSALS: u32 = ${CONFIG.MAX_BRICK_TRAVERSALS}u`,
+    );
 }
 
 // Shared bindings used by volume shaders
@@ -52,7 +63,7 @@ function buildSharedCode(atlasSize: number): string {
     samplingWGSL,
     compositingWGSL,
     raymarchingWGSL,
-  ].join('\n');
+  ].join("\n");
 }
 
 // Mode dispatch function (calls appropriate render mode)
@@ -86,7 +97,9 @@ fn rayMarchMode(
 
 // Compute shader (full-screen ray marching). Built per-viewer so the injected
 // ATLAS_SIZE matches the (possibly budget-shrunk) atlas texture.
-export function buildComputeShader(atlasSize: number = CONFIG.ATLAS_SIZE): string {
+export function buildComputeShader(
+  atlasSize: number = CONFIG.ATLAS_SIZE,
+): string {
   return /* wgsl */ `
 struct Uniforms {
 ${COMPUTE_UNIFORMS.fields}
@@ -123,10 +136,10 @@ fn main(@builtin(global_invocation_id) globalId: vec3u) {
     let halfSize = uniforms.normalizedSize * 0.5;
     let hit = intersectBox(rayOrigin, rayDir, -halfSize, halfSize);
 
-    let bgColor = vec3f(0.05, 0.05, 0.05);
+    let bg = uniforms.background;
 
     if (hit.x > hit.y || hit.y <= 0.0) {
-        textureStore(outputTexture, pixelCoord, vec4f(bgColor, 1.0));
+        textureStore(outputTexture, pixelCoord, bg);
         return;
     }
 
@@ -137,15 +150,17 @@ fn main(@builtin(global_invocation_id) globalId: vec3u) {
     );
 
     if (clipped.x > clipped.y) {
-        textureStore(outputTexture, pixelCoord, vec4f(bgColor, 1.0));
+        textureStore(outputTexture, pixelCoord, bg);
         return;
     }
 
     let useIndirection = uniforms.useIndirection > 0.5;
     let result = rayMarchMode(rayOrigin, rayDir, clipped.x, clipped.y, uniforms.normalizedSize, uniforms.datasetSize, uniforms.renderMode, uniforms.isoValue, useIndirection);
 
-    let finalColor = result.rgb + bgColor * (1.0 - result.a);
-    textureStore(outputTexture, pixelCoord, vec4f(finalColor, 1.0));
+    // Premultiplied "over" onto the background (bg.a = 0 keeps the volume's alpha).
+    let finalColor = result.rgb + bg.rgb * (1.0 - result.a);
+    let finalAlpha = result.a + bg.a * (1.0 - result.a);
+    textureStore(outputTexture, pixelCoord, vec4f(finalColor, finalAlpha));
 }
 `;
 }
@@ -158,7 +173,9 @@ export const accumulateShader = accumulateWGSL;
 
 // Slice planes shader: axis-aligned cross-sections through the volume. Built
 // per-viewer so the injected ATLAS_SIZE matches the atlas texture.
-export function buildSlicePlanesShader(atlasSize: number = CONFIG.ATLAS_SIZE): string {
+export function buildSlicePlanesShader(
+  atlasSize: number = CONFIG.ATLAS_SIZE,
+): string {
   return [
     `struct Uniforms {\n${SLICE_UNIFORMS.fields}\n}`,
     `@group(0) @binding(0) var<uniform> uniforms: Uniforms;`,
@@ -166,5 +183,5 @@ export function buildSlicePlanesShader(atlasSize: number = CONFIG.ATLAS_SIZE): s
     injectConfig(commonWGSL, atlasSize),
     samplingWGSL,
     slicePlanesWGSL,
-  ].join('\n');
+  ].join("\n");
 }

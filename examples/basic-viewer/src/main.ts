@@ -18,6 +18,7 @@ import {
   ImarisDataProvider,
   KilnViewer,
   LocalZarrDataProvider,
+  looksLikeImsUrl,
   queryReadPermission,
   UnsupportedDatasetError,
   type VolumeRenderMode,
@@ -36,15 +37,20 @@ import { promptLocalFileReconnect } from "../../shared/local-reconnect.js";
 import { setupShareButton } from "../../shared/share-button.js";
 import { mountToast } from "../../shared/toast.js";
 import { mountTopBar } from "../../shared/top-bar.js";
+import { createChannelPicker } from "./ui/channel-picker.js";
 import type { ChannelState } from "./ui/multichannel-ui.js";
 import { MultichannelUI } from "./ui/multichannel-ui.js";
+import { SplatPanel } from "./ui/splat-panel.js";
 import { VolumeUI } from "./ui/volume-ui.js";
 import "../../shared/viewer-shell.css";
 import "../../shared/controls/controls.css";
 
 // Default volume source (can be overridden via ?dataset= URL parameter)
 const DEFAULT_VOLUME_SOURCE =
-  "https://lsp-private-data.s3.amazonaws.com/235-minerva-1-5-paper/TLS-4.ims";
+  "https://lsp-public-data.s3.amazonaws.com/yapp-2023-3d-melanoma/LSP22408.ims";
+
+/** Default DVR density for thick multichannel fluorescence (IMS) volumes. */
+const IMS_MULTICHANNEL_DENSITY = 0.1;
 
 // ?embed=1 — rendering only: no top bar, dataset dialog, controls/stats panel,
 // or share button. Camera orbit/pan/zoom still works — that's wired directly
@@ -86,6 +92,8 @@ function parseURLParams(): {
   axis?: boolean;
   /** Multichannel share schema */
   channels?: ChannelState[];
+  /** Imaris source channels to load (`?ch=0,3,5`) */
+  imsChannels?: number[];
   multiSlice?: MultiSliceParams;
 } {
   const params = new URLSearchParams(window.location.search);
@@ -216,6 +224,11 @@ function parseURLParams(): {
     axis: params.get("axis") === "1" ? true : undefined,
     channels,
     multiSlice,
+    imsChannels: params
+      .get("ch")
+      ?.split(",")
+      .map(Number)
+      .filter((n) => Number.isInteger(n) && n >= 0),
   };
 }
 
@@ -246,7 +259,9 @@ async function main() {
       granted = await promptLocalFileReconnect(storedImsHandle, "ims");
     }
     if (granted) {
-      dataset = new ImarisDataProvider(await storedImsHandle.getFile());
+      dataset = new ImarisDataProvider(await storedImsHandle.getFile(), {
+        channels: urlParams.imsChannels,
+      });
     } else {
       dataset = volumeSource;
     }
@@ -261,6 +276,10 @@ async function main() {
     } else {
       dataset = volumeSource;
     }
+  } else if (looksLikeImsUrl(volumeSource)) {
+    dataset = new ImarisDataProvider(volumeSource, {
+      channels: urlParams.imsChannels,
+    });
   } else {
     dataset = volumeSource;
   }
@@ -304,7 +323,15 @@ async function main() {
   const viewer = await KilnViewer.create(canvas, dataset, options);
   document.getElementById("spinner")?.classList.remove("active");
 
+  // Handy for debugging from the console.
+  (window as unknown as { kiln: KilnViewer }).kiln = viewer;
+
   const isMultichannel = viewer.renderer.numChannels > 1;
+  const imsProvider = dataset instanceof ImarisDataProvider ? dataset : null;
+  if (imsProvider && isMultichannel && urlParams.density === undefined) {
+    viewer.renderer.densityScale = IMS_MULTICHANNEL_DENSITY;
+    viewer.renderer.resetAccumulation();
+  }
   topBar?.setDatasetName(viewer.metadata.name);
   if (isMultichannel) topBar?.setBeta(true);
 
@@ -338,6 +365,14 @@ async function main() {
       );
       viewer.onBeforeFrame = () => ui.recordFrame();
       viewer.onChannelWindowsChanged = () => ui.refreshChannelWindows();
+      if (imsProvider && imsProvider.allChannels.length > 1) {
+        ui.addChannelHeader(
+          createChannelPicker(
+            imsProvider.allChannels,
+            imsProvider.activeChannels,
+          ),
+        );
+      }
 
       setupShareButton({
         isLocalZarr,
@@ -443,6 +478,8 @@ async function main() {
       });
     }
   }
+
+  if (!IS_EMBED) new SplatPanel(viewer, viewer.metadata.name);
 
   // ── Cleanup ────────────────────────────────────────────────────────────────
 

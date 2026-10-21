@@ -52,19 +52,19 @@ export function float32ToFloat16Bits(f32: number): number {
 /** Decode a uint16 float16 bit pattern to a JavaScript number. */
 export function float16BitsToFloat32(bits: number): number {
   const sign = (bits >> 15) & 0x1;
-  const exp  = (bits >> 10) & 0x1f;
-  const mant =  bits        & 0x3ff;
+  const exp = (bits >> 10) & 0x1f;
+  const mant = bits & 0x3ff;
 
   if (exp === 0) {
     // Subnormal: (-1)^s * 2^-14 * (mant / 1024)
-    return (sign ? -1 : 1) * Math.pow(2, -14) * (mant / 1024);
+    return (sign ? -1 : 1) * 2 ** -14 * (mant / 1024);
   }
   if (exp === 31) {
     // Infinity or NaN
-    return mant ? NaN : (sign ? -Infinity : Infinity);
+    return mant ? NaN : sign ? -Infinity : Infinity;
   }
   // Normal: (-1)^s * 2^(exp-15) * (1 + mant/1024)
-  return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + mant / 1024);
+  return (sign ? -1 : 1) * 2 ** (exp - 15) * (1 + mant / 1024);
 }
 
 // Encode LUT: uint16 intensity (0-65535, pre-normalised by /65535) → float16 bits. 128 KB.
@@ -74,7 +74,8 @@ let _u16ToF16Lut: Uint16Array | null = null;
 export function getUint16ToFloat16Lut(): Uint16Array {
   if (!_u16ToF16Lut) {
     _u16ToF16Lut = new Uint16Array(65536);
-    for (let i = 0; i < 65536; i++) _u16ToF16Lut[i] = float32ToFloat16Bits(i / 65535);
+    for (let i = 0; i < 65536; i++)
+      _u16ToF16Lut[i] = float32ToFloat16Bits(i / 65535);
   }
   return _u16ToF16Lut;
 }
@@ -101,4 +102,20 @@ export function uint16ToFloat16(uint16Data: Uint16Array): Uint16Array {
   }
 
   return float16Data;
+}
+
+const NativeFloat16Array = (
+  globalThis as unknown as {
+    Float16Array?: new (a: ArrayLike<number>) => { buffer: ArrayBuffer };
+  }
+).Float16Array;
+
+/** Float32 values → float16 bits (native Float16Array conversion when available). */
+export function float32ToFloat16Array(f: Float32Array): Uint16Array {
+  if (NativeFloat16Array) {
+    return new Uint16Array(new NativeFloat16Array(f).buffer);
+  }
+  const out = new Uint16Array(f.length);
+  for (let i = 0; i < f.length; i++) out[i] = float32ToFloat16Bits(f[i]!);
+  return out;
 }

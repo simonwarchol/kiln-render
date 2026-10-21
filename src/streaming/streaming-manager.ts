@@ -10,7 +10,7 @@ import {
   isAABBInFrustum,
 } from "../core/camera.js";
 import type { DatasetConfig } from "../core/config.js";
-import { PHYSICAL_BRICK_SIZE } from "../core/config.js";
+import { clipToWorld, PHYSICAL_BRICK_SIZE } from "../core/config.js";
 import { writeToCanvas } from "../core/volume.js";
 import type { VolumeResources } from "../core/volume-resources.js";
 import type {
@@ -32,6 +32,31 @@ export interface BrickRequest {
   bz: number;
   distance: number;
   key: string;
+}
+
+/**
+ * Cap an octree desired set to what the atlas can actually hold: every pinned
+ * brick plus the closest unpinned candidates. Without this, missing-brick
+ * queues sit at 1024 forever once the atlas is full of still-desired residents
+ * (they get re-touched every recompute and are never evictable).
+ */
+export function selectResidentSet(
+  candidates: readonly BrickRequest[],
+  pinnedKeys: ReadonlySet<string>,
+  capacity: number,
+): BrickRequest[] {
+  const pinned: BrickRequest[] = [];
+  const unpinned: BrickRequest[] = [];
+  for (const brick of candidates) {
+    if (pinnedKeys.has(brick.key)) pinned.push(brick);
+    else unpinned.push(brick);
+  }
+  unpinned.sort((a, b) => a.distance - b.distance);
+  const budget = Math.max(0, capacity - pinnedKeys.size);
+  if (unpinned.length <= budget) {
+    return pinned.length === 0 ? unpinned : pinned.concat(unpinned);
+  }
+  return pinned.concat(unpinned.slice(0, budget));
 }
 
 export interface LoadedBrickInfo {
@@ -167,13 +192,19 @@ export class StreamingManager {
   // Split to finer LOD when projected voxel error exceeds this value
   // Lower = higher quality, more bricks loaded
   // Higher = lower quality, fewer bricks loaded
-  public maxPixelError = 8.0;
+  public maxPixelError = 1.5;
 
   /**
    * When non-null, force the desired set to this pyramid level (0 = finest,
    * metadata.maxLod = coarsest). `null` restores automatic SSE selection.
    */
   public forcedLod: number | null = null;
+  /**
+   * Renderer clip box (0–1 per axis), shared by reference. Bricks outside it
+   * are never streamed: they would take atlas slots without being drawn.
+   */
+  public clipBox: { min: ArrayLike<number>; max: ArrayLike<number> } | null =
+    null;
 
   /** Per-channel fetch mask. Hidden channels are not requested on LOD changes. */
   private channelEnabled: boolean[];
@@ -189,6 +220,8 @@ export class StreamingManager {
 
   // Suspends load-queue draining when atlas is full; retries on next computeDesiredSet.
   private allocationStalled = false;
+  /** Camera is being dragged: new dispatches wait until it settles. */
+  private dispatchGated = false;
 
   // cached zero-filled bricks per bit depth, used to clear stale slot
   // contents when a channel's fetch failed
@@ -267,7 +300,11 @@ export class StreamingManager {
     // Promise.all per brick cannot flood Imaris(≤4)/Zarr(≤8) worker pools.
     this.maxConcurrentChannelJobs =
       numChannels > 1 ? 8 : this.maxConcurrentRequests;
-    this.brickCache = new BrickCache(numChannels * 256 * 1024 * 1024);
+    // CPU-side brick cache. Capped in total: with many channels a per-channel
+    // budget ran into GiBs of JS memory alongside the GPU atlas.
+    this.brickCache = new BrickCache(
+      Math.min(512, 128 * numChannels) * 1024 * 1024,
+    );
 
     // Use page load start time if provided for true time-to-first-render
     this.loadStartTime = pageLoadStartTime ?? performance.now();
@@ -843,9 +880,8 @@ export class StreamingManager {
     // Gate new dispatches during interaction — keep recomputing the desired
     // set (so cancellation stays fresh) but don't start new loads that will
     // likely be stale in 100ms. Stream full detail when the camera settles.
-    if (!camera.isInteracting()) {
-      this.processLoadQueue();
-    }
+    this.dispatchGated = camera.isInteracting();
+    this.processLoadQueue();
   }
 
   /**
@@ -930,6 +966,14 @@ export class StreamingManager {
   /**
    * Get current stats
    */
+  /**
+   * The view wants more bricks than the atlas can hold: the rest stay queued
+   * (shown at coarser parents) and nothing is loading. Waiting won't help.
+   */
+  get isStalled(): boolean {
+    return this.allocationStalled && this.inFlightRequests.size === 0;
+  }
+
   getStats(): StreamingStats {
     const networkStats = this.dataProvider.getNetworkStats();
     const providerTimings = this.dataProvider.getPipelineTimings?.() ?? {
@@ -985,6 +1029,11 @@ export class StreamingManager {
     const projMatrix = camera.getProjectionMatrix(aspect);
     const viewProj = mat4.multiply(projMatrix, viewMatrix);
     const frustum = extractFrustumPlanes(viewProj);
+    const { lo: clipLo, hi: clipHi } = clipToWorld(
+      this.config.normalizedSize,
+      this.clipBox?.min ?? [-Infinity, -Infinity, -Infinity],
+      this.clipBox?.max ?? [Infinity, Infinity, Infinity],
+    );
 
     // projectionFactor targets full canvas resolution — LOD selection pre-loads
     // fine bricks during interaction; dispatch gating prevents wasted loads.
@@ -1023,9 +1072,17 @@ export class StreamingManager {
       // Get brick AABB
       const aabb = this.getBrickAABB(bx, by, bz, lod);
 
-      // Frustum culling
+      // Frustum and clip-box culling
       if (!isAABBInFrustum(aabb.min, aabb.max, frustum)) {
         return;
+      }
+      for (let a = 0; a < 3; a++) {
+        if (
+          (aabb.max[a] as number) <= (clipLo[a] as number) ||
+          (aabb.min[a] as number) >= (clipHi[a] as number)
+        ) {
+          return;
+        }
       }
 
       // Distance check
@@ -1119,9 +1176,15 @@ export class StreamingManager {
       }
     }
 
+    const residentBricks = selectResidentSet(
+      desiredBricks,
+      this.pinnedBricks,
+      this.resources.allocator.totalSlots,
+    );
+
     // Update desired keys set (used for stale check)
     this.desiredKeys.clear();
-    for (const brick of desiredBricks) {
+    for (const brick of residentBricks) {
       this.desiredKeys.add(brick.key);
     }
 
@@ -1151,7 +1214,7 @@ export class StreamingManager {
 
     // Touch all desired bricks that are already loaded
     let loadedCount = 0;
-    for (const brick of desiredBricks) {
+    for (const brick of residentBricks) {
       const entry = this.loadedBricks.get(brick.key);
       if (entry) {
         this.resources.allocator.touch(entry.slotIndex, this.frameCount);
@@ -1168,7 +1231,7 @@ export class StreamingManager {
     }
 
     // Find missing bricks and add to load queue
-    const missingBricks = desiredBricks.filter(
+    const missingBricks = residentBricks.filter(
       (b) => !this.loadedBricks.has(b.key) && !this.inFlightRequests.has(b.key),
     );
 
@@ -1181,7 +1244,7 @@ export class StreamingManager {
 
     // Update stats (network stats and timing are fetched live in getStats())
     this.lastStats = {
-      desiredCount: desiredBricks.length,
+      desiredCount: residentBricks.length,
       loadedCount,
       pendingCount: this.loadQueue.length + this.inFlightRequests.size,
       cancelledCount,
@@ -1223,10 +1286,11 @@ export class StreamingManager {
    * Process pending load requests (non-blocking)
    */
   private processLoadQueue(): void {
-    // an allocation was refused since the last desired-set
-    // recompute — don't burn network/worker time on bricks that can't get a
-    // slot. computeDesiredSet clears the flag (retry point).
-    if (this.allocationStalled) return;
+    // No new loads while the camera is being dragged (they'd be stale), or
+    // after an allocation was refused since the last desired-set recompute —
+    // don't burn network/worker time on bricks that can't get a slot.
+    // computeDesiredSet clears the stall flag (retry point).
+    if (this.dispatchGated || this.allocationStalled) return;
 
     // Start new requests up to max concurrent
     while (
@@ -1235,7 +1299,12 @@ export class StreamingManager {
     ) {
       // pre-dispatch check: if the atlas is full and nothing is
       // evictable, stop dispatching *before* paying the fetch cost.
-      if (!this.resources.allocator.hasEvictableSlot(this.frameCount)) {
+      if (
+        !this.resources.allocator.hasEvictableSlot(
+          this.frameCount,
+          this.desiredKeys.size > 0 ? this.desiredKeys : undefined,
+        )
+      ) {
         this.allocationStalled = true;
         break;
       }
@@ -1264,6 +1333,8 @@ export class StreamingManager {
           this.inFlightRequests.delete(request.key);
         }
         this.dispatchTimestamps.delete(request.key);
+        // Refill the freed slot now rather than on the next update tick.
+        this.processLoadQueue();
       });
     }
   }
@@ -1378,7 +1449,10 @@ export class StreamingManager {
     }
 
     // Allocate one slot (shared atlas position across all channels)
-    const result = this.resources.allocator.allocate(this.frameCount);
+    const result = this.resources.allocator.allocate(
+      this.frameCount,
+      this.desiredKeys.size > 0 ? this.desiredKeys : undefined,
+    );
     if (!result) {
       // silent backpressure — the brick stays desired and retries after
       // the next computeDesiredSet; the shader keeps rendering the coarser
