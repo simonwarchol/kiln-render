@@ -1,19 +1,25 @@
 /** Dev-only GPU self-tests (open /app/gpu-tests.html). Results also on window.__gpuTests. */
 
+import { trainWithBrush } from "@kiln/splat/brush-trainer.js";
+import { cloudFromParams } from "@kiln/splat/cloud.js";
 import {
-  type Blend,
-  backwardReference,
   intrinsicsFor,
   PARAM_STRIDE,
   renderReference,
 } from "@kiln/splat/cpu-reference.js";
-import { readBuffer, STORAGE_RW } from "@kiln/splat/gpu/kernel.js";
+import {
+  createBuffer,
+  readBuffer,
+  STORAGE_RW,
+} from "@kiln/splat/gpu/kernel.js";
 import { GpuRadixSort } from "@kiln/splat/gpu/radix-sort.js";
-import { SplatRasterizer } from "@kiln/splat/gpu/rasterizer.js";
+import {
+  type SplatCamera,
+  SplatRasterizer,
+} from "@kiln/splat/gpu/rasterizer.js";
 import { GpuScan } from "@kiln/splat/gpu/scan.js";
-import { SsimLoss } from "@kiln/splat/gpu/ssim.js";
-import { GpuGaussians, SplatTrainStep } from "@kiln/splat/gpu/trainer.js";
-import { ssimReference } from "@kiln/splat/ssim-reference.js";
+import { evaluateCloud, sphereDirections } from "@kiln/splat/splat-builder.js";
+import { float32ToFloat16Array } from "@kiln/utils/float16.js";
 import { mat4 } from "wgpu-matrix";
 
 const logEl = document.getElementById("log")!;
@@ -160,7 +166,6 @@ async function testForward(
   count: number,
   w: number,
   h: number,
-  blend: Blend = "alpha",
 ): Promise<void> {
   const params = randomScene(count, count);
   const pbuf = device.createBuffer({
@@ -171,7 +176,6 @@ async function testForward(
   const view = mat4.lookAt([0.4, -0.5, 1.6], [0, 0, 0], [0, -1, 0]);
   const cam = intrinsicsFor(Array.from(view), w, h);
   const r = new SplatRasterizer(device);
-  r.blend = blend;
   r.resize(w, h);
   r.setGaussians(pbuf, count);
   const enc = device.createCommandEncoder();
@@ -180,7 +184,7 @@ async function testForward(
   const gpu = new Float32Array(
     await readBuffer(device, r.image, 0, w * h * 16),
   );
-  const cpu = renderReference(params, count, cam, blend);
+  const cpu = renderReference(params, count, cam);
   let maxDiff = 0;
   let at = -1;
   for (let i = 0; i < gpu.length; i++) {
@@ -211,309 +215,12 @@ async function testForward(
       : `first mismatch at ${firstMismatch} (gpu ${order[firstMismatch]} cpu ${cpuOrder[firstMismatch]})`,
   );
   log(
-    `forward${blend === "max" ? " (max blend)" : ""} vs CPU n=${count} ${w}x${h}`,
+    `forward vs CPU n=${count} ${w}x${h}`,
     maxDiff < 2e-3 && sumA > 1,
     `max |diff| ${maxDiff.toExponential(2)} at px ${Math.floor(at / 4)} ch ${at % 4} (gpu ${gpu[at]?.toFixed(4)} cpu ${cpu.image[at]?.toFixed(4)}); coverage ${sumA.toFixed(0)}; isects ${m}`,
   );
   r.destroy();
   pbuf.destroy();
-}
-
-async function testBackward(
-  device: GPUDevice,
-  count: number,
-  w: number,
-  h: number,
-  blend: Blend = "alpha",
-): Promise<void> {
-  const params = randomScene(count, count + 11);
-  const view = mat4.lookAt([-0.6, 0.3, 1.5], [0, 0, 0], [0, -1, 0]);
-  const cam = intrinsicsFor(Array.from(view), w, h);
-  const gs = new GpuGaussians(device, params, count);
-  const r = new SplatRasterizer(device);
-  r.blend = blend;
-  const tex = device.createTexture({
-    size: [w, h, 1],
-    format: "rgba16float",
-    usage: GPUTextureUsage.TEXTURE_BINDING,
-  });
-  const step = new SplatTrainStep(r, gs, {
-    texture: tex,
-    cameras: [{ ...cam, view: Float32Array.from(view) }],
-    width: w,
-    height: h,
-  });
-  r.setGaussians(gs.params, count);
-  const dImage = new Float32Array(w * h * 4);
-  for (let i = 0; i < dImage.length; i++) dImage[i] = Math.sin(i * 0.37) * 0.5;
-  device.queue.writeBuffer(step.dImage, 0, dImage);
-  const enc = device.createCommandEncoder();
-  r.encodeForward(enc, { ...cam, view: Float32Array.from(view) });
-  step.encodeBackwardOnly(enc);
-  device.queue.submit([enc.finish()]);
-  const gpu = new Float32Array(
-    await readBuffer(device, gs.grads, 0, count * PARAM_STRIDE * 4),
-  );
-  const cpu = backwardReference(
-    params,
-    count,
-    cam,
-    dImage,
-    renderReference(params, count, cam, blend),
-  );
-  let worst = 0;
-  let worstAt = "";
-  let maxMag = 0;
-  for (let g = 0; g < count; g++) {
-    for (let k = 0; k < 14; k++) {
-      const i = g * PARAM_STRIDE + k;
-      const a = gpu[i]!;
-      const b = cpu[i]!;
-      maxMag = Math.max(maxMag, Math.abs(b));
-      const rel = Math.abs(a - b) / Math.max(1e-3, Math.abs(b));
-      if (rel > worst) {
-        worst = rel;
-        worstAt = `g${g}[${k}] gpu ${a.toExponential(3)} cpu ${b.toExponential(3)}`;
-      }
-    }
-  }
-  log(
-    `backward${blend === "max" ? " (max blend)" : ""} vs CPU n=${count} ${w}x${h}`,
-    worst < 2e-2,
-    `worst rel err ${worst.toExponential(2)} (${worstAt}); max |grad| ${maxMag.toExponential(2)}`,
-  );
-  step.destroy();
-  gs.destroy();
-  r.destroy();
-  tex.destroy();
-}
-
-async function testTraining(device: GPUDevice): Promise<void> {
-  const count = 300;
-  const w = 128;
-  const h = 96;
-  const gt = randomScene(count, 99);
-  const nViews = 12;
-  const views: Array<
-    ReturnType<typeof intrinsicsFor> & { view: Float32Array }
-  > = [];
-  for (let i = 0; i < nViews; i++) {
-    const a = (i / nViews) * Math.PI * 2;
-    const el = 0.4 * Math.sin(i * 1.7);
-    const eye: [number, number, number] = [
-      1.6 * Math.cos(a) * Math.cos(el),
-      1.6 * Math.sin(el),
-      1.6 * Math.sin(a) * Math.cos(el),
-    ];
-    const view = Float32Array.from(mat4.lookAt(eye, [0, 0, 0], [0, -1, 0]));
-    views.push({ ...intrinsicsFor(view, w, h), view });
-  }
-  const tex = device.createTexture({
-    size: [w, h, nViews],
-    format: "rgba32float",
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-  });
-  const gtGs = new GpuGaussians(device, gt, count);
-  const r = new SplatRasterizer(device);
-  r.resize(w, h);
-  r.setGaussians(gtGs.params, count);
-  for (let i = 0; i < nViews; i++) {
-    const enc = device.createCommandEncoder();
-    r.encodeForward(enc, views[i]!);
-    enc.copyBufferToTexture(
-      { buffer: r.image, bytesPerRow: w * 16 },
-      { texture: tex, origin: [0, 0, i] },
-      [w, h, 1],
-    );
-    device.queue.submit([enc.finish()]);
-  }
-  // Perturbed initialisation
-  const init = gt.slice();
-  let seed = 5;
-  const rnd = () => {
-    seed = (seed * 1664525 + 1013904223) >>> 0;
-    return seed / 4294967296 - 0.5;
-  };
-  for (let g = 0; g < count; g++) {
-    const b = g * PARAM_STRIDE;
-    const jitter = (k: number, amt: number) => {
-      init[b + k] = init[b + k]! + rnd() * amt;
-    };
-    for (let k = 0; k < 3; k++) jitter(k, 0.04);
-    for (let k = 3; k < 6; k++) jitter(k, 0.6);
-    for (let k = 10; k < 13; k++) jitter(k, 3);
-    jitter(13, 2);
-  }
-  const gs = new GpuGaussians(device, init, count);
-  const step = new SplatTrainStep(r, gs, {
-    texture: tex,
-    cameras: views,
-    width: w,
-    height: h,
-  });
-  const lrs = {
-    mean: 2e-4,
-    scale: 5e-3,
-    quat: 1e-3,
-    color: 2.5e-2,
-    opacity: 2.5e-2,
-  };
-  const losses: number[] = [];
-  const t0 = performance.now();
-  const iters = 600;
-  for (let it = 0; it < iters; it++) {
-    const enc = device.createCommandEncoder();
-    step.encodeStep(enc, it % nViews, lrs);
-    device.queue.submit([enc.finish()]);
-    if ((it + 1) % 100 === 0) losses.push((await step.takeLoss()) / 100);
-  }
-  await device.queue.onSubmittedWorkDone();
-  const ms = (performance.now() - t0) / iters;
-  const first = losses[0]!;
-  const lastL = losses[losses.length - 1]!;
-  log(
-    "training converges (synthetic)",
-    lastL < first * 0.5,
-    `loss per 100 its: ${losses.map((l) => l.toExponential(2)).join(" → ")}; ${ms.toFixed(2)} ms/step`,
-  );
-  step.destroy();
-  gs.destroy();
-  gtGs.destroy();
-  r.destroy();
-  tex.destroy();
-}
-
-function denseSlab(count: number, seed = 3): Float32Array {
-  let a = seed;
-  const rand = () => {
-    a = (a * 1664525 + 1013904223) >>> 0;
-    return a / 4294967296;
-  };
-  const p = new Float32Array(count * PARAM_STRIDE);
-  for (let g = 0; g < count; g++) {
-    const b = g * PARAM_STRIDE;
-    p[b] = rand() - 0.5;
-    p[b + 1] = rand() - 0.5;
-    p[b + 2] = (rand() - 0.5) * 0.1;
-    const s = Math.log(0.0015 + rand() * 0.002);
-    p[b + 3] = s;
-    p[b + 4] = s;
-    p[b + 5] = s - 0.5;
-    p[b + 6] = 1;
-    p[b + 7] = rand() - 0.5;
-    p[b + 8] = rand() - 0.5;
-    p[b + 9] = rand() - 0.5;
-    p[b + 10] = (rand() - 0.5) * 2;
-    p[b + 11] = (rand() - 0.5) * 2;
-    p[b + 12] = (rand() - 0.5) * 2;
-    p[b + 13] = -2.5 + rand();
-  }
-  return p;
-}
-
-async function benchTraining(
-  device: GPUDevice,
-  count: number,
-  size: number,
-): Promise<void> {
-  const params = denseSlab(count);
-  const view = Float32Array.from(
-    mat4.lookAt([0.3, -0.9, 0.9], [0, 0, 0], [0, -1, 0]),
-  );
-  const cam = { ...intrinsicsFor(view, size, size), view };
-  const tex = device.createTexture({
-    size: [size, size, 1],
-    format: "rgba16float",
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-  });
-  const gs = new GpuGaussians(device, params, count);
-  const r = new SplatRasterizer(device);
-  const step = new SplatTrainStep(r, gs, {
-    texture: tex,
-    cameras: [cam],
-    width: size,
-    height: size,
-  });
-  r.setGaussians(gs.params, count);
-  const time = async (fn: (e: GPUCommandEncoder) => void) => {
-    const t0 = performance.now();
-    const enc = device.createCommandEncoder();
-    fn(enc);
-    device.queue.submit([enc.finish()]);
-    await device.queue.onSubmittedWorkDone();
-    return performance.now() - t0;
-  };
-  const fwd0 = await time((e) => r.encodeForward(e, cam));
-  const m = await r.intersectionTotal();
-  r.reserveIntersections(m);
-  step.invalidate();
-  const fwd = await time((e) => r.encodeForward(e, cam));
-  const bwd = await time((e) => step.encodeBackwardOnly(e));
-  const lrs = {
-    mean: 1e-4,
-    scale: 5e-3,
-    quat: 1e-3,
-    color: 5e-3,
-    opacity: 2.5e-2,
-  };
-  const full = await time((e) => step.encodeStep(e, 0, lrs));
-  log(
-    `train bench n=${count} ${size}²`,
-    true,
-    `isects ${m} (cap ${r.intersectionCapacity}); forward ${fwd0.toFixed(0)}→${fwd.toFixed(0)} ms, backward ${bwd.toFixed(0)} ms, full step ${full.toFixed(0)} ms`,
-  );
-  step.destroy();
-  gs.destroy();
-  r.destroy();
-  tex.destroy();
-}
-
-async function testSsim(device: GPUDevice): Promise<void> {
-  const w = 48;
-  const h = 37;
-  const n = w * h * 4;
-  const x = new Float32Array(n).map((_, i) => 0.5 + 0.3 * Math.sin(i * 0.7));
-  const y = new Float32Array(n).map((_, i) => 0.5 + 0.3 * Math.cos(i * 0.31));
-  const img = device.createBuffer({ size: n * 4, usage: STORAGE_RW });
-  device.queue.writeBuffer(img, 0, x);
-  const tex = device.createTexture({
-    size: [w, h, 1],
-    format: "rgba32float",
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-  });
-  device.queue.writeTexture({ texture: tex }, y, { bytesPerRow: w * 16 }, [
-    w,
-    h,
-    1,
-  ]);
-  const dImage = device.createBuffer({ size: n * 4, usage: STORAGE_RW });
-  const loss = device.createBuffer({ size: 16, usage: STORAGE_RW });
-  const ssim = new SsimLoss(device, w, h, tex, dImage, loss);
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  ssim.encode(pass, img, 0, 0.2);
-  pass.end();
-  device.queue.submit([enc.finish()]);
-  const gpu = new Float32Array(await readBuffer(device, dImage, 0, n * 4));
-  const gpuSsim = await ssim.readSsim();
-  const cpu = ssimReference(x, y, w, h, 0.2);
-  let worst = 0;
-  let maxMag = 0;
-  for (let i = 0; i < n; i++) {
-    maxMag = Math.max(maxMag, Math.abs(cpu.grad[i]!));
-    worst = Math.max(worst, Math.abs(gpu[i]! - cpu.grad[i]!));
-  }
-  const ok = worst < maxMag * 1e-3 && Math.abs(gpuSsim - cpu.ssim) < 1e-4;
-  log(
-    "SSIM vs CPU",
-    ok,
-    `ssim gpu ${gpuSsim.toFixed(5)} cpu ${cpu.ssim.toFixed(5)}; grad max |diff| ${worst.toExponential(2)} (max |grad| ${maxMag.toExponential(2)})`,
-  );
-  ssim.destroy();
-  img.destroy();
-  tex.destroy();
-  dImage.destroy();
-  loss.destroy();
 }
 
 async function benchForward(
@@ -560,6 +267,102 @@ async function benchForward(
   pbuf.destroy();
 }
 
+/**
+ * Brush round trip: render a known cloud with Kiln's rasterizer from many
+ * views, train Brush from that same cloud, and check it still matches. A
+ * wrong camera, quaternion or colour convention would wreck the score.
+ */
+async function testBrush(
+  device: GPUDevice,
+  count: number,
+  size: number,
+  nViews: number,
+  iterations: number,
+): Promise<void> {
+  const params = randomScene(count, 11);
+  for (let g = 0; g < count; g++) params[g * PARAM_STRIDE + 6] = 1; // ~unit quats
+  const pbuf = createBuffer(
+    device,
+    "test:brush",
+    params.byteLength,
+    STORAGE_RW,
+  );
+  device.queue.writeBuffer(pbuf, 0, params as Float32Array<ArrayBuffer>);
+  const texture = device.createTexture({
+    size: [size, size, nViews],
+    format: "rgba16float",
+    usage:
+      GPUTextureUsage.TEXTURE_BINDING |
+      GPUTextureUsage.COPY_DST |
+      GPUTextureUsage.COPY_SRC,
+  });
+  const r = new SplatRasterizer(device);
+  r.mipFilter = true;
+  r.resize(size, size);
+  r.setGaussians(pbuf, count);
+  r.reserveIntersections(count * 64);
+  const cameras: SplatCamera[] = [];
+  for (const [i, d] of sphereDirections(nViews).entries()) {
+    const eye = [d[0] * 2.2, d[1] * 2.2, d[2] * 2.2];
+    const up = Math.abs(d[1]) > 0.95 ? [0, 0, 1] : [0, 1, 0];
+    const view = Float32Array.from(mat4.lookAt(eye, [0, 0, 0], up));
+    const cam = { ...intrinsicsFor(Array.from(view), size, size), view };
+    cameras.push(cam);
+    const enc = device.createCommandEncoder();
+    r.encodeForward(enc, cam);
+    device.queue.submit([enc.finish()]);
+    const img = new Float32Array(
+      await readBuffer(device, r.image, 0, size * size * 16),
+    );
+    device.queue.writeTexture(
+      { texture, origin: [0, 0, i] },
+      float32ToFloat16Array(img) as Uint16Array<ArrayBuffer>,
+      { bytesPerRow: size * 8 },
+      [size, size, 1],
+    );
+  }
+  r.destroy();
+  const views = { texture, cameras, width: size, height: size, radius: 0.7 };
+  const black = [0, 0, 0];
+  const before = await evaluateCloud(device, pbuf, count, views, black);
+  const t0 = performance.now();
+  let error = "";
+  let after = 0;
+  let trained = 0;
+  try {
+    const cloud = await trainWithBrush(
+      device,
+      cloudFromParams(params, count),
+      views,
+      { iterations, maxSplats: count * 2 },
+    );
+    trained = cloud.count;
+    const tbuf = createBuffer(
+      device,
+      "test:brush-out",
+      cloud.params.byteLength,
+      STORAGE_RW,
+    );
+    device.queue.writeBuffer(
+      tbuf,
+      0,
+      cloud.params as Float32Array<ArrayBuffer>,
+    );
+    after = await evaluateCloud(device, tbuf, cloud.count, views, black);
+    tbuf.destroy();
+  } catch (e) {
+    error = String((e as Error)?.stack ?? e);
+  }
+  texture.destroy();
+  pbuf.destroy();
+  log(
+    `Brush round trip n=${count} ${nViews}×${size}² ${iterations} its`,
+    !error && after > 25,
+    error ||
+      `PSNR ${before.toFixed(1)} dB (source) → ${after.toFixed(1)} dB (trained), ${trained} splats, ${((performance.now() - t0) / 1000).toFixed(1)} s`,
+  );
+}
+
 async function main(): Promise<void> {
   const adapter = await navigator.gpu.requestAdapter({
     powerPreference: "high-performance",
@@ -581,6 +384,12 @@ async function main(): Promise<void> {
       (e as GPUUncapturedErrorEvent).error.message,
     );
   });
+  // ?only=brush runs just the Brush round trip.
+  if (new URLSearchParams(location.search).get("only") === "brush") {
+    await testBrush(device, 2000, 128, 24, 300);
+    logEl.appendChild(document.createTextNode("done\n"));
+    return;
+  }
   for (const n of [1, 1000, 1024, 1025, 70_000, 1_500_000])
     await testScan(device, n);
   await testSort(device, 1, 8);
@@ -593,21 +402,8 @@ async function main(): Promise<void> {
   await testForward(device, 1, 64, 48);
   await testForward(device, 50, 96, 64);
   await testForward(device, 400, 133, 101);
-  await testBackward(device, 1, 64, 48);
-  await testBackward(device, 30, 96, 64);
-  await testBackward(device, 300, 133, 101);
-  await testForward(device, 50, 96, 64, "max");
-  await testForward(device, 400, 133, 101, "max");
-  await testBackward(device, 30, 96, 64, "max");
-  await testBackward(device, 300, 133, 101, "max");
-  await testTraining(device);
-  await testSsim(device);
-  if (new URLSearchParams(location.search).has("bench")) {
-    await benchTraining(device, 100_000, 512);
-    await benchTraining(device, 300_000, 512);
-    await benchTraining(device, 1_000_000, 512);
-  }
   await benchForward(device, 1_000_000, 1280, 800);
+  await testBrush(device, 2000, 128, 24, 300);
   const tests =
     (
       window as unknown as {

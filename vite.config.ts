@@ -1,31 +1,34 @@
-import { defineConfig } from 'vite';
-import { resolve } from 'path';
-import { copyFavicons, legacyMultichannelRedirect } from './vite.favicons';
+import { resolve } from "path";
+import { defineConfig } from "vite";
+import { copyFavicons, legacyMultichannelRedirect } from "./vite.favicons";
 
 export default defineConfig({
-  root: 'examples/basic-viewer',
+  root: "examples/basic-viewer",
   // VITE_BASE is the site-root prefix (default /kiln-render/); the unified
   // viewer (single- + multi-channel) lives under <root>/app/. The site build
   // uses the bare root; CI preview overrides VITE_BASE with a branch-specific
   // prefix.
-  base: (process.env.VITE_BASE || '/kiln-render/') + 'app/',
-  publicDir: resolve(__dirname, 'public'),
+  base: (process.env.VITE_BASE || "/kiln-render/") + "app/",
+  publicDir: resolve(__dirname, "public"),
   plugins: [copyFavicons(), legacyMultichannelRedirect()],
+  // wasm-bindgen output finds its .wasm via import.meta.url; pre-bundling
+  // would move the JS away from it.
+  optimizeDeps: { exclude: ["brush-js"] },
   server: {
     port: 3000,
     open: true,
   },
   build: {
-    target: 'esnext',
-    minify: 'esbuild',
-    outDir: resolve(__dirname, 'dist/app'),
+    target: "esnext",
+    minify: "esbuild",
+    outDir: resolve(__dirname, "dist/app"),
     emptyOutDir: true,
     // public/ holds ~15 GB of dev-only test datasets — don't copy them into
     // the build (see vite.favicons.ts). Dev serving is unaffected.
     copyPublicDir: false,
   },
   worker: {
-    format: 'es',
+    format: "es",
     rollupOptions: {
       output: {
         // Inline all dynamic imports (zarrita codec chunks) into the worker
@@ -37,9 +40,9 @@ export default defineConfig({
   resolve: {
     alias: {
       // Allows example code to import from 'kiln-render' without publishing
-      'kiln-render': resolve(__dirname, 'src/index.ts'),
+      "kiln-render": resolve(__dirname, "src/index.ts"),
       // Allows example code to reach internal library modules cleanly
-      '@kiln': resolve(__dirname, 'src'),
+      "@kiln": resolve(__dirname, "src"),
     },
   },
 });

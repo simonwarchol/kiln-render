@@ -1,0 +1,23 @@
+{
+  "name": "brush-js",
+  "version": "1.0.0-79e8d37",
+  "description": "WebAssembly build of Brush's JS bindings (apps/brush-js), Apache-2.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./brush_js.js",
+  "types": "./brush_js.d.ts",
+  "exports": {
+    ".": {
+      "types": "./brush_js.d.ts",
+      "import": "./brush_js.js"
+    },
+    "./brush_js_bg.wasm": "./brush_js_bg.wasm"
+  },
+  "files": [
+    "brush_js.js",
+    "brush_js.d.ts",
+    "brush_js_bg.wasm",
+    "brush_js_bg.wasm.d.ts"
+  ],
+  "sideEffects": false
+}

@@ -1,18 +1,13 @@
 /**
  * SplatLayer — displays a Gaussian cloud in the Kiln viewer with the same
- * camera as the volume renderer, using the tile rasterizer (identical to the
- * one used for training, so what you see is what was optimised).
+ * camera as the volume renderer, using Kiln's tile rasterizer.
  */
 
 import type { Camera } from "../core/camera.js";
 import type { GaussianCloud } from "./cloud.js";
 import { PARAM_STRIDE } from "./cpu-reference.js";
 import { createBuffer, STORAGE_RW } from "./gpu/kernel.js";
-import {
-  type SplatBlend,
-  type SplatCamera,
-  SplatRasterizer,
-} from "./gpu/rasterizer.js";
+import { type SplatCamera, SplatRasterizer } from "./gpu/rasterizer.js";
 
 const FOV_Y = Math.PI / 4;
 
@@ -134,24 +129,7 @@ export class SplatLayer {
     );
     this.count = cloud.count;
     this.rasterizer.mipFilter = cloud.antialiased ?? false;
-    this.rasterizer.blend = cloud.blend ?? "alpha";
     this.rasterizer.setGaussians(this.ownParams, cloud.count);
-    this.version++;
-  }
-
-  /** Display Gaussians from an external buffer (e.g. live training state). */
-  setExternal(
-    params: GPUBuffer,
-    count: number,
-    blend: SplatBlend = "alpha",
-  ): void {
-    this.cloud = null;
-    this.ownParams?.destroy();
-    this.ownParams = null;
-    this.count = count;
-    this.rasterizer.mipFilter = true;
-    this.rasterizer.blend = blend;
-    this.rasterizer.setGaussians(params, count);
     this.version++;
   }
 

@@ -6,8 +6,7 @@
  *   emit (tile, gaussian) pairs in depth order → stable sort by tile →
  *   tile ranges → per-tile front-to-back compositing.
  *
- * Output is a storage buffer of premultiplied RGBA (one vec4 per pixel) plus a
- * per-pixel (final T, last contributor) buffer the backward pass needs.
+ * Output is a storage buffer of premultiplied RGBA (one vec4 per pixel).
  * Everything stays on the GPU; the intersection total is read back
  * asynchronously only to grow buffers.
  */
@@ -29,7 +28,6 @@ import {
   PROJ_STRIDE,
   PROJECT_WGSL,
   RANGES_WGSL,
-  RASTERIZE_MAX_WGSL,
   RASTERIZE_WGSL,
   TILE,
   TILES_WGSL,
@@ -54,15 +52,7 @@ interface RasterKernels {
   rangesSetup: Kernel;
   ranges: Kernel;
   rasterize: Kernel;
-  rasterizeMax: Kernel;
 }
-
-/**
- * How Gaussians combine per pixel: `alpha` = front-to-back compositing (3DGS,
- * matches DVR / isosurface renders); `max` = largest single contribution per
- * channel (matches maximum-intensity projection).
- */
-export type SplatBlend = "alpha" | "max";
 
 const kernelCache = new WeakMap<GPUDevice, RasterKernels>();
 
@@ -134,21 +124,6 @@ function rasterKernels(device: GPUDevice): RasterKernels {
         "read-only-storage",
         "read-only-storage",
         "storage",
-        "storage",
-      ],
-    ),
-    rasterizeMax: createKernel(
-      device,
-      "splat:rasterize-max",
-      RASTERIZE_MAX_WGSL,
-      "rasterizeMax",
-      [
-        "uniform",
-        "read-only-storage",
-        "read-only-storage",
-        "read-only-storage",
-        "storage",
-        "storage",
       ],
     ),
   };
@@ -188,7 +163,6 @@ export class SplatRasterizer {
   tilesX = 0;
   tilesY = 0;
   image!: GPUBuffer;
-  aux!: GPUBuffer;
   tileRanges!: GPUBuffer;
   readonly camera: GPUBuffer;
   private readonly rangesIndirect: GPUBuffer;
@@ -203,8 +177,6 @@ export class SplatRasterizer {
    * Kiln-trained clouds; off for ordinary 3DGS files trained without it.
    */
   mipFilter = true;
-  /** Per-pixel combination; see {@link SplatBlend}. */
-  blend: SplatBlend = "alpha";
 
   private readbackPending = false;
   private lastCapacityCheck = 0;
@@ -250,18 +222,10 @@ export class SplatRasterizer {
     this.tilesX = Math.ceil(width / TILE);
     this.tilesY = Math.ceil(height / TILE);
     this.image?.destroy();
-    this.aux?.destroy();
     this.tileRanges?.destroy();
     this.image = createBuffer(
       this.device,
       "splat:image",
-      width * height * 16,
-      STORAGE_RW,
-    );
-    // Alpha blend keeps (T, last) per pixel; max blend the 4 winners.
-    this.aux = createBuffer(
-      this.device,
-      "splat:aux",
       width * height * 16,
       STORAGE_RW,
     );
@@ -413,21 +377,12 @@ export class SplatRasterizer {
         this.isectVals,
         this.tileRanges,
         this.image,
-        this.aux,
-      ]),
-      rasterizeMax: bindGroup(d, k.rasterizeMax, [
-        this.camera,
-        this.projected,
-        this.isectVals,
-        this.tileRanges,
-        this.image,
-        this.aux,
       ]),
     };
     return this.groups;
   }
 
-  /** Encode the full forward pass. Output lands in `image` / `aux`. */
+  /** Encode the full forward pass. Output lands in `image`. */
   encodeForward(
     encoder: GPUCommandEncoder,
     cam: SplatCamera,
@@ -483,9 +438,8 @@ export class SplatRasterizer {
     pass.setBindGroup(0, g.ranges!);
     pass.dispatchWorkgroupsIndirect(this.rangesIndirect, 0);
     pass = chain.stage("rasterize");
-    const max = this.blend === "max";
-    pass.setPipeline((max ? k.rasterizeMax : k.rasterize).pipeline);
-    pass.setBindGroup(0, (max ? g.rasterizeMax : g.rasterize)!);
+    pass.setPipeline(k.rasterize.pipeline);
+    pass.setBindGroup(0, g.rasterize!);
     pass.dispatchWorkgroups(this.tilesX, this.tilesY, 1);
     chain.end();
   }
@@ -515,7 +469,7 @@ export class SplatRasterizer {
       });
   }
 
-  /** Synchronous-ish variant for training: await the true total. */
+  /** Await the exact intersection total (offline evaluation). */
   async intersectionTotal(): Promise<number> {
     const buf = await readBuffer(this.device, this.offsets, this.count * 4, 4);
     return new Uint32Array(buf)[0] ?? 0;
@@ -542,7 +496,6 @@ export class SplatRasterizer {
       this.isectKeys,
       this.isectVals,
       this.image,
-      this.aux,
       this.tileRanges,
       this.camera,
       this.rangesIndirect,

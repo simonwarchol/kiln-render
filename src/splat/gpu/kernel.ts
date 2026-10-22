@@ -148,24 +148,6 @@ export function dispatch1d(
   pass.dispatchWorkgroups(x, y, 1);
 }
 
-/**
- * WGSL `fn <fnName>(i: u32, v: f32)`: float add into `<array>` (an
- * `array<atomic<u32>>`) by compare-exchange — WebGPU has no float atomics.
- * Zero adds are skipped.
- */
-export function wgslAtomicAddF(fnName: string, array: string): string {
-  return /* wgsl */ `
-fn ${fnName}(i: u32, v: f32) {
-  if (v == 0.0) { return; }
-  var old = atomicLoad(&${array}[i]);
-  loop {
-    let r = atomicCompareExchangeWeak(&${array}[i], old, bitcast<u32>(bitcast<f32>(old) + v));
-    if (r.exchanged) { break; }
-    old = r.old_value;
-  }
-}`;
-}
-
 /** WGSL snippet: linear workgroup index for 2D-split 1D dispatches. */
 export const WGSL_LINEAR_WORKGROUP = /* wgsl */ `
 fn linearWorkgroup(wid: vec3u, nwg: vec3u) -> u32 {

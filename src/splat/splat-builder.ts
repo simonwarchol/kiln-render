@@ -8,8 +8,7 @@
  *               (transparent background, premultiplied RGBA) into a GPU
  *               texture array — no PNG round trip;
  *  3. train   — photometric refinement of the fitted Gaussians against those
- *               views on the GPU (rasterizer + backward + Adam, with
- *               densification and pruning).
+ *               views with Brush, on the same GPU device (brush-trainer.ts).
  */
 
 import type { Camera } from "../core/camera.js";
@@ -19,12 +18,11 @@ import type { TransferFunction } from "../core/transfer-function.js";
 import type { DataProvider, VolumeMetadata } from "../data/data-provider.js";
 import type { StreamingManager } from "../streaming/streaming-manager.js";
 import { getFloat16ToFloat32Lut } from "../utils/float16.js";
+import { trainWithBrush } from "./brush-trainer.js";
 import { cloudFromParams, type GaussianCloud } from "./cloud.js";
-import { P_OPACITY, PARAM_STRIDE, sigmoid } from "./cpu-reference.js";
 import { createBuffer, readBuffer, STORAGE_RW } from "./gpu/kernel.js";
-import type { SplatBlend, SplatCamera } from "./gpu/rasterizer.js";
+import type { SplatCamera } from "./gpu/rasterizer.js";
 import { SplatRasterizer } from "./gpu/rasterizer.js";
-import { densify, GpuGaussians, SplatTrainStep } from "./gpu/trainer.js";
 import { splatCameraFor } from "./splat-layer.js";
 import type { ClassifyParams } from "./volume-fit.js";
 import { VolumeFitter } from "./volume-fit.js";
@@ -35,15 +33,6 @@ import type {
 import FitWorkerInline from "./volume-fit-worker.ts?worker&inline";
 
 export type BuildStage = "fit" | "capture" | "train" | "done";
-
-/** Log to the console and to `window.__kilnLog` (handy when devtools are closed). */
-export function debugLog(msg: string): void {
-  console.log(`[Kiln] ${msg}`);
-  const g = globalThis as unknown as { __kilnLog?: string[] };
-  g.__kilnLog ??= [];
-  g.__kilnLog.push(`${Math.round(performance.now())} ${msg}`);
-  if (g.__kilnLog.length > 500) g.__kilnLog.shift();
-}
 
 export interface BuildProgress {
   stage: BuildStage;
@@ -59,7 +48,7 @@ export interface BuildProgress {
 export interface SplatBuildOptions {
   /** Gaussians produced by the fit (training may densify up to 2×). Default 1M. */
   targetCount?: number;
-  /** Refine photometrically against DVR renders. Default true. */
+  /** Refine photometrically against volume renders with Brush. Default true. */
   train?: boolean;
   /** Training iterations (default 3000) */
   iterations?: number;
@@ -77,14 +66,7 @@ export interface SplatBuildOptions {
   fitLod?: number;
   /** Fit memory budget in bytes (default 512 MB) */
   fitMemoryBytes?: number;
-  /**
-   * How splats combine: "max" for maximum-intensity projections, "alpha"
-   * otherwise. `KilnViewer.generateSplats` picks it from the render mode.
-   */
-  blend?: SplatBlend;
   onProgress?: (p: BuildProgress) => void;
-  /** Called during training with the live Gaussians (for preview). */
-  onPreview?: (params: GPUBuffer, count: number) => void;
   signal?: AbortSignal;
 }
 
@@ -307,7 +289,6 @@ export async function fitVolume(
     );
     if (res.type !== "done") throw new Error("fit worker returned no result");
     const cloud = cloudFromParams(res.params, res.count, {
-      blend: opts.blend,
       worldScale: worldScaleOf(meta),
       worldUnit: "micron",
     });
@@ -621,124 +602,21 @@ export async function captureViews(
 // Train
 // ---------------------------------------------------------------------------
 
-/** Stage 3: photometric refinement on the GPU. */
-export async function trainCloud(
-  device: GPUDevice,
+/** Stage 3: photometric refinement with Brush. */
+export function trainCloud(
+  host: SplatBuildHost,
   init: GaussianCloud,
   views: CapturedViews,
   opts: SplatBuildOptions = {},
 ): Promise<GaussianCloud> {
   const iterations = Math.max(1, opts.iterations ?? 3000);
-  const onProgress = opts.onProgress ?? (() => {});
-  const extent = Math.max(1e-3, views.radius);
-  const maxCount = Math.ceil((opts.targetCount ?? init.count) * 2);
-  const gs = new GpuGaussians(device, init.params, init.count);
-  const rasterizer = new SplatRasterizer(device);
-  rasterizer.blend = opts.blend ?? init.blend ?? "alpha";
-  const step = new SplatTrainStep(rasterizer, gs, views);
-  const nViews = views.cameras.length;
-  let order: number[] = [];
-  const lerpLog = (a: number, b: number, t: number) =>
-    Math.exp(Math.log(a) * (1 - t) + Math.log(b) * t);
-  const densifyFrom = 300;
-  const densifyUntil = Math.floor(iterations * 0.6);
-  const densifyEvery = 300;
-  let lastLoss = Number.NaN;
-  let lossIts = 0;
-  try {
-    for (let it = 0; it < iterations; it++) {
-      throwIfAborted(opts.signal);
-      if (order.length === 0) {
-        order = Array.from({ length: nViews }, (_, i) => i);
-        for (let i = order.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [order[i], order[j]] = [order[j]!, order[i]!];
-        }
-      }
-      const view = order.pop()!;
-      const t = it / Math.max(1, iterations - 1);
-      const lrs = {
-        mean: lerpLog(1.6e-4 * extent, 1.6e-6 * extent, t),
-        scale: 5e-3,
-        quat: 1e-3,
-        color: 5e-3,
-        opacity: 2.5e-2,
-      };
-      const enc = device.createCommandEncoder({ label: "splat:train-step" });
-      step.encodeStep(enc, view, lrs);
-      device.queue.submit([enc.finish()]);
-      lossIts++;
-
-      // Keep intersection buffers large enough (checked against the GPU total).
-      if (it % 20 === 0) {
-        const m = await rasterizer.intersectionTotal();
-        if (rasterizer.reserveIntersections(m)) step.invalidate();
-      }
-
-      if (it >= densifyFrom && it <= densifyUntil && it % densifyEvery === 0) {
-        const [params, stats] = await Promise.all([
-          gs.download(),
-          gs.downloadStats(),
-        ]);
-        const res = densify(params, stats, gs.count, {
-          gradThreshold: 1e-7,
-          fraction: 0.06,
-          splitScale: 0.01 * extent,
-          minOpacity: 0.005,
-          maxScale: 0.15 * extent,
-          maxCount,
-        });
-        gs.upload(res.params, res.count);
-        step.invalidate();
-        debugLog(
-          `densify @${it}: +${res.cloned} cloned, +${res.split} split, −${res.pruned} pruned → ${res.count}`,
-        );
-      }
-
-      if (it % 50 === 49 || it === iterations - 1) {
-        const l = await step.takeLosses();
-        lastLoss = l.l1 / lossIts;
-        const ssim = l.ssim / lossIts;
-        lossIts = 0;
-        debugLog(
-          `train it ${it + 1}: L1 ${lastLoss.toFixed(4)}, SSIM ${ssim.toFixed(4)}, ${gs.count} Gaussians`,
-        );
-        onProgress({
-          stage: "train",
-          fraction: (it + 1) / iterations,
-          label: `Training ${it + 1}/${iterations} · loss ${lastLoss.toExponential(2)} · ${gs.count.toLocaleString()} Gaussians`,
-          gaussians: gs.count,
-          loss: lastLoss,
-        });
-        if (it % 200 === 199) opts.onPreview?.(gs.params, gs.count);
-        await yieldTask();
-      }
-    }
-    const params = await gs.download();
-    // Drop Gaussians that ended up invisible.
-    let keep = 0;
-    for (let i = 0; i < gs.count; i++) {
-      if (sigmoid(params[i * PARAM_STRIDE + P_OPACITY]!) >= 0.004) {
-        if (keep !== i) {
-          params.copyWithin(
-            keep * PARAM_STRIDE,
-            i * PARAM_STRIDE,
-            (i + 1) * PARAM_STRIDE,
-          );
-        }
-        keep++;
-      }
-    }
-    return cloudFromParams(params.slice(0, keep * PARAM_STRIDE), keep, {
-      blend: rasterizer.blend,
-      worldScale: init.worldScale,
-      worldUnit: init.worldUnit,
-    });
-  } finally {
-    step.destroy();
-    rasterizer.destroy();
-    gs.destroy();
-  }
+  return trainWithBrush(host.device, init, views, {
+    iterations,
+    maxSplats: Math.ceil((opts.targetCount ?? init.count) * 2),
+    signal: opts.signal,
+    onProgress: (fraction, label, gaussians) =>
+      opts.onProgress?.({ stage: "train", fraction, label, gaussians }),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -755,10 +633,8 @@ export async function evaluateCloud(
   count: number,
   views: CapturedViews,
   background: ArrayLike<number>,
-  blend: SplatBlend = "alpha",
 ): Promise<number> {
   const r = new SplatRasterizer(device);
-  r.blend = blend;
   const { width: w, height: h } = views;
   const rowBytes = Math.ceil((w * 8) / 256) * 256;
   const staging = createBuffer(

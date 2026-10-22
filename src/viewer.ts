@@ -147,7 +147,7 @@ const ATLAS_GRID_CAP_KEY = "kiln-atlas-grid-cap";
 
 async function requestKilnDevice(adapter: GPUAdapter): Promise<GPUDevice> {
   const limits = adapter.limits;
-  // Optional: subgroups speed up splat-training reductions; timestamp-query
+  // Optional: subgroups speed up the splat depth sort; timestamp-query
   // enables GpuProfiler.
   const features = (
     ["subgroups", "timestamp-query"] as GPUFeatureName[]
@@ -238,7 +238,7 @@ async function createVolumeResourcesFittingDevice(
 export interface GenerateSplatsOptions extends SplatBuildOptions {
   /**
    * Render mode the splats reproduce (default: the displayed one, or volume
-   * rendering for other modes). MIP builds max-blended splats.
+   * rendering for other modes).
    */
   renderMode?: "dvr" | "mip" | "iso";
   /** Volume-rendering density (default: the displayed one). */
@@ -277,7 +277,7 @@ const canvasOwner = new WeakMap<HTMLCanvasElement, KilnViewer>();
 
 /**
  * Fit density for MIP builds. MIP ignores density, but the fit derives
- * opacity from it; this starts max-blended splats near MIP brightness.
+ * opacity from it; this gives training a starting cloud near MIP brightness.
  */
 const MIP_FIT_DENSITY = 1;
 
@@ -894,7 +894,7 @@ export class KilnViewer {
    * Turn the volume — with its current channels, colours, windows and
    * transfer function, in `renderMode` at `density` inside `region` (each
    * defaulting to what is displayed) — into Gaussian splats: a direct
-   * moment-matched fit from the voxels, optionally refined on the GPU against
+   * moment-matched fit from the voxels, optionally refined with Brush against
    * renders of the same volume. The viewer's render state is restored after;
    * the result is shown and returned.
    */
@@ -915,8 +915,6 @@ export class KilnViewer {
     const mode =
       opts.renderMode ??
       (saved.mode === "mip" || saved.mode === "iso" ? saved.mode : "dvr");
-    // Splats reproduce what is rendered: MIP needs max-blended splats.
-    const blend = opts.blend ?? (mode === "mip" ? "max" : "alpha");
     const region: Box = opts.region ?? {
       min: [saved.clipMin[0]!, saved.clipMin[1]!, saved.clipMin[2]!],
       max: [saved.clipMax[0]!, saved.clipMax[1]!, saved.clipMax[2]!],
@@ -940,14 +938,13 @@ export class KilnViewer {
         r.clipMin.set(box.train.min);
         r.clipMax.set(box.train.max);
         r.resetAccumulation();
-        const cloud = await this.buildSplats({ ...opts, blend, targetCount });
+        const cloud = await this.buildSplats({ ...opts, targetCount });
         parts.push({ ...cloud, core: box.core });
       }
       const first = parts[0]!;
       if (parts.length === 1) return first;
       const merged = mergeTileParams(parts, this.config.normalizedSize);
       const cloud = cloudFromParams(merged.params, merged.count, {
-        blend,
         worldScale: first.worldScale,
         worldUnit: first.worldUnit,
       });
@@ -968,7 +965,6 @@ export class KilnViewer {
   /** Fit (+ train, + evaluate) the region inside the current clip box. */
   private async buildSplats(opts: SplatBuildOptions): Promise<GaussianCloud> {
     const host = this.buildHost();
-    const blend = opts.blend ?? "alpha";
     let views: CapturedViews | null = null;
     let evalViews: CapturedViews | null = null;
     try {
@@ -991,14 +987,7 @@ export class KilnViewer {
         });
       }
       if (views) {
-        cloud = await trainCloud(this.device, cloud, views, {
-          ...opts,
-          onPreview: (params, count) => {
-            this.splats.setExternal(params, count, blend);
-            this.renderNow();
-            opts.onPreview?.(params, count);
-          },
-        });
+        cloud = await trainCloud(host, cloud, views, opts);
         this.setSplats(cloud);
       }
       // setSplats uploaded the cloud: evaluate that buffer.
@@ -1011,7 +1000,6 @@ export class KilnViewer {
               cloud.count,
               evalViews,
               this.renderer.background,
-              blend,
             )
           : undefined;
       opts.onProgress?.({

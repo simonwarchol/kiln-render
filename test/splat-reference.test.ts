@@ -1,8 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mat4 } from "wgpu-matrix";
 import {
-  type Blend,
-  backwardReference,
   intrinsicsFor,
   PARAM_STRIDE,
   renderReference,
@@ -50,19 +48,6 @@ function camera(eye: [number, number, number]) {
   return intrinsicsFor(Array.from(view), W, H);
 }
 
-function loss(
-  p: ArrayLike<number>,
-  count: number,
-  cam: ReturnType<typeof camera>,
-  w: Float64Array,
-  blend: Blend = "alpha",
-) {
-  const r = renderReference(p, count, cam, blend);
-  let l = 0;
-  for (let i = 0; i < r.image.length; i++) l += r.image[i]! * w[i]!;
-  return l;
-}
-
 describe("splat CPU reference", () => {
   it("renders something inside the frame", () => {
     const p = scene(1, 5);
@@ -73,54 +58,4 @@ describe("splat CPU reference", () => {
     expect(sumA).toBeGreaterThan(5);
     expect(r.order.length).toBe(5);
   });
-
-  for (const [seed, eye, blend] of [
-    [2, [0.3, -0.4, 1.8], "alpha"],
-    [3, [-1.2, 0.5, 1.1], "alpha"],
-    [4, [0.1, 1.5, 0.6], "alpha"],
-    [5, [0.3, -0.4, 1.8], "max"],
-    [6, [-1.2, 0.5, 1.1], "max"],
-  ] as const) {
-    it(`analytic gradients match finite differences (${blend}, seed ${seed})`, () => {
-      const count = 4;
-      const p = scene(seed, count);
-      const cam = camera(eye as unknown as [number, number, number]);
-      const rand = mulberry32(seed + 100);
-      const w = new Float64Array(W * H * 4);
-      for (let i = 0; i < w.length; i++) w[i] = rand() - 0.5;
-      const grad = backwardReference(
-        p,
-        count,
-        cam,
-        w,
-        renderReference(p, count, cam, blend),
-      );
-      const eps = 1e-5;
-      let checked = 0;
-      let maxRel = 0;
-      for (let g = 0; g < count; g++) {
-        for (let k = 0; k < 14; k++) {
-          const i = g * PARAM_STRIDE + k;
-          const q = Float64Array.from(p);
-          q[i] = p[i]! + eps;
-          const lp = loss(q, count, cam, w, blend);
-          q[i] = p[i]! - eps;
-          const lm = loss(q, count, cam, w, blend);
-          const fd = (lp - lm) / (2 * eps);
-          const an = grad[i]!;
-          const scale = Math.max(1e-2, Math.abs(fd), Math.abs(an));
-          const rel = Math.abs(fd - an) / scale;
-          maxRel = Math.max(maxRel, rel);
-          if (rel > 2e-2) {
-            throw new Error(
-              `param g${g}[${k}] analytic ${an.toExponential(4)} vs fd ${fd.toExponential(4)}`,
-            );
-          }
-          checked++;
-        }
-      }
-      expect(checked).toBe(count * 14);
-      expect(maxRel).toBeLessThan(2e-2);
-    });
-  }
 });

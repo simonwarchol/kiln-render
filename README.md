@@ -3,7 +3,7 @@
 A WebGPU viewer for large microscopy volumes — **Imaris (`.ims`)** first, OME-Zarr too — that streams multi-gigabyte files over HTTP at interactive framerates, **turns the volume into 3D Gaussian splats** in the browser, and plays the splats back side by side with the volume.
 
 - **Imaris over plain HTTPS/S3** — a built-in async HDF5 reader fetches only the chunks it needs (coalesced `Range` requests, a shared de-duplicating fetcher, persistent OPFS chunk store, one decode per chunk), so a 2.6 GB, 18-channel float32 `.ims` shows a first image within seconds (≈8 s from a cold start against S3 in our tests, dominated by HDF5 metadata round trips) and refines progressively; revisits come from the local cache. Pick any 6 channels to render; names, colours and display ranges come from the file.
-- **Volume → splats** — fit anisotropic Gaussians directly to the voxels (seconds), then refine them on the GPU against Kiln's own volume renders (differentiable tile rasterizer, L1 + D-SSIM, Adam, densification). No Python/CUDA/external trainer.
+- **Volume → splats** — fit anisotropic Gaussians directly to the voxels (seconds), then refine them against Kiln's own volume renders with [Brush](https://github.com/ArthurBrussee/brush) (WebAssembly, in the browser). No Python/CUDA.
 - **Playback** — splats render with the same camera as the volume (*Volume / Split / Splats*), and save/load as standard 3DGS `.ply` (SuperSplat, PlayCanvas, Brush…).
 
 ```text

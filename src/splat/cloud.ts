@@ -19,7 +19,6 @@ import {
   P_SCALE,
   PARAM_STRIDE,
 } from "./cpu-reference.js";
-import type { SplatBlend } from "./gpu/rasterizer.js";
 
 const SH_C0 = 0.28209479177387814;
 
@@ -32,11 +31,6 @@ export interface GaussianCloud {
    * 3DGS files are not and should be rendered without it.
    */
   antialiased?: boolean;
-  /**
-   * How splats combine per pixel: "max" for clouds trained against
-   * maximum-intensity projections. Omitted = "alpha" (standard 3DGS).
-   */
-  blend?: SplatBlend;
   /** Physical units per normalised unit (optional metadata) */
   worldScale?: number;
   worldUnit?: string;
@@ -50,13 +44,12 @@ export function createCloud(count: number): GaussianCloud {
 export function cloudFromParams(
   params: Float32Array,
   count: number,
-  meta: Pick<GaussianCloud, "blend" | "worldScale" | "worldUnit"> = {},
+  meta: Pick<GaussianCloud, "worldScale" | "worldUnit"> = {},
 ): GaussianCloud {
   return {
     count,
     params,
     antialiased: true,
-    ...(meta.blend === "max" ? { blend: "max" as const } : {}),
     ...(meta.worldScale !== undefined ? { worldScale: meta.worldScale } : {}),
     ...(meta.worldUnit !== undefined ? { worldUnit: meta.worldUnit } : {}),
   };
@@ -134,7 +127,6 @@ export function writePly(cloud: GaussianCloud): Uint8Array {
     "comment kiln-render gaussian splats",
   ];
   if (cloud.antialiased) lines.push("comment kiln mip_filter 1");
-  if (cloud.blend === "max") lines.push("comment kiln blend max");
   if (cloud.worldScale) {
     lines.push(`comment kiln world_scale ${cloud.worldScale}`);
     if (cloud.worldUnit)
@@ -243,7 +235,6 @@ export function readPly(bytes: Uint8Array): GaussianCloud {
   let worldScale: number | undefined;
   let worldUnit: string | undefined;
   let antialiased = false;
-  let blend: SplatBlend | undefined;
   const props: Array<{ name: string; type: string; offset: number }> = [];
   let stride = 0;
   for (const line of lines) {
@@ -252,8 +243,6 @@ export function readPly(bytes: Uint8Array): GaussianCloud {
       worldScale = Number(t[3]);
     } else if (t[0] === "comment" && t[1] === "kiln" && t[2] === "mip_filter") {
       antialiased = t[3] === "1";
-    } else if (t[0] === "comment" && t[1] === "kiln" && t[2] === "blend") {
-      if (t[3] === "max") blend = "max";
     } else if (t[0] === "comment" && t[1] === "kiln" && t[2] === "world_unit") {
       worldUnit = t[3];
     } else if (t[0] === "element") {
@@ -308,7 +297,6 @@ export function readPly(bytes: Uint8Array): GaussianCloud {
   cloud.worldScale = worldScale;
   cloud.worldUnit = worldUnit;
   cloud.antialiased = antialiased;
-  if (blend) cloud.blend = blend;
   const p = cloud.params;
   for (let i = 0; i < count; i++) {
     const b = i * PARAM_STRIDE;

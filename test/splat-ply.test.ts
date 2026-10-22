@@ -36,9 +36,6 @@ describe("splat PLY round trip", () => {
     expect(back.worldScale).toBeCloseTo(307.2);
     expect(back.worldUnit).toBe("micron");
     expect(back.antialiased).toBe(true);
-    expect(back.blend).toBeUndefined();
-    c.blend = "max";
-    expect(readPly(writePly(c)).blend).toBe("max");
     for (let i = 0; i < 3; i++) {
       const b = i * PARAM_STRIDE;
       for (const k of [0, 1, 2, 3, 4, 5, 13]) {

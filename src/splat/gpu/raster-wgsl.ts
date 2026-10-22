@@ -324,7 +324,7 @@ fn tileRangesKernel(
 
 /**
  * Bindings: 0 camera, 1 projected, 2 isectVals, 3 tileRanges, 4 image (vec4 per
- * pixel, premultiplied), 5 aux (finalT, lastIndex) per pixel.
+ * pixel, premultiplied).
  */
 export const RASTERIZE_WGSL = /* wgsl */ `
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -332,7 +332,6 @@ export const RASTERIZE_WGSL = /* wgsl */ `
 @group(0) @binding(2) var<storage, read> isectVals: array<u32>;
 @group(0) @binding(3) var<storage, read> tileRanges: array<u32>;
 @group(0) @binding(4) var<storage, read_write> image: array<vec4f>;
-@group(0) @binding(5) var<storage, read_write> aux: array<vec2f>;
 
 var<private> params: array<f32, 1>;
 
@@ -364,7 +363,6 @@ fn rasterize(
 
   var T = 1.0;
   var C = vec3f(0.0);
-  var last = range.x;
   var done = !inside;
   if (done) { atomicAdd(&doneCount, 1u); }
 
@@ -394,7 +392,6 @@ fn rasterize(
         if (nextT < T_MIN) { done = true; break; }
         C += shColor[j] * (alpha * T);
         T = nextT;
-        last = batch + j + 1u;
       }
       if (done) { atomicAdd(&doneCount, 1u); }
     }
@@ -402,91 +399,6 @@ fn rasterize(
   if (inside) {
     let pix = px.y * camera.width + px.x;
     image[pix] = vec4f(C, 1.0 - T);
-    aux[pix] = vec2f(T, bitcast<f32>(last));
-  }
-}
-`;
-
-/**
- * Max-blend forward (for MIP-mode volumes): each output channel is the
- * largest single-Gaussian contribution, colour·alpha for rgb and alpha for
- * a, instead of front-to-back compositing. Order doesn't matter, so there
- * is no early termination. `aux` records the winning Gaussian per channel
- * for the backward pass (NO_WINNER when nothing covers the pixel).
- */
-export const NO_WINNER = 0xffffffff;
-
-export const RASTERIZE_MAX_WGSL = /* wgsl */ `
-@group(0) @binding(0) var<uniform> camera: Camera;
-@group(0) @binding(1) var<storage, read> projected: array<f32>;
-@group(0) @binding(2) var<storage, read> isectVals: array<u32>;
-@group(0) @binding(3) var<storage, read> tileRanges: array<u32>;
-@group(0) @binding(4) var<storage, read_write> image: array<vec4f>;
-@group(0) @binding(5) var<storage, read_write> aux: array<vec4u>;
-
-var<private> params: array<f32, 1>;
-
-${RASTER_COMMON_WGSL}
-
-const NO_WINNER: u32 = ${NO_WINNER}u;
-
-var<workgroup> shUv: array<vec2f, 256>;
-var<workgroup> shConicO: array<vec4f, 256>;
-var<workgroup> shColor: array<vec3f, 256>;
-var<workgroup> shIdx: array<u32, 256>;
-var<workgroup> shRange: vec2u;
-
-@compute @workgroup_size(${TILE}, ${TILE})
-fn rasterizeMax(
-  @builtin(local_invocation_id) lid3: vec3u,
-  @builtin(local_invocation_index) lid: u32,
-  @builtin(workgroup_id) wid: vec3u,
-) {
-  let tileId = wid.y * camera.tilesX + wid.x;
-  let px = wid.xy * TILE + lid3.xy;
-  let inside = px.x < camera.width && px.y < camera.height;
-  let pixf = vec2f(px) + vec2f(0.5);
-  if (lid == 0u) {
-    shRange = vec2u(tileRanges[tileId * 2u], tileRanges[tileId * 2u + 1u]);
-  }
-  let range = workgroupUniformLoad(&shRange);
-
-  var best = vec4f(0.0);
-  var arg = vec4u(NO_WINNER);
-  for (var batch = range.x; batch < range.y; batch += 256u) {
-    workgroupBarrier();
-    let i = batch + lid;
-    if (i < range.y) {
-      let g = isectVals[i];
-      let o = g * PROJ_STRIDE;
-      shIdx[lid] = g;
-      shUv[lid] = vec2f(projected[o], projected[o + 1u]);
-      shConicO[lid] = vec4f(projected[o + 2u], projected[o + 3u], projected[o + 4u], projected[o + 9u]);
-      shColor[lid] = vec3f(projected[o + 6u], projected[o + 7u], projected[o + 8u]);
-    }
-    workgroupBarrier();
-    let n = min(256u, range.y - batch);
-    if (inside) {
-      for (var j = 0u; j < n; j++) {
-        let d = shUv[j] - pixf;
-        let co = shConicO[j];
-        let power = -0.5 * (co.x * d.x * d.x + co.z * d.y * d.y) - co.y * d.x * d.y;
-        if (power > 0.0) { continue; }
-        let alpha = min(ALPHA_MAX, co.w * exp(power));
-        if (alpha < ALPHA_MIN) { continue; }
-        let v = vec4f(shColor[j] * alpha, alpha);
-        let g = shIdx[j];
-        if (v.x > best.x) { best.x = v.x; arg.x = g; }
-        if (v.y > best.y) { best.y = v.y; arg.y = g; }
-        if (v.z > best.z) { best.z = v.z; arg.z = g; }
-        if (v.w > best.w) { best.w = v.w; arg.w = g; }
-      }
-    }
-  }
-  if (inside) {
-    let pix = px.y * camera.width + px.x;
-    image[pix] = best;
-    aux[pix] = arg;
   }
 }
 `;

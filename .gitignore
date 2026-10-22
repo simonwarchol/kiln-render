@@ -10,3 +10,6 @@ docs/.vitepress/dist/
 
 public/volumes/
 public/datasets/
+
+# Brush build checkout (scripts/build-brush-js.sh)
+.brush-build/

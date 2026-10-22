@@ -55,7 +55,6 @@ export {
 // Gaussian splats
 export type { GaussianCloud } from "./splat/cloud.js";
 export { createCloud, readPly, writePly } from "./splat/cloud.js";
-export type { SplatBlend } from "./splat/gpu/rasterizer.js";
 export type {
   BuildProgress,
   BuildStage,
