@@ -60,10 +60,10 @@ self.onmessage = (e: MessageEvent<FitWorkerRequest>) => {
       const fitter = new VolumeFitter(grid!, params!, false);
       fitter.setNodes(msg.nodes, msg.occupied);
       const cloud = fitter.finish(msg.options);
-      const out = cloud.params.slice();
-      post({ type: "done", id: msg.id, params: out, count: cloud.count }, [
-        out.buffer,
-      ]);
+      post(
+        { type: "done", id: msg.id, params: cloud.params, count: cloud.count },
+        [cloud.params.buffer],
+      );
     }
   } catch (err) {
     post({

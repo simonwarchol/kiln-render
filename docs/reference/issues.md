@@ -10,7 +10,7 @@
 
 ## Empty brick culling does not work for Zarr datasets
 
-Brick stats (min/max) in the Zarr path are computed lazily during `assembleBrick()` in the worker and cached in `brickStatsCache`. The streaming manager calls `isBrickEmpty` **before** `loadBrick`, so `getBrickStats` always returns `null` on the first pass → `isBrickEmpty` returns `false` → all bricks are loaded regardless.
+Brick stats (min/max) in the Zarr path are computed lazily during `assembleBrick()` in the worker and cached in `brickStatsCache`. The streaming manager calls `isBrickEmpty` **before** `loadBrick`, so no stats are cached yet on the first pass → `isBrickEmpty` returns `false` → all bricks are loaded regardless.
 
 Culling only activates on re-visits via the CPU brick cache (i.e., after an eviction/reload cycle).
 

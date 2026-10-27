@@ -13,12 +13,7 @@ fn rayMarchISO(
     // precompute float normalisation
     let floatInvRange = 1.0 / max(uniforms.floatMax - uniforms.floatMin, 0.0001);
 
-    // compute jitter fraction once for the whole ray
-    // select() is not short-circuiting in WGSL — rand() would run even with jitter off.
-    var jitterFrac = 0.0;
-    if (uniforms.jitter != 0u) {
-        jitterFrac = rand(rayToSeed(rayDir) + uniforms.frameIndex);
-    }
+    let jitterFrac = rayJitter(rayDir);
 
     var prevDensity = 0.0;
     var prevT = tStart;
@@ -30,10 +25,13 @@ fn rayMarchISO(
 
         let brick = setupBrick(rayOrigin, rayDir, invDir, t, tEnd, normalizedSize, datasetSize);
 
-        if (!brick.valid) {
-            // scale-sensitive epsilon
-            t = brick.tEnd + max(0.0001, brick.tEnd * 1e-6);
-            prevDensity = 0.0;  // Reset across empty space to avoid false crossings
+        // Unloaded, empty, or entirely below the iso value: no crossing inside.
+        if (!brick.valid ||
+            applyWindow(brickMax(brick.slot, 0u, floatInvRange), windowCenter, windowWidth) < isoValue) {
+            t = nextBrickT(brick);
+            // Below the iso value up to here: restart the bracket at the exit
+            prevDensity = 0.0;
+            prevT = brick.tEnd;
             continue;
         }
 
@@ -74,7 +72,8 @@ fn rayMarchISO(
                 if (length(gradient) >= 0.001) {
                     let normal = -normalize(gradient);
                     let tfColor = textureSampleLevel(tfTexture, tfSampler, vec2f(isoValue, 0.5), 0.0);
-                    return vec4f(phongLighting(normal, -rayDir, tfColor.rgb), 1.0);
+                    let shaded = phongLighting(normal, -rayDir, tfColor.rgb);
+                    return vec4f(shaded * depthFade(tSurface), 1.0);
                 }
             }
 
@@ -83,8 +82,7 @@ fn rayMarchISO(
             tSample += brick.stepSize;
         }
 
-        // scale-sensitive epsilon
-        t = brick.tEnd + max(0.0001, brick.tEnd * 1e-6);
+        t = nextBrickT(brick);
     }
 
     // No isosurface found

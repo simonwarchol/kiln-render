@@ -6,7 +6,7 @@
  * module can share resource lists without "binding not in layout" errors.
  */
 
-export type BindingKind =
+type BindingKind =
   | "uniform"
   | "uniform-dynamic"
   | "storage"
@@ -49,21 +49,9 @@ function layoutEntry(
   }
 }
 
-export function createBindGroupLayout(
-  device: GPUDevice,
-  label: string,
-  bindings: readonly BindingKind[],
-  visibility: number = GPUShaderStage.COMPUTE,
-): GPUBindGroupLayout {
-  return device.createBindGroupLayout({
-    label,
-    entries: bindings.map((kind, i) => layoutEntry(i, kind, visibility)),
-  });
-}
-
 const moduleCache = new WeakMap<GPUDevice, Map<string, GPUShaderModule>>();
 
-export function shaderModule(
+function shaderModule(
   device: GPUDevice,
   label: string,
   code: string,
@@ -90,7 +78,12 @@ export function createKernel(
   bindings: readonly BindingKind[],
   constants?: Record<string, number>,
 ): Kernel {
-  const layout = createBindGroupLayout(device, `${label}:layout`, bindings);
+  const layout = device.createBindGroupLayout({
+    label: `${label}:layout`,
+    entries: bindings.map((kind, i) =>
+      layoutEntry(i, kind, GPUShaderStage.COMPUTE),
+    ),
+  });
   const pipeline = device.createComputePipeline({
     label,
     layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
@@ -103,49 +96,42 @@ export function createKernel(
   return { label, pipeline, layout };
 }
 
-export type BindingResourceLike = GPUBuffer | GPUBindingResource;
-
-function toResource(r: BindingResourceLike): GPUBindingResource {
-  return r instanceof GPUBuffer ? { buffer: r } : r;
-}
-
 /** Bind resources[i] to binding i of the kernel's layout. */
 export function bindGroup(
   device: GPUDevice,
   kernel: Kernel,
-  resources: readonly BindingResourceLike[],
+  resources: ReadonlyArray<GPUBuffer | GPUBindingResource>,
 ): GPUBindGroup {
   return device.createBindGroup({
     label: `${kernel.label}:bg`,
     layout: kernel.layout,
     entries: resources.map((r, i) => ({
       binding: i,
-      resource: toResource(r),
+      resource: r instanceof GPUBuffer ? { buffer: r } : r,
     })),
   });
 }
 
-export const MAX_WORKGROUPS_PER_DIM = 65535;
-
-/** Split a 1D workgroup count into a 2D grid that respects the per-dim limit. */
-export function grid2d(workgroups: number): [number, number] {
-  const n = Math.max(1, Math.ceil(workgroups));
-  if (n <= MAX_WORKGROUPS_PER_DIM) return [n, 1];
-  return [MAX_WORKGROUPS_PER_DIM, Math.ceil(n / MAX_WORKGROUPS_PER_DIM)];
-}
+const MAX_WORKGROUPS_PER_DIM = 65535;
 
 export function dispatch1d(
   pass: GPUComputePassEncoder,
   kernel: Kernel,
   group: GPUBindGroup,
   workgroups: number,
-  dynamicOffsets?: number[],
 ): void {
   if (workgroups <= 0) return;
   pass.setPipeline(kernel.pipeline);
-  pass.setBindGroup(0, group, dynamicOffsets);
-  const [x, y] = grid2d(workgroups);
-  pass.dispatchWorkgroups(x, y, 1);
+  pass.setBindGroup(0, group);
+  // Split into a 2D grid that respects the per-dimension limit.
+  const n = Math.ceil(workgroups);
+  if (n <= MAX_WORKGROUPS_PER_DIM) pass.dispatchWorkgroups(n, 1, 1);
+  else
+    pass.dispatchWorkgroups(
+      MAX_WORKGROUPS_PER_DIM,
+      Math.ceil(n / MAX_WORKGROUPS_PER_DIM),
+      1,
+    );
 }
 
 /** WGSL snippet: linear workgroup index for 2D-split 1D dispatches. */
@@ -171,120 +157,40 @@ export function createBuffer(
 export const STORAGE_RW =
   GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
 
-/** Read a GPU buffer back to the CPU (debug / occasional stats only). */
+/** Usage of a reusable staging buffer that GPU copies land in for reading. */
+export const READBACK = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
+
+/**
+ * Map a READBACK buffer, run `fn` on its contents (valid only during the
+ * call) and unmap it again.
+ */
+export async function withMapped<T>(
+  buffer: GPUBuffer,
+  fn: (data: ArrayBuffer) => T,
+): Promise<T> {
+  await buffer.mapAsync(GPUMapMode.READ);
+  try {
+    return fn(buffer.getMappedRange());
+  } finally {
+    buffer.unmap();
+  }
+}
+
+/** Read a GPU buffer back to the CPU (debug / occasional reads only). */
 export async function readBuffer(
   device: GPUDevice,
   src: GPUBuffer,
   byteOffset = 0,
   byteLength: number = src.size - byteOffset,
 ): Promise<ArrayBuffer> {
-  const staging = device.createBuffer({
-    size: Math.ceil(byteLength / 4) * 4,
-    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-  });
+  const size = Math.ceil(byteLength / 4) * 4;
+  const staging = createBuffer(device, "readback", size, READBACK);
   const enc = device.createCommandEncoder();
-  enc.copyBufferToBuffer(
-    src,
-    byteOffset,
-    staging,
-    0,
-    Math.ceil(byteLength / 4) * 4,
-  );
+  enc.copyBufferToBuffer(src, byteOffset, staging, 0, size);
   device.queue.submit([enc.finish()]);
-  await staging.mapAsync(GPUMapMode.READ);
-  const out = staging.getMappedRange().slice(0, byteLength);
-  staging.unmap();
-  staging.destroy();
-  return out;
-}
-
-/**
- * Optional GPU timestamp profiler (needs the "timestamp-query" feature).
- * Each stage gets its own compute pass with begin/end timestamps.
- */
-export class GpuProfiler {
-  private readonly querySet: GPUQuerySet;
-  private readonly resolveBuf: GPUBuffer;
-  private labels: string[] = [];
-
-  constructor(
-    private readonly device: GPUDevice,
-    private readonly maxStages = 64,
-  ) {
-    this.querySet = device.createQuerySet({
-      type: "timestamp",
-      count: maxStages * 2,
-    });
-    this.resolveBuf = device.createBuffer({
-      size: maxStages * 16,
-      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
-    });
-  }
-
-  begin(encoder: GPUCommandEncoder, label: string): GPUComputePassEncoder {
-    const i = this.labels.length;
-    if (i >= this.maxStages) return encoder.beginComputePass({ label });
-    this.labels.push(label);
-    return encoder.beginComputePass({
-      label,
-      timestampWrites: {
-        querySet: this.querySet,
-        beginningOfPassWriteIndex: i * 2,
-        endOfPassWriteIndex: i * 2 + 1,
-      },
-    });
-  }
-
-  /** Resolve and read stage durations (ms, summed per label), then reset. */
-  async read(): Promise<Record<string, number>> {
-    const n = this.labels.length;
-    const out: Record<string, number> = {};
-    if (n === 0) return out;
-    const enc = this.device.createCommandEncoder();
-    enc.resolveQuerySet(this.querySet, 0, n * 2, this.resolveBuf, 0);
-    this.device.queue.submit([enc.finish()]);
-    const t = new BigUint64Array(
-      await readBuffer(this.device, this.resolveBuf, 0, n * 16),
-    );
-    for (let i = 0; i < n; i++) {
-      const ms = Number(t[i * 2 + 1]! - t[i * 2]!) / 1e6;
-      out[this.labels[i]!] = (out[this.labels[i]!] ?? 0) + ms;
-    }
-    this.labels = [];
-    return out;
-  }
-
-  destroy(): void {
-    this.querySet.destroy();
-    this.resolveBuf.destroy();
-  }
-}
-
-/**
- * Hands out compute passes for successive stages: one shared pass normally,
- * a separate timestamped pass per stage when profiling.
- */
-export class PassChain {
-  private pass: GPUComputePassEncoder | null = null;
-
-  constructor(
-    private readonly encoder: GPUCommandEncoder,
-    private readonly label: string,
-    private readonly profiler?: GpuProfiler,
-  ) {}
-
-  stage(label: string): GPUComputePassEncoder {
-    if (!this.profiler) {
-      this.pass ??= this.encoder.beginComputePass({ label: this.label });
-      return this.pass;
-    }
-    this.pass?.end();
-    this.pass = this.profiler.begin(this.encoder, label);
-    return this.pass;
-  }
-
-  end(): void {
-    this.pass?.end();
-    this.pass = null;
+  try {
+    return await withMapped(staging, (d) => d.slice(0, byteLength));
+  } finally {
+    staging.destroy();
   }
 }

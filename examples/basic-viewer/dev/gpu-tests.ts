@@ -6,6 +6,7 @@ import {
   intrinsicsFor,
   PARAM_STRIDE,
   renderReference,
+  type SplatCamera,
 } from "@kiln/splat/cpu-reference.js";
 import {
   createBuffer,
@@ -13,10 +14,7 @@ import {
   STORAGE_RW,
 } from "@kiln/splat/gpu/kernel.js";
 import { GpuRadixSort } from "@kiln/splat/gpu/radix-sort.js";
-import {
-  type SplatCamera,
-  SplatRasterizer,
-} from "@kiln/splat/gpu/rasterizer.js";
+import { SplatRasterizer } from "@kiln/splat/gpu/rasterizer.js";
 import { GpuScan } from "@kiln/splat/gpu/scan.js";
 import { evaluateCloud, sphereDirections } from "@kiln/splat/splat-builder.js";
 import { float32ToFloat16Array } from "@kiln/utils/float16.js";
@@ -268,6 +266,85 @@ async function benchForward(
 }
 
 /**
+ * Per-channel clouds: additive mode must equal the sum of the channels drawn
+ * separately (with tints applied), and a hidden channel must drop out.
+ */
+async function testChannelComposite(device: GPUDevice): Promise<void> {
+  const w = 96;
+  const h = 64;
+  const n = 300;
+  const a = randomScene(n, 21);
+  const b = randomScene(n, 22);
+  const view = Float32Array.from(
+    mat4.lookAt([0.4, -0.5, 1.6], [0, 0, 0], [0, -1, 0]),
+  );
+  const cam = { ...intrinsicsFor(Array.from(view), w, h), view };
+  const render = async (
+    params: Float32Array,
+    count: number,
+    mode: 0 | 1 | 2,
+    tint?: number[],
+  ) => {
+    const buf = createBuffer(device, "test:ch", params.byteLength, STORAGE_RW);
+    device.queue.writeBuffer(buf, 0, params as Float32Array<ArrayBuffer>);
+    const r = new SplatRasterizer(device);
+    r.resize(w, h);
+    r.setGaussians(buf, count);
+    r.reserveIntersections(count * 64);
+    r.channelMode = mode;
+    if (tint) r.channelTint.set(tint);
+    const enc = device.createCommandEncoder();
+    r.encodeForward(enc, cam);
+    device.queue.submit([enc.finish()]);
+    const img = new Float32Array(
+      await readBuffer(device, r.image, 0, w * h * 16),
+    );
+    r.destroy();
+    buf.destroy();
+    return img;
+  };
+  const both = new Float32Array(2 * n * PARAM_STRIDE);
+  both.set(a, 0);
+  both.set(b, n * PARAM_STRIDE);
+  for (let i = 0; i < n; i++) both[(n + i) * PARAM_STRIDE + 14] = 1;
+  const ia = await render(a, n, 0);
+  const ib = await render(b, n, 0);
+  const red = [1, 1, 1, 1, 1, 0, 0, 1, ...Array(16).fill(1)];
+  const sum = await render(both, 2 * n, 2, red);
+  const hidden = await render(both, 2 * n, 2, [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    ...Array(16).fill(1),
+  ]);
+  let maxSum = 0;
+  let maxHidden = 0;
+  for (let p = 0; p < w * h; p++) {
+    const tint = [1, 0, 0];
+    for (let c = 0; c < 3; c++) {
+      const want = ia[p * 4 + c]! + ib[p * 4 + c]! * tint[c]!;
+      maxSum = Math.max(maxSum, Math.abs(sum[p * 4 + c]! - want));
+      maxHidden = Math.max(
+        maxHidden,
+        Math.abs(hidden[p * 4 + c]! - ia[p * 4 + c]!),
+      );
+    }
+    const alpha = 1 - (1 - ia[p * 4 + 3]!) * (1 - ib[p * 4 + 3]!);
+    maxSum = Math.max(maxSum, Math.abs(sum[p * 4 + 3]! - alpha));
+  }
+  log(
+    "per-channel additive composite (tint, hide)",
+    maxSum < 2e-3 && maxHidden < 2e-3,
+    `max |diff| sum ${maxSum.toExponential(2)}, hidden ${maxHidden.toExponential(2)}`,
+  );
+}
+
+/**
  * Brush round trip: render a known cloud with Kiln's rasterizer from many
  * views, train Brush from that same cloud, and check it still matches. A
  * wrong camera, quaternion or colour convention would wreck the score.
@@ -322,7 +399,7 @@ async function testBrush(
     );
   }
   r.destroy();
-  const views = { texture, cameras, width: size, height: size, radius: 0.7 };
+  const views = { texture, cameras, width: size, height: size };
   const black = [0, 0, 0];
   const before = await evaluateCloud(device, pbuf, count, views, black);
   const t0 = performance.now();
@@ -402,6 +479,7 @@ async function main(): Promise<void> {
   await testForward(device, 1, 64, 48);
   await testForward(device, 50, 96, 64);
   await testForward(device, 400, 133, 101);
+  await testChannelComposite(device);
   await benchForward(device, 1_000_000, 1280, 800);
   await testBrush(device, 2000, 128, 24, 300);
   const tests =

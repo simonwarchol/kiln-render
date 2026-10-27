@@ -16,10 +16,10 @@ export type Box = { min: Vec3; max: Vec3 };
  * faces on the region's boundary are open (±Infinity), since no neighbour
  * owns Gaussians that spill past them.
  */
-export type TileBox = { core: Box; train: Box };
+type TileBox = { core: Box; train: Box };
 
 /** Margin around each tile while building, as a fraction of the volume. */
-export const TILE_MARGIN = 0.04;
+const TILE_MARGIN = 0.04;
 
 /** Split the `splits` longest normalised axes in two (a thin stack splits x and y). */
 export function chooseTiles(normalizedSize: Vec3, splits: number): Vec3 {
@@ -100,11 +100,9 @@ export function mergeTileParams(
   let at = 0;
   parts.forEach(({ params: src }, p) => {
     for (const g of keep[p]!) {
-      params.set(
-        src.subarray(g * PARAM_STRIDE, (g + 1) * PARAM_STRIDE),
-        at * PARAM_STRIDE,
-      );
-      at++;
+      for (let k = 0; k < PARAM_STRIDE; k++)
+        params[at + k] = src[g * PARAM_STRIDE + k]!;
+      at += PARAM_STRIDE;
     }
   });
   return { params, count };

@@ -4,7 +4,7 @@ import { float16BitsToFloat32 } from "../../utils/float16.js";
 import { btree1Leaves, btree2Records } from "./btree.js";
 import { Hdf5Context } from "./context.js";
 import { Cursor, decodeCString, decodeUtf8, product } from "./cursor.js";
-import { byteSwapInPlace, decodeChunk, type Hdf5Filter } from "./filters.js";
+import type { Hdf5Filter } from "./filters.js";
 import { FractalHeap } from "./fractal-heap.js";
 import {
   type AttributeMsg,
@@ -37,14 +37,14 @@ export type Hdf5AttrValue = string | number | bigint | number[] | string[];
 export interface Hdf5Dtype {
   class: "int" | "uint" | "float" | "string" | "other";
   size: number;
-  /** Byte order as stored on disk (readChunk/readAll always return little-endian). */
+  /** Byte order as stored on disk. */
   littleEndian: boolean;
 }
 
 export interface Hdf5ChunkRef {
   /** Chunk origin in element coordinates, dataset order (e.g. [z, y, x]). */
   offset: number[];
-  /** File byte offset. */
+  /** Absolute file byte offset. */
   address: number;
   /** Stored (compressed) byte size. */
   size: number;
@@ -76,13 +76,7 @@ export class Hdf5File {
   private constructor(
     /** @internal */ readonly ctx: Hdf5Context,
     private readonly rootAddress: number,
-    readonly superblockVersion: number,
   ) {}
-
-  /** Metadata (page-cached) source; its `stats` count metadata traffic. */
-  get meta(): RangeSource {
-    return this.ctx.meta;
-  }
 
   static async open(
     src: RangeSource,
@@ -142,8 +136,7 @@ export class Hdf5File {
       throw new Error(`HDF5: unsupported superblock version ${version}`);
     }
     if (root === null) throw new Error("HDF5: root group address undefined");
-    const ctx = new Hdf5Context(meta, src, base, O, L, k);
-    return new Hdf5File(ctx, root, version);
+    return new Hdf5File(new Hdf5Context(meta, base, O, L, k), root);
   }
 
   async root(): Promise<Hdf5Group> {
@@ -296,7 +289,6 @@ export class Hdf5Dataset extends Hdf5Object {
   private readonly maxShape: number[];
   private readonly datatype: Datatype;
   private readonly layout: Layout;
-  private chunksP?: Promise<Hdf5ChunkRef[]>;
 
   /** @internal */
   constructor(file: Hdf5File, path: string, messages: RawMessage[]) {
@@ -334,15 +326,11 @@ export class Hdf5Dataset extends Hdf5Object {
     return product(this.chunkShape ?? []) * this.dtype.size;
   }
 
-  /** All allocated chunks (index walked once and cached). */
-  chunks(): Promise<Hdf5ChunkRef[]> {
-    this.chunksP ??= retryable(this.readChunkIndex(), () => {
-      this.chunksP = undefined;
-    });
-    return this.chunksP;
-  }
-
-  private async readChunkIndex(): Promise<Hdf5ChunkRef[]> {
+  /**
+   * All allocated chunks. Not memoised: callers keep their own (compact)
+   * index, and the dataset stays cached by its file.
+   */
+  async chunks(): Promise<Hdf5ChunkRef[]> {
     const layout = this.layout;
     if (layout.kind !== "chunked" || !this.chunkShape) return [];
     const ctx = this.ctx;
@@ -370,14 +358,14 @@ export class Hdf5Dataset extends Hdf5Object {
           const filterMask = k.u32();
           const offset: number[] = [];
           for (let i = 0; i < rank; i++) offset.push(k.u64());
-          return { offset, address: e.child, size, filterMask };
+          return { offset, address: ctx.base + e.child, size, filterMask };
         });
       }
       case "single":
         return [
           {
             offset: new Array(rank).fill(0),
-            address: idx.address,
+            address: ctx.base + idx.address,
             size: idx.filteredSize ?? this.chunkBytes,
             filterMask: idx.filterMask,
           },
@@ -391,7 +379,7 @@ export class Hdf5Dataset extends Hdf5Object {
           if (offset) {
             refs.push({
               offset,
-              address: idx.address + i * this.chunkBytes,
+              address: ctx.base + idx.address + i * this.chunkBytes,
               size: this.chunkBytes,
               filterMask: 0,
             });
@@ -470,7 +458,8 @@ export class Hdf5Dataset extends Hdf5Object {
         c.pos = start + elemSize;
         if (address === null) continue;
         const offset = this.gridOffset(first + j, grid);
-        if (offset) out.push({ offset, address, size, filterMask });
+        if (offset)
+          out.push({ offset, address: ctx.base + address, size, filterMask });
       }
     };
 
@@ -495,130 +484,6 @@ export class Hdf5Dataset extends Hdf5Object {
       }),
     );
     return pages.flat();
-  }
-
-  /**
-   * Fetch one chunk through the raw (uncached) source and decode it to
-   * little-endian element bytes (length prod(chunkShape) * dtype.size).
-   */
-  async readChunk(
-    ref: Hdf5ChunkRef,
-    signal?: AbortSignal,
-  ): Promise<Uint8Array> {
-    const ctx = this.ctx;
-    const stored = await ctx.raw.read(ctx.base + ref.address, ref.size, signal);
-    if (stored.length < ref.size) {
-      throw new Error(`HDF5: short read for chunk at ${ref.address}`);
-    }
-    return this.decode(stored, ref.filterMask);
-  }
-
-  /** Decode stored chunk bytes fetched by the caller (e.g. coalesced reads). */
-  async decode(stored: Uint8Array, filterMask: number): Promise<Uint8Array> {
-    let out = await decodeChunk(
-      stored,
-      this.filters,
-      filterMask,
-      this.dtype.size,
-    );
-    const want = this.chunkBytes;
-    if (out.length < want) {
-      throw new Error(
-        `HDF5: decoded chunk is ${out.length} bytes, expected ${want} (${this.path})`,
-      );
-    }
-    if (out.length > want) out = out.subarray(0, want);
-    if (this.needsSwap) {
-      // Never swap caller-owned bytes in place (no filters → out aliases stored).
-      if (this.filters.length === 0) out = out.slice();
-      byteSwapInPlace(out, this.dtype.size);
-    }
-    return out;
-  }
-
-  private get needsSwap(): boolean {
-    const c = this.dtype.class;
-    return (
-      !this.dtype.littleEndian &&
-      this.dtype.size > 1 &&
-      (c === "int" || c === "uint" || c === "float")
-    );
-  }
-
-  /** Read the whole dataset (intended for small datasets). */
-  async readAll(): Promise<Uint8Array> {
-    const es = this.dtype.size;
-    const total = product(this.shape) * es;
-    const layout = this.layout;
-    let out: Uint8Array;
-    if (layout.kind === "compact") {
-      out = layout.data.slice(0, total);
-    } else if (layout.kind === "contiguous") {
-      if (layout.address === null) return new Uint8Array(total);
-      const ctx = this.ctx;
-      out = (await ctx.raw.read(ctx.base + layout.address, total)).slice();
-    } else if (layout.kind === "chunked") {
-      out = new Uint8Array(total);
-      const refs = await this.chunks();
-      await Promise.all(
-        refs.map(async (ref) => {
-          const data = await this.readChunk(ref);
-          copyChunkInto(
-            out,
-            this.shape,
-            data,
-            this.chunkShape!,
-            ref.offset,
-            es,
-          );
-        }),
-      );
-      return out; // readChunk already swapped
-    } else {
-      throw new Error(`HDF5: virtual datasets unsupported (${this.path})`);
-    }
-    if (out.length < total)
-      throw new Error(`HDF5: short dataset read (${this.path})`);
-    if (this.needsSwap) byteSwapInPlace(out, es);
-    return out;
-  }
-}
-
-/** Copy the in-bounds part of a decoded chunk into a C-order output array. */
-function copyChunkInto(
-  out: Uint8Array,
-  shape: number[],
-  chunk: Uint8Array,
-  chunkShape: number[],
-  origin: number[],
-  es: number,
-): void {
-  const rank = shape.length;
-  if (rank === 0) {
-    out.set(chunk.subarray(0, es));
-    return;
-  }
-  const ext = shape.map((d, i) => Math.min(chunkShape[i]!, d - origin[i]!));
-  if (ext.some((e) => e <= 0)) return;
-  const rowBytes = ext[rank - 1]! * es;
-  const idx = new Array<number>(rank - 1).fill(0);
-  for (;;) {
-    let src = 0;
-    let dst = 0;
-    for (let d = 0; d < rank; d++) {
-      const i = d < rank - 1 ? idx[d]! : 0;
-      src = src * chunkShape[d]! + i;
-      dst = dst * shape[d]! + origin[d]! + i;
-    }
-    out.set(chunk.subarray(src * es, src * es + rowBytes), dst * es);
-    let d = rank - 2;
-    while (d >= 0) {
-      idx[d]!++;
-      if (idx[d]! < ext[d]!) break;
-      idx[d] = 0;
-      d--;
-    }
-    if (d < 0) break;
   }
 }
 

@@ -20,6 +20,8 @@ export const P_SCALE = 3;
 export const P_QUAT = 6;
 export const P_COLOR = 10;
 export const P_OPACITY = 13;
+/** Channel slot of a per-channel cloud (GaussianCloud.channelComposite). */
+export const P_CHANNEL = 14;
 
 export const ALPHA_MIN = 1 / 255;
 export const ALPHA_MAX = 0.99;
@@ -28,7 +30,11 @@ export const COV2D_DILATION = 0.3;
 export const NEAR_Z = 0.01;
 export const FRUSTUM_SLACK = 1.3;
 
-export interface CameraIntrinsics {
+/** Kiln's vertical field of view. */
+const FOV_Y = Math.PI / 4;
+
+/** Pinhole camera of a splat render. */
+export interface SplatCamera {
   /** Column-major 4×4 view matrix */
   view: ArrayLike<number>;
   fx: number;
@@ -53,20 +59,21 @@ export function logit(p: number): number {
   return Math.log(c / (1 - c));
 }
 
-/** Intrinsics for Kiln's camera (vertical FOV, square pixels). */
+/** Intrinsics of Kiln's camera (vertical FOV, square pixels) for an image size. */
 export function intrinsicsFor(
   view: ArrayLike<number>,
   width: number,
   height: number,
-  fovY: number = Math.PI / 4,
-): CameraIntrinsics {
+  fovY: number = FOV_Y,
+): SplatCamera {
   const f = (0.5 * height) / Math.tan(fovY / 2);
   return { view, fx: f, fy: f, cx: width / 2, cy: height / 2, width, height };
 }
 
 type Mat3 = number[]; // row-major 3×3
 
-function quatToRot(w: number, x: number, y: number, z: number): Mat3 {
+/** Rotation matrix (row-major) of the unit quaternion (w, x, y, z). */
+export function quatToRot(w: number, x: number, y: number, z: number): Mat3 {
   return [
     1 - 2 * (y * y + z * z),
     2 * (x * y - w * z),
@@ -80,7 +87,7 @@ function quatToRot(w: number, x: number, y: number, z: number): Mat3 {
   ];
 }
 
-export interface Projected {
+interface Projected {
   visible: boolean;
   u: number;
   v: number;
@@ -90,32 +97,15 @@ export interface Projected {
   color: [number, number, number];
   /** effective opacity o·ρ used for compositing */
   opacity: number;
-  radius: number;
-  // cached for backward
-  /** sigmoid(opacity logit) */
-  opacityRaw: number;
-  /** dilation compensation √(det Σ2D / det(Σ2D + sI)) */
-  rho: number;
-  t: [number, number, number];
-  cov2: [number, number, number];
-  sigma: Mat3;
-  M: Mat3;
-  R: Mat3;
-  s: [number, number, number];
-  qn: [number, number, number, number];
-  qlen: number;
-  Tm: number[]; // 2×3 row-major (J·W)
-  W: Mat3;
-  txz: number;
-  tyz: number;
-  clampX: boolean;
-  clampY: boolean;
+  /** Half-extents of the α ≥ ALPHA_MIN ellipse's bounding box (px) */
+  extentX: number;
+  extentY: number;
 }
 
-export function projectGaussian(
+function projectGaussian(
   p: ArrayLike<number>,
   base: number,
-  cam: CameraIntrinsics,
+  cam: SplatCamera,
 ): Projected {
   const V = cam.view;
   const mx = p[base + P_MEAN]!;
@@ -138,33 +128,6 @@ export function projectGaussian(
     W[6]! * mx + W[7]! * my + W[8]! * mz + V[14]!,
   ];
   const z = -t[2];
-  const s: [number, number, number] = [
-    Math.exp(p[base + P_SCALE]!),
-    Math.exp(p[base + P_SCALE + 1]!),
-    Math.exp(p[base + P_SCALE + 2]!),
-  ];
-  const qw = p[base + P_QUAT]!;
-  const qx = p[base + P_QUAT + 1]!;
-  const qy = p[base + P_QUAT + 2]!;
-  const qz = p[base + P_QUAT + 3]!;
-  const qlen = Math.max(1e-12, Math.hypot(qw, qx, qy, qz));
-  const qn: [number, number, number, number] = [
-    qw / qlen,
-    qx / qlen,
-    qy / qlen,
-    qz / qlen,
-  ];
-  const R = quatToRot(qn[0], qn[1], qn[2], qn[3]);
-  const M: Mat3 = [];
-  for (let i = 0; i < 3; i++)
-    for (let j = 0; j < 3; j++) M[i * 3 + j] = R[i * 3 + j]! * s[j]!;
-  const sigma: Mat3 = [];
-  for (let i = 0; i < 3; i++)
-    for (let j = 0; j < 3; j++) {
-      let acc = 0;
-      for (let k = 0; k < 3; k++) acc += M[i * 3 + k]! * M[j * 3 + k]!;
-      sigma[i * 3 + j] = acc;
-    }
   const color: [number, number, number] = [
     Math.exp(p[base + P_COLOR]!),
     Math.exp(p[base + P_COLOR + 1]!),
@@ -179,32 +142,37 @@ export function projectGaussian(
     depth: z,
     color,
     opacity,
-    radius: 0,
-    opacityRaw: opacity,
-    rho: 1,
-    t,
-    cov2: [0, 0, 0],
-    sigma,
-    M,
-    R,
-    s,
-    qn,
-    qlen,
-    Tm: [0, 0, 0, 0, 0, 0],
-    W,
-    txz: 0,
-    tyz: 0,
-    clampX: false,
-    clampY: false,
+    extentX: 0,
+    extentY: 0,
   };
   if (z < NEAR_Z) return empty;
 
+  const s = [
+    Math.exp(p[base + P_SCALE]!),
+    Math.exp(p[base + P_SCALE + 1]!),
+    Math.exp(p[base + P_SCALE + 2]!),
+  ];
+  const qw = p[base + P_QUAT]!;
+  const qx = p[base + P_QUAT + 1]!;
+  const qy = p[base + P_QUAT + 2]!;
+  const qz = p[base + P_QUAT + 3]!;
+  const qlen = Math.max(1e-12, Math.hypot(qw, qx, qy, qz));
+  const R = quatToRot(qw / qlen, qx / qlen, qy / qlen, qz / qlen);
+  const M: Mat3 = [];
+  for (let i = 0; i < 3; i++)
+    for (let j = 0; j < 3; j++) M[i * 3 + j] = R[i * 3 + j]! * s[j]!;
+  const sigma: Mat3 = [];
+  for (let i = 0; i < 3; i++)
+    for (let j = 0; j < 3; j++) {
+      let acc = 0;
+      for (let k = 0; k < 3; k++) acc += M[i * 3 + k]! * M[j * 3 + k]!;
+      sigma[i * 3 + j] = acc;
+    }
+
   const limX = (FRUSTUM_SLACK * (0.5 * cam.width)) / cam.fx;
   const limY = (FRUSTUM_SLACK * (0.5 * cam.height)) / cam.fy;
-  const rawX = t[0] / z;
-  const rawY = t[1] / z;
-  const txz = Math.min(limX, Math.max(-limX, rawX));
-  const tyz = Math.min(limY, Math.max(-limY, rawY));
+  const txz = Math.min(limX, Math.max(-limX, t[0] / z));
+  const tyz = Math.min(limY, Math.max(-limY, t[1] / z));
   const J = [
     cam.fx / z,
     0,
@@ -213,7 +181,7 @@ export function projectGaussian(
     -cam.fy / z,
     (-cam.fy * tyz) / z,
   ];
-  const Tm: number[] = [];
+  const Tm: number[] = []; // 2×3 row-major (J·W)
   for (let r = 0; r < 2; r++)
     for (let c = 0; c < 3; c++) {
       let acc = 0;
@@ -245,53 +213,28 @@ export function projectGaussian(
     1e-20,
     (a - COV2D_DILATION) * (c - COV2D_DILATION) - b * b,
   );
-  const rho = Math.sqrt(det0 / det);
-  const effOpacity = opacity * rho;
-  const mid = 0.5 * (a + c);
-  const lambda = mid + Math.sqrt(Math.max(0.1, mid * mid - det));
+  const effOpacity = opacity * Math.sqrt(det0 / det);
   if (effOpacity < ALPHA_MIN) return empty;
-  // Beyond this radius α < ALPHA_MIN in every direction (λ is the major axis).
+  // α ≥ ALPHA_MIN inside the ellipse dᵀΣ⁻¹d ≤ extent²; its bounding box.
   const extent = Math.sqrt(2 * Math.log(effOpacity / ALPHA_MIN));
-  const radius = Math.ceil(extent * Math.sqrt(lambda));
-  const u = cam.fx * (t[0] / z) + cam.cx;
-  const v = cam.cy - cam.fy * (t[1] / z);
   return {
     ...empty,
-    visible: radius > 0,
-    u,
-    v,
+    visible: extent > 0,
+    u: cam.fx * (t[0] / z) + cam.cx,
+    v: cam.cy - cam.fy * (t[1] / z),
     conic,
-    radius,
     opacity: effOpacity,
-    rho,
-    cov2: [a, b, c],
-    Tm,
-    txz,
-    tyz,
-    clampX: rawX !== txz,
-    clampY: rawY !== tyz,
+    extentX: Math.ceil(extent * Math.sqrt(a)),
+    extentY: Math.ceil(extent * Math.sqrt(c)),
   };
-}
-
-export interface RenderResult {
-  width: number;
-  height: number;
-  /** premultiplied rgb + alpha, 4 floats per pixel */
-  image: Float64Array;
-  /** final transmittance per pixel */
-  finalT: Float64Array;
-  /** per-pixel ordered list of contributing Gaussian indices */
-  contributors: number[][];
-  projected: Projected[];
-  order: number[];
 }
 
 /** Pixel-exact forward rasterisation (front-to-back by view depth). */
 export function renderReference(
   params: ArrayLike<number>,
   count: number,
-  cam: CameraIntrinsics,
-): RenderResult {
+  cam: SplatCamera,
+): { image: Float64Array; order: number[] } {
   const projected: Projected[] = [];
   for (let g = 0; g < count; g++)
     projected.push(projectGaussian(params, g * PARAM_STRIDE, cam));
@@ -299,19 +242,9 @@ export function renderReference(
     .map((_, i) => i)
     .filter((i) => projected[i]!.visible)
     .sort((a, b) => projected[a]!.depth - projected[b]!.depth || a - b);
-  return rasterizeProjected(projected, order, cam.width, cam.height);
-}
-
-/** Rasterise already-projected Gaussians in the given front-to-back order. */
-export function rasterizeProjected(
-  projected: Projected[],
-  order: number[],
-  width: number,
-  height: number,
-): RenderResult {
+  const { width, height } = cam;
+  // premultiplied rgb + alpha, 4 floats per pixel
   const image = new Float64Array(width * height * 4);
-  const finalT = new Float64Array(width * height);
-  const contributors: number[][] = [];
   for (let py = 0; py < height; py++) {
     for (let px = 0; px < width; px++) {
       const pix = py * width + px;
@@ -319,16 +252,13 @@ export function rasterizeProjected(
       let r = 0;
       let gC = 0;
       let bC = 0;
-      const list: number[] = [];
       for (const g of order) {
         const pr = projected[g]!;
-        if (
-          Math.abs(pr.u - (px + 0.5)) > pr.radius + 0.5 ||
-          Math.abs(pr.v - (py + 0.5)) > pr.radius + 0.5
-        )
-          continue;
         const dx = pr.u - (px + 0.5);
         const dy = pr.v - (py + 0.5);
+        // Outside the footprint's bounding box α < ALPHA_MIN anyway.
+        if (Math.abs(dx) > pr.extentX + 0.5 || Math.abs(dy) > pr.extentY + 0.5)
+          continue;
         const power =
           -0.5 * (pr.conic[0] * dx * dx + pr.conic[2] * dy * dy) -
           pr.conic[1] * dx * dy;
@@ -341,15 +271,12 @@ export function rasterizeProjected(
         gC += pr.color[1] * alpha * T;
         bC += pr.color[2] * alpha * T;
         T = nextT;
-        list.push(g);
       }
       image[pix * 4] = r;
       image[pix * 4 + 1] = gC;
       image[pix * 4 + 2] = bC;
       image[pix * 4 + 3] = 1 - T;
-      finalT[pix] = T;
-      contributors.push(list);
     }
   }
-  return { width, height, image, finalT, contributors, projected, order };
+  return { image, order };
 }

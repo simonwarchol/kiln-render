@@ -22,18 +22,19 @@ import {
 import { ByteLru } from "../utils/byte-lru.js";
 import type {
   BrickLoadResult,
+  BrickStaleListener,
   BrickStats,
   DataProvider,
   NetworkStats,
-  PipelineTimings,
+  ProviderTimings,
   VolumeMetadata,
 } from "./data-provider.js";
 import { UnsupportedDatasetError } from "./data-provider.js";
 import {
   blobRangeSource,
+  type CachedRangeSource,
   cachedRangeSource,
   type Hdf5AttrValue,
-  type Hdf5ChunkRef,
   Hdf5Dataset,
   Hdf5File,
   Hdf5Group,
@@ -47,12 +48,18 @@ import type {
   ImsBrickResponse,
   ImsExtractRequest,
   ImsExtractResponse,
+  ImsInitRequest,
   ImsPiece,
 } from "./imaris/ims-brick-worker.js";
 import ImsBrickWorkerInline from "./imaris/ims-brick-worker.ts?worker&inline";
 import {
   axisSampling,
+  type BorderPlan,
+  clampGhost,
+  DECODED_CHUNK_BUDGET,
+  faceBit,
   overlappingChunks,
+  planBorders,
   planVirtualPyramid,
   type SourceLevel,
   type Vec3,
@@ -62,6 +69,19 @@ import {
 import { NetworkTracker, RollingAvg } from "./network-tracker.js";
 
 const MAX_STATS_ENTRIES = 200_000;
+/**
+ * Compressed chunk bytes kept in memory. Remote files also persist chunks in
+ * OPFS, so revisits are cheap either way; local files re-read from disk.
+ */
+const REMOTE_CHUNK_BUDGET = 192 * 1024 * 1024;
+const LOCAL_CHUNK_BUDGET = 64 * 1024 * 1024;
+/** Metadata page cache: generous while chunk indexes load, small after. */
+const META_PAGES = 8192; // × 16 KB
+const META_PAGES_AFTER_INDEX = 256;
+/** Clamped brick channels watched for their missing chunks (oldest dropped). */
+const MAX_CLAMPED = 65_536;
+/** Stale-brick reports are batched over this long. */
+const STALE_NOTIFY_MS = 100;
 
 /** One channel as described by the file (all channels, not just active ones). */
 export interface ImsChannelInfo {
@@ -80,7 +100,10 @@ export interface ImarisProviderOptions {
   channels?: number[];
   /** Time point to load (default 0). */
   timepoint?: number;
-  /** Worker count (default: min(hardwareConcurrency, 6)). */
+  /**
+   * Worker count (default: half the cores, up to 4, for URLs; cores − 1, up
+   * to 8, for local files). Workers start with the first brick load.
+   */
   workers?: number;
   /** Keep fetched chunks in the Origin Private File System across sessions (default true). */
   persistentCache?: boolean;
@@ -130,18 +153,45 @@ function ownerOf(address: number, n: number): number {
   return ((h ^ (h >>> 16)) >>> 0) % n;
 }
 
+/**
+ * One dataset's chunk index as flat arrays over the chunk grid (linear index
+ * (cz * grid[1] + cy) * grid[0] + cx): ~12 bytes per chunk instead of a ref
+ * object per chunk.
+ */
 interface DatasetIndex {
   dataset: Hdf5Dataset;
   /** chunk shape [x, y, z] */
   chunkShape: Vec3;
   /** chunk grid [x, y, z] */
   grid: Vec3;
-  chunks: Map<number, Hdf5ChunkRef>;
+  /** File address per chunk; -1 when unallocated (reads as zeros) */
+  address: Float64Array;
+  /** Stored (compressed) bytes per chunk */
+  size: Uint32Array;
+  /** The rare non-zero filter masks */
+  filterMask: Map<number, number>;
+}
+
+const chunkIndex = (idx: DatasetIndex, cx: number, cy: number, cz: number) =>
+  (cz * idx.grid[1] + cy) * idx.grid[0] + cx;
+
+/** A brick channel returned with edge-clamped parts of its ghost border. */
+interface ClampedBrick {
+  key: string;
+  lod: number;
+  bx: number;
+  by: number;
+  bz: number;
+  channelIndex: number;
+  /** Per BorderPlan.waiting group: chunk addresses it still waits for. */
+  waiting: Array<Set<number>>;
 }
 
 export class ImarisDataProvider implements DataProvider {
   private readonly tracker = new NetworkTracker();
   private file: Hdf5File | null = null;
+  private raw: RangeSource | null = null;
+  private meta: CachedRangeSource | null = null;
   private metadata: VolumeMetadata | null = null;
   private pyramid: VirtualLevel[] = [];
   private sourceLevels: SourceLevel[] = [];
@@ -154,18 +204,26 @@ export class ImarisDataProvider implements DataProvider {
   private readonly pending = new Map<
     number,
     {
+      worker: number;
       resolve: (r: ImsBrickResponse | ImsExtractResponse) => void;
       reject: (e: Error) => void;
     }
   >();
-  /** Approximate mirror of each worker's owned-chunk LRU: address → bytes. */
   /** Per worker: chunks it holds decoded (address → bytes), as an LRU like its own. */
   private ownerMirror: Array<ByteLru<number, number>> = [];
-  private nextAssembler = 0;
+  /** Per worker: requests posted and not answered yet. */
+  private load: number[] = [];
   private readonly fetchAvg = new RollingAvg();
   private readonly assemblyAvg = new RollingAvg();
   private readonly queueAvg = new RollingAvg();
   private readonly timepoint: number;
+  /** Clamped brick channels by `lod:bx/by/bz:channel`, oldest first. */
+  private readonly clamped = new Map<string, ClampedBrick>();
+  /** Chunk address → clamped bricks waiting for it. */
+  private readonly waitingOn = new Map<number, Set<ClampedBrick>>();
+  private stale: ClampedBrick[] = [];
+  private staleTimer: ReturnType<typeof setTimeout> | null = null;
+  private staleListener: BrickStaleListener | null = null;
 
   /** Every channel in the file (names, colours, ranges). */
   allChannels: ImsChannelInfo[] = [];
@@ -185,8 +243,8 @@ export class ImarisDataProvider implements DataProvider {
     this.format = format === "r8unorm" ? "u8" : "f16";
   }
 
-  async setFloatRange(): Promise<void> {
-    // Values are normalised per channel in the worker; nothing to do.
+  setBrickStaleListener(listener: BrickStaleListener | null): void {
+    this.staleListener = listener;
   }
 
   private rangeSource(): RangeSource {
@@ -194,7 +252,6 @@ export class ImarisDataProvider implements DataProvider {
     // Retry transient network failures (TypeError "Failed to fetch", 5xx).
     const inner = httpRangeSource(this.source);
     return {
-      stats: inner.stats,
       async read(offset, length, signal) {
         let lastErr: unknown;
         for (let attempt = 0; attempt < 4; attempt++) {
@@ -218,8 +275,10 @@ export class ImarisDataProvider implements DataProvider {
     const raw = this.rangeSource();
     const meta = cachedRangeSource(raw, {
       pageSize: 16 * 1024,
-      maxPages: 8192,
+      maxPages: META_PAGES,
     });
+    this.raw = raw;
+    this.meta = meta;
     // Imaris writes its group/attribute metadata at the head of the file:
     // one up-front read turns ~30 serial round trips into one.
     await meta.read(0, 1024 * 1024).catch(() => undefined);
@@ -420,30 +479,10 @@ export class ImarisDataProvider implements DataProvider {
       sourceDataType: `${dt.class}${dt.size * 8}`,
     };
 
-    const n = Math.max(
-      1,
-      Math.min(
-        this.options.workers ?? (navigator.hardwareConcurrency || 4) - 1,
-        8,
-      ),
-    );
-    this.fetcher = new ChunkFetcher(raw, {
-      persistKey:
-        typeof this.source === "string" &&
-        this.options.persistentCache !== false
-          ? new URL(this.source, location.href).href
-          : undefined,
-    });
-    for (let i = 0; i < n; i++) {
-      const w = createWorker();
-      w.onmessage = (e: MessageEvent<ImsBrickResponse | ImsExtractResponse>) =>
-        this.onWorkerMessage(e.data);
-      w.onerror = (e) => console.error("[Kiln] IMS worker error", e.message);
-      this.workers.push(w);
-      this.ownerMirror.push(new ByteLru(WORKER_CHUNK_BUDGET * 0.9, (b) => b));
-    }
-
-    // Prefetch chunk indexes for the active channels at the coarsest levels.
+    // The coarsest level's chunk index now: the base layer needs it first,
+    // and an unreadable index fails here rather than on every brick.
+    // Workers, the chunk fetcher and the other indexes wait for the first
+    // brick (start()), so a metadata-only open stays cheap.
     const coarse = this.pyramid[this.pyramid.length - 1]!.source;
     await Promise.all(
       this.activeChannels.map((c) => this.openDataset(coarse, c)),
@@ -451,26 +490,95 @@ export class ImarisDataProvider implements DataProvider {
     return this.metadata;
   }
 
+  /** Workers, chunk fetcher and index prefetch, on the first brick load. */
+  private start(): void {
+    if (this.fetcher || !this.raw) return;
+    // Decoding keeps up with a remote link on a few workers; more only add
+    // memory (each has a decoded-chunk cache) and contend for cores. Local
+    // files read at disk speed and can use more.
+    const remote = typeof this.source === "string";
+    const cores = navigator.hardwareConcurrency || 4;
+    const n = Math.max(
+      1,
+      Math.min(
+        this.options.workers ?? (remote ? Math.ceil(cores / 2) : cores - 1),
+        remote ? 4 : 8,
+      ),
+    );
+    this.fetcher = new ChunkFetcher(this.raw, {
+      budgetBytes: remote ? REMOTE_CHUNK_BUDGET : LOCAL_CHUNK_BUDGET,
+      persistKey:
+        remote && this.options.persistentCache !== false
+          ? new URL(this.source as string, location.href).href
+          : undefined,
+      onFetched: (bytes, requests) => this.tracker.record(bytes, requests),
+      onCached: (address) => this.chunkCached(address),
+    });
+    const chunkBudget = Math.min(WORKER_CHUNK_BUDGET, DECODED_CHUNK_BUDGET / n);
+    for (let i = 0; i < n; i++) {
+      const w = createWorker();
+      w.onmessage = (e: MessageEvent<ImsBrickResponse | ImsExtractResponse>) =>
+        this.onWorkerMessage(e.data);
+      w.onerror = (e) => console.error("[Kiln] IMS worker error", e.message);
+      w.postMessage({ type: "init", chunkBudget } satisfies ImsInitRequest);
+      this.workers.push(w);
+      this.load.push(0);
+      this.ownerMirror.push(new ByteLru(chunkBudget * 0.9, (b) => b));
+    }
+    this.prefetchIndexes(this.activeChannels);
+  }
+
+  /**
+   * Open chunk indexes for `channels` at every level in the background,
+   * coarse to fine, so a first zoom doesn't wait on B-tree reads queued
+   * behind chunk downloads. Then shrink the metadata page cache: once the
+   * indexes are built, its pages are not read again.
+   */
+  private prefetchIndexes(channels: readonly number[]): void {
+    const file = this.file;
+    const levels = [...new Set(this.pyramid.map((l) => l.source))].reverse();
+    void (async () => {
+      for (const level of levels) {
+        if (this.file !== file) return; // disposed
+        await Promise.all(
+          channels.map((c) => this.openDataset(level, c).catch(() => null)),
+        );
+      }
+      if (this.file === file) this.meta?.setMaxPages(META_PAGES_AFTER_INDEX);
+    })();
+  }
+
   private onWorkerMessage(msg: ImsBrickResponse | ImsExtractResponse): void {
     const p = this.pending.get(msg.id);
     if (!p) return;
     this.pending.delete(msg.id);
+    this.load[p.worker]!--;
     if (msg.error) p.reject(new Error(msg.error));
     else p.resolve(msg);
   }
 
   private call<T extends ImsBrickResponse | ImsExtractResponse>(
-    worker: Worker,
+    worker: number,
     msg: ImsExtractRequest | ImsAssembleRequest,
     transfer: Transferable[] = [],
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       this.pending.set(msg.id, {
+        worker,
         resolve: resolve as (r: ImsBrickResponse | ImsExtractResponse) => void,
         reject,
       });
-      worker.postMessage(msg, transfer);
+      this.load[worker]!++;
+      this.workers[worker]!.postMessage(msg, transfer);
     });
+  }
+
+  /** The worker with the fewest requests outstanding. */
+  private leastLoaded(): number {
+    let best = 0;
+    for (let i = 1; i < this.load.length; i++)
+      if (this.load[i]! < this.load[best]!) best = i;
+    return best;
   }
 
   /**
@@ -479,32 +587,30 @@ export class ImarisDataProvider implements DataProvider {
    */
   private async extract(
     idx: DatasetIndex,
-    ref: Hdf5ChunkRef,
+    chunk: number,
     region: [number, number, number, number, number, number],
     norm: [number, number],
-    stats: { bytes: number; requests: number },
+    signal: AbortSignal | undefined,
+    priority: number,
   ): Promise<Uint16Array> {
-    const w = ownerOf(ref.address, this.workers.length);
-    const worker = this.workers[w]!;
+    const address = idx.address[chunk]!;
+    const size = idx.size[chunk]!;
+    const w = ownerOf(address, this.workers.length);
     const decodedBytes =
       idx.chunkShape[0] * idx.chunkShape[1] * idx.chunkShape[2] * 2;
     const send = async (withBytes: boolean): Promise<ImsExtractResponse> => {
       let bytes: Uint8Array | null = null;
       if (withBytes) {
-        const f = this.fetcher!;
-        const b0 = f.stats.bytesFetched;
-        const r0 = f.stats.requests;
-        bytes = (await f.get([{ address: ref.address, size: ref.size }]))[0]!;
-        stats.bytes += f.stats.bytesFetched - b0;
-        stats.requests += f.stats.requests - r0;
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        bytes = await this.fetcher!.get({ address, size }, signal, priority);
       }
       const msg: ImsExtractRequest = {
         type: "extract",
         id: ++this.requestId,
-        address: ref.address,
+        address,
         bytes,
         filters: idx.dataset.filters,
-        filterMask: ref.filterMask,
+        filterMask: idx.filterMask.get(chunk) ?? 0,
         dtype: {
           class: idx.dataset.dtype.class as "int" | "uint" | "float",
           size: idx.dataset.dtype.size,
@@ -514,16 +620,16 @@ export class ImarisDataProvider implements DataProvider {
         normHi: norm[1],
         region,
       };
-      return this.call<ImsExtractResponse>(worker, msg);
+      return this.call<ImsExtractResponse>(w, msg);
     };
-    let res = await send(!this.ownerMirror[w]!.has(ref.address));
+    let res = await send(!this.ownerMirror[w]!.has(address));
     if (res.missing) {
-      this.ownerMirror[w]!.delete(ref.address);
+      this.ownerMirror[w]!.delete(address);
       res = await send(true);
     }
     if (res.error || !res.data)
       throw new Error(res.error ?? "IMS chunk extract failed");
-    this.ownerMirror[w]!.set(ref.address, decodedBytes);
+    this.ownerMirror[w]!.set(address, decodedBytes);
     return new Uint16Array(res.data);
   }
 
@@ -548,16 +654,30 @@ export class ImarisDataProvider implements DataProvider {
           Math.ceil(ds.shape[1]! / chunkShape[1]),
           Math.ceil(ds.shape[0]! / chunkShape[2]),
         ];
-        const chunks = new Map<number, Hdf5ChunkRef>();
+        const n = grid[0] * grid[1] * grid[2];
+        const idx: DatasetIndex = {
+          dataset: ds,
+          chunkShape,
+          grid,
+          address: new Float64Array(n).fill(-1),
+          size: new Uint32Array(n),
+          filterMask: new Map(),
+        };
         if (ds.chunkShape) {
           for (const ref of await ds.chunks()) {
-            const cz = Math.floor(ref.offset[0]! / chunkShape[2]);
-            const cy = Math.floor(ref.offset[1]! / chunkShape[1]);
-            const cx = Math.floor(ref.offset[2]! / chunkShape[0]);
-            chunks.set((cz * grid[1] + cy) * grid[0] + cx, ref);
+            const i = chunkIndex(
+              idx,
+              Math.floor(ref.offset[2]! / chunkShape[0]),
+              Math.floor(ref.offset[1]! / chunkShape[1]),
+              Math.floor(ref.offset[0]! / chunkShape[2]),
+            );
+            if (i >= n) continue;
+            idx.address[i] = ref.address;
+            idx.size[i] = ref.size;
+            if (ref.filterMask !== 0) idx.filterMask.set(i, ref.filterMask);
           }
         }
-        return { dataset: ds, chunkShape, grid, chunks };
+        return idx;
       })();
       p.catch(() => this.datasetIndex.delete(key));
       this.datasetIndex.set(key, p);
@@ -584,6 +704,7 @@ export class ImarisDataProvider implements DataProvider {
     bz: number,
     channelIndex = 0,
     signal?: AbortSignal,
+    priority = 0,
   ): Promise<BrickLoadResult | null> {
     const level = this.pyramid[lod];
     const channel = this.activeChannels[channelIndex];
@@ -591,31 +712,57 @@ export class ImarisDataProvider implements DataProvider {
     const [gx, gy, gz] = level.brickGrid;
     if (bx < 0 || by < 0 || bz < 0 || bx >= gx || by >= gy || bz >= gz)
       return null;
+    this.start();
 
     try {
       const idx = await this.openDataset(level.source, channel);
       const src = this.sourceLevels.find((s) => s.index === level.source)!;
-      const sx = axisSampling(bx, level.dims[0], src.dims[0], level.ratio[0]);
-      const sy = axisSampling(by, level.dims[1], src.dims[1], level.ratio[1]);
-      const sz = axisSampling(bz, level.dims[2], src.dims[2], level.ratio[2]);
+      let sx = axisSampling(bx, level.dims[0], src.dims[0], level.ratio[0]);
+      let sy = axisSampling(by, level.dims[1], src.dims[1], level.ratio[1]);
+      let sz = axisSampling(bz, level.dims[2], src.dims[2], level.ratio[2]);
+      // Ghost faces that would pull in uncached, border-only chunks are
+      // edge-clamped for now (missing edge / corner chunks clamp-filled);
+      // the brick is reported stale once they arrive for their own bricks.
+      // Not on the base level: it loads every brick at once (so neighbours
+      // arrive anyway), outside the streaming manager's stale tracking.
+      let plan: BorderPlan | null = null;
+      if (lod < this.pyramid.length - 1) {
+        plan = planBorders([sx, sy, sz], idx.chunkShape, (cx, cy, cz) =>
+          this.isCached(idx, chunkIndex(idx, cx, cy, cz)),
+        );
+        const c = plan.clamped;
+        if (c & faceBit(0, 0)) sx = clampGhost(sx, 0);
+        if (c & faceBit(0, 1)) sx = clampGhost(sx, 1);
+        if (c & faceBit(1, 0)) sy = clampGhost(sy, 0);
+        if (c & faceBit(1, 1)) sy = clampGhost(sy, 1);
+        if (c & faceBit(2, 0)) sz = clampGhost(sz, 0);
+        if (c & faceBit(2, 1)) sz = clampGhost(sz, 1);
+      }
       const lo: Vec3 = [sx.lo, sy.lo, sz.lo];
       const hi: Vec3 = [sx.hi, sy.hi, sz.hi];
       const P = PHYSICAL_BRICK_SIZE;
       const info = this.allChannels[channel]!;
       const norm: [number, number] = [info.range[0], info.range[1]];
       const t0 = performance.now();
-      const stats = { bytes: 0, requests: 0 };
       const jobs: Array<Promise<ImsPiece>> = [];
+      const fills: Array<[number, number, number, number, number, number]> = [];
+      const unfetched = new Set(
+        plan?.filled.map(([cx, cy, cz]) => chunkIndex(idx, cx, cy, cz)),
+      );
       const [csx, csy, csz] = idx.chunkShape;
       for (const [cx, cy, cz] of overlappingChunks(lo, hi, idx.chunkShape)) {
-        const ref = idx.chunks.get((cz * idx.grid[1] + cy) * idx.grid[0] + cx);
-        if (!ref) continue; // unallocated → zeros
+        const index = chunkIndex(idx, cx, cy, cz);
+        if (!(idx.address[index]! >= 0)) continue; // unallocated → zeros
         const x0 = Math.max(lo[0], cx * csx);
         const y0 = Math.max(lo[1], cy * csy);
         const z0 = Math.max(lo[2], cz * csz);
         const x1 = Math.min(hi[0], (cx + 1) * csx);
         const y1 = Math.min(hi[1], (cy + 1) * csy);
         const z1 = Math.min(hi[2], (cz + 1) * csz);
+        if (unfetched.has(index)) {
+          fills.push([x0, y0, z0, x1, y1, z1]);
+          continue;
+        }
         const region: [number, number, number, number, number, number] = [
           x0 - cx * csx,
           y0 - cy * csy,
@@ -625,15 +772,17 @@ export class ImarisDataProvider implements DataProvider {
           z1 - cz * csz,
         ];
         jobs.push(
-          this.extract(idx, ref, region, norm, stats).then((data) => ({
-            x0,
-            y0,
-            z0,
-            sx: x1 - x0,
-            sy: y1 - y0,
-            sz: z1 - z0,
-            data,
-          })),
+          this.extract(idx, index, region, norm, signal, priority).then(
+            (data) => ({
+              x0,
+              y0,
+              z0,
+              sx: x1 - x0,
+              sy: y1 - y0,
+              sz: z1 - z0,
+              data,
+            }),
+          ),
         );
       }
       if (jobs.length === 0) {
@@ -650,17 +799,15 @@ export class ImarisDataProvider implements DataProvider {
       const pieces = await Promise.all(jobs);
       if (signal?.aborted) return null;
       const tPieces = performance.now();
-      this.tracker.record(stats.bytes, stats.requests);
-      const assembler =
-        this.workers[this.nextAssembler++ % this.workers.length]!;
       const result = await this.call<ImsBrickResponse>(
-        assembler,
+        this.leastLoaded(),
         {
           type: "assemble",
           id: ++this.requestId,
           pieces,
           lo,
           hi,
+          fills,
           rx: sx.ranges,
           ry: sy.ranges,
           rz: sz.ranges,
@@ -679,6 +826,7 @@ export class ImarisDataProvider implements DataProvider {
         this.format === "u8"
           ? new Uint8Array(result.data)
           : new Uint16Array(result.data);
+      this.watchClamped({ lod, bx, by, bz, channelIndex }, idx, plan);
       return { data, ...brickStats };
     } catch (e) {
       if (signal?.aborted) return null;
@@ -689,6 +837,105 @@ export class ImarisDataProvider implements DataProvider {
       );
       return null;
     }
+  }
+
+  /**
+   * Chunk `i` needs no network: unallocated, held decoded by its worker, or
+   * its bytes are in memory or on disk.
+   */
+  private isCached(idx: DatasetIndex, i: number): boolean {
+    const address = idx.address[i]!;
+    if (!(address >= 0)) return true;
+    const w = ownerOf(address, this.workers.length);
+    return (
+      !!this.ownerMirror[w]?.has(address) ||
+      !!this.fetcher?.has(address, idx.size[i]!)
+    );
+  }
+
+  /**
+   * Remember which chunks a just-assembled brick channel lacked for its
+   * ghost border (replacing what an earlier load of it recorded).
+   */
+  private watchClamped(
+    brick: Omit<ClampedBrick, "key" | "waiting">,
+    idx: DatasetIndex,
+    plan: BorderPlan | null,
+  ): void {
+    const key = `${brick.lod}:${brick.bx}/${brick.by}/${brick.bz}:${brick.channelIndex}`;
+    this.unwatchClamped(key);
+    if (!plan || plan.waiting.length === 0) return;
+    const rec: ClampedBrick = { ...brick, key, waiting: [] };
+    for (const chunks of plan.waiting) {
+      const addresses = new Set<number>();
+      for (const [cx, cy, cz] of chunks) {
+        const i = chunkIndex(idx, cx, cy, cz);
+        // May have arrived while this brick loaded.
+        if (!this.isCached(idx, i)) addresses.add(idx.address[i]!);
+      }
+      rec.waiting.push(addresses);
+    }
+    if (rec.waiting.some((a) => a.size === 0)) {
+      this.markStale(rec);
+      return;
+    }
+    this.clamped.set(key, rec);
+    for (const addresses of rec.waiting) {
+      for (const a of addresses) {
+        let recs = this.waitingOn.get(a);
+        if (!recs) {
+          recs = new Set();
+          this.waitingOn.set(a, recs);
+        }
+        recs.add(rec);
+      }
+    }
+    if (this.clamped.size > MAX_CLAMPED) {
+      const oldest = this.clamped.values().next().value!;
+      this.unwatchClamped(oldest.key);
+      this.markStale(oldest);
+    }
+  }
+
+  private unwatchClamped(key: string): void {
+    const rec = this.clamped.get(key);
+    if (!rec) return;
+    this.clamped.delete(key);
+    for (const addresses of rec.waiting) {
+      for (const a of addresses) {
+        const recs = this.waitingOn.get(a);
+        recs?.delete(rec);
+        if (recs?.size === 0) this.waitingOn.delete(a);
+      }
+    }
+  }
+
+  /** A chunk arrived: bricks with a waiting group now complete are stale. */
+  private chunkCached(address: number): void {
+    const recs = this.waitingOn.get(address);
+    if (!recs) return;
+    this.waitingOn.delete(address);
+    for (const rec of recs) {
+      let complete = false;
+      for (const addresses of rec.waiting) {
+        if (addresses.delete(address) && addresses.size === 0) complete = true;
+      }
+      if (complete) {
+        this.unwatchClamped(rec.key);
+        this.markStale(rec);
+      }
+    }
+  }
+
+  private markStale(rec: ClampedBrick): void {
+    this.stale.push(rec);
+    this.staleTimer ??= setTimeout(() => {
+      this.staleTimer = null;
+      const recs = this.stale;
+      this.stale = [];
+      for (const r of recs)
+        this.staleListener?.(r.lod, r.bx, r.by, r.bz, r.channelIndex);
+    }, STALE_NOTIFY_MS);
   }
 
   async isBrickEmpty(
@@ -710,25 +957,15 @@ export class ImarisDataProvider implements DataProvider {
     });
   }
 
-  async getBrickStats(
-    lod: number,
-    bx: number,
-    by: number,
-    bz: number,
-  ): Promise<BrickStats | null> {
-    return this.brickStatsCache.get(`${lod}:${bx}/${by}/${bz}`) ?? null;
-  }
-
   getNetworkStats(): NetworkStats {
     return this.tracker.getStats();
   }
 
-  getPipelineTimings(): PipelineTimings {
+  getPipelineTimings(): ProviderTimings {
     return {
       avgQueueMs: this.queueAvg.value,
       avgFetchMs: this.fetchAvg.value,
       avgAssemblyMs: this.assemblyAvg.value,
-      avgUploadMs: 0,
       sampleCount: this.fetchAvg.count,
     };
   }
@@ -737,14 +974,23 @@ export class ImarisDataProvider implements DataProvider {
     for (const w of this.workers) w.terminate();
     this.workers = [];
     this.ownerMirror = [];
-    this.fetcher?.clear();
+    this.load = [];
+    this.fetcher?.dispose();
     this.fetcher = null;
     for (const p of this.pending.values()) p.reject(new Error("cancelled"));
     this.pending.clear();
     this.brickStatsCache.clear();
     this.datasetIndex.clear();
+    this.clamped.clear();
+    this.waitingOn.clear();
+    this.stale = [];
+    if (this.staleTimer !== null) clearTimeout(this.staleTimer);
+    this.staleTimer = null;
+    this.staleListener = null;
     this.metadata = null;
     this.file = null;
+    this.raw = null;
+    this.meta = null;
   }
 
   private cacheBrickStats(

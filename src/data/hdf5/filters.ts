@@ -1,7 +1,5 @@
 /** HDF5 filter pipeline decoding (deflate, shuffle, fletcher32, LZ4 plugin). */
 
-import { unzlibSync } from "fflate";
-
 export interface Hdf5Filter {
   id: number;
   name: string;
@@ -59,19 +57,16 @@ export async function decodeChunk(
   return buf;
 }
 
-/** zlib-wrapped deflate (HDF5 filter 1). Prefers native DecompressionStream. */
-export async function inflate(data: Uint8Array): Promise<Uint8Array> {
-  if (typeof DecompressionStream === "function") {
-    const stream = new Blob([data as Uint8Array<ArrayBuffer>])
-      .stream()
-      .pipeThrough(new DecompressionStream("deflate"));
-    return new Uint8Array(await new Response(stream).arrayBuffer());
-  }
-  return unzlibSync(data);
+/** zlib-wrapped deflate (HDF5 filter 1), via the native DecompressionStream. */
+async function inflate(data: Uint8Array): Promise<Uint8Array> {
+  const stream = new Blob([data as Uint8Array<ArrayBuffer>])
+    .stream()
+    .pipeThrough(new DecompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
 /** Byte shuffle (HDF5 filter 2): bytes are grouped by significance on write. */
-export function unshuffle(src: Uint8Array, elementSize: number): Uint8Array {
+function unshuffle(src: Uint8Array, elementSize: number): Uint8Array {
   if (elementSize <= 1) return src;
   const n = Math.floor(src.length / elementSize);
   const out = new Uint8Array(src.length);
@@ -92,7 +87,7 @@ export function unshuffle(src: Uint8Array, elementSize: number): Uint8Array {
  * block size, then per block a 4-byte BE compressed size and the LZ4 block
  * (stored raw when compressed size == block size).
  */
-export function lz4HdfDecode(src: Uint8Array): Uint8Array {
+function lz4HdfDecode(src: Uint8Array): Uint8Array {
   const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
   if (src.length < 12) throw new Error("HDF5 LZ4: truncated header");
   const origSize = view.getUint32(0) * 2 ** 32 + view.getUint32(4);
@@ -123,7 +118,7 @@ export function lz4HdfDecode(src: Uint8Array): Uint8Array {
 }
 
 /** Raw LZ4 block decoder. Writes into dst at dstPos; returns bytes written. */
-export function lz4DecodeBlock(
+function lz4DecodeBlock(
   src: Uint8Array,
   dst: Uint8Array,
   dstPos: number,
@@ -173,16 +168,4 @@ export function lz4DecodeBlock(
     }
   }
   return op - dstPos;
-}
-
-/** Swap bytes of each element in place (big-endian → little-endian). */
-export function byteSwapInPlace(buf: Uint8Array, size: number): void {
-  if (size <= 1) return;
-  for (let i = 0; i + size <= buf.length; i += size) {
-    for (let a = i, b = i + size - 1; a < b; a++, b--) {
-      const t = buf[a]!;
-      buf[a] = buf[b]!;
-      buf[b] = t;
-    }
-  }
 }

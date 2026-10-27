@@ -34,9 +34,58 @@ const expected = JSON.parse(
 };
 
 function openFixture(name: string) {
-  const buf = readFileSync(join(FIXTURES, name));
-  const src = blobRangeSource(new Blob([buf]));
-  return { src, file: Hdf5File.open(src) };
+  const buf = new Uint8Array(readFileSync(join(FIXTURES, name)));
+  return { buf, file: Hdf5File.open(blobRangeSource(new Blob([buf]))) };
+}
+
+/** Decoded little-endian bytes of one chunk (prod(chunkShape) * dtype.size). */
+async function chunkBytes(
+  buf: Uint8Array,
+  d: Hdf5Dataset,
+  ref: Hdf5ChunkRef,
+): Promise<Uint8Array> {
+  const stored = buf.subarray(ref.address, ref.address + ref.size);
+  const out = await decodeChunk(
+    stored,
+    d.filters,
+    ref.filterMask,
+    d.dtype.size,
+  );
+  const n = d.chunkShape!.reduce((a, b) => a * b, 1) * d.dtype.size;
+  expect(out.length, d.path).toBeGreaterThanOrEqual(n);
+  return out.subarray(0, n);
+}
+
+/** A whole chunked dataset in C order, assembled from its decoded chunks. */
+async function readChunked(buf: Uint8Array, d: Hdf5Dataset) {
+  const es = d.dtype.size;
+  const shape = d.shape;
+  const cs = d.chunkShape!;
+  const rank = shape.length;
+  const out = new Uint8Array(shape.reduce((a, b) => a * b, 1) * es);
+  for (const ref of await d.chunks()) {
+    const chunk = await chunkBytes(buf, d, ref);
+    const ext = shape.map((n, i) => Math.min(cs[i]!, n - ref.offset[i]!));
+    const rows = ext.slice(0, -1).reduce((a, b) => a * b, 1);
+    for (let r = 0; r < rows; r++) {
+      // Row r of the chunk's in-bounds part → element offsets (last axis 0).
+      let rest = r;
+      let src = 0;
+      let dst = 0;
+      const idx = new Array<number>(rank).fill(0);
+      for (let k = rank - 2; k >= 0; k--) {
+        idx[k] = rest % ext[k]!;
+        rest = Math.floor(rest / ext[k]!);
+      }
+      for (let k = 0; k < rank; k++) {
+        src = src * cs[k]! + idx[k]!;
+        dst = dst * shape[k]! + ref.offset[k]! + idx[k]!;
+      }
+      const len = ext[rank - 1]! * es;
+      out.set(chunk.subarray(src * es, src * es + len), dst * es);
+    }
+  }
+  return out;
 }
 
 /** Expected little-endian bytes from the generator formulas in the fixture script. */
@@ -96,7 +145,7 @@ describe.each(FILES)("HDF5 fixture %s", (name) => {
   const exp = expected[name]!;
 
   it("matches h5py datasets: shape, dtype, chunk index and values", async () => {
-    const { file } = openFixture(name);
+    const { buf, file } = openFixture(name);
     const f = await file;
     for (const [path, ds] of Object.entries(exp.datasets)) {
       const node = await f.get(path);
@@ -129,7 +178,9 @@ describe.each(FILES)("HDF5 fixture %s", (name) => {
           expect(refs.slice(-4).map(asTuple), path).toEqual(ds.chunkList.last);
         }
       }
-      const all = await d.readAll();
+      // Values: chunked little-endian datasets (what Imaris uses).
+      if (!d.chunkShape || !d.dtype.littleEndian) continue;
+      const all = await readChunked(buf, d);
       expect(all.length, path).toBe(expectedBytes(ds).length);
       expect(
         Buffer.from(all).equals(Buffer.from(expectedBytes(ds))),
@@ -199,22 +250,20 @@ describe.each(FILES)("HDF5 fixture %s", (name) => {
 });
 
 describe("HDF5 chunk access", () => {
-  it("readChunk decodes single chunks and uses the raw (uncached) source", async () => {
-    const { src, file } = openFixture("v108.h5");
-    const f = await file;
-    const d = (await f.get(
+  it("decodes deflate chunks at their absolute file offsets", async () => {
+    const { buf, file } = openFixture("v108.h5");
+    const d = (await (
+      await file
+    ).get(
       "/DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Data",
     )) as Hdf5Dataset;
     expect(d.filters.map((x) => x.id)).toEqual([1]);
     expect(d.filters[0]!.name).toBe("deflate");
-    const refs = await d.chunks();
-    const metaBytes = f.meta.stats.bytes;
-    const before = src.stats.requests;
-    const first = refs.find((r) => r.offset.every((o) => o === 0))!;
-    const data = await d.readChunk(first);
+    const first = (await d.chunks()).find((r) =>
+      r.offset.every((o) => o === 0),
+    )!;
+    const data = await chunkBytes(buf, d, first);
     expect(data.length).toBe(8 * 16 * 8);
-    expect(src.stats.requests).toBe(before + 1);
-    expect(f.meta.stats.bytes).toBe(metaBytes); // bulk data bypasses the page cache
     // element (z=1, y=2, x=3) of the first chunk = global index 1*33*17 + 2*17 + 3
     const i = 1 * 33 * 17 + 2 * 17 + 3;
     expect(data[1 * 16 * 8 + 2 * 8 + 3]).toBe(
@@ -223,16 +272,24 @@ describe("HDF5 chunk access", () => {
   });
 
   it("decodeChunk handles shuffle, fletcher32 and filterMask", async () => {
-    const f = await openFixture("v108.h5").file;
-    const d = (await f.get("/f32_gzip_shuffle_fletcher")) as Hdf5Dataset;
+    const { buf, file } = openFixture("v108.h5");
+    const d = (await (
+      await file
+    ).get("/f32_gzip_shuffle_fletcher")) as Hdf5Dataset;
     expect(d.filters.map((x) => x.id)).toEqual([2, 1, 3]);
-    const ref = (await d.chunks())[0]!;
-    const src = blobRangeSource(
-      new Blob([readFileSync(join(FIXTURES, "v108.h5"))]),
-    );
-    const stored = await src.read(ref.address, ref.size);
+    const ref = (await d.chunks()).find((r) => r.offset.every((o) => o === 0))!;
+    const stored = buf.subarray(ref.address, ref.address + ref.size);
     const out = await decodeChunk(stored, d.filters, ref.filterMask, 4);
-    expect(out).toEqual(await d.readChunk(ref));
+    const values = new Float32Array(out.buffer, out.byteOffset, 4 * 32 * 8);
+    // chunk [4, 32, 8] at the origin of a [9, 50, 21] float dataset
+    for (const [z, y, x] of [
+      [0, 0, 0],
+      [1, 2, 3],
+      [3, 31, 7],
+    ] as const) {
+      const g = (z * 50 + y) * 21 + x;
+      expect(values[(z * 32 + y) * 8 + x]).toBe((g % 1000) * 0.25 - 17.5);
+    }
     // All filters masked → bytes pass through untouched.
     expect(await decodeChunk(stored, d.filters, 0b111, 4)).toBe(stored);
   });
@@ -270,7 +327,6 @@ describe("range sources", () => {
     const data = new Uint8Array(size).map((_, i) => i & 255);
     const calls: Array<[number, number]> = [];
     const src: RangeSource = {
-      stats: { bytes: 0, requests: 0 },
       async read(offset, length) {
         calls.push([offset, length]);
         await new Promise((r) => setTimeout(r, 1));
@@ -298,7 +354,6 @@ describe("range sources", () => {
     // EOF: short read
     const tail = await c.read(9990, 100);
     expect(tail.length).toBe(10);
-    expect(c.stats.requests).toBe(calls.length);
   });
 
   it("cachedRangeSource evicts LRU pages", async () => {
@@ -312,6 +367,11 @@ describe("range sources", () => {
     expect(calls.length).toBe(3);
     await c.read(2048, 1);
     expect(calls.length).toBe(4);
+    c.setMaxPages(1); // keeps only the most recent page (2)
+    await c.read(2048, 1);
+    expect(calls.length).toBe(4);
+    await c.read(0, 1);
+    expect(calls.length).toBe(5);
   });
 
   it("httpRangeSource sends GET with Range (never HEAD) and requires 206", async () => {
@@ -330,7 +390,6 @@ describe("range sources", () => {
     expect((seen[0]!.headers as Record<string, string>).Range).toBe(
       "bytes=10-12",
     );
-    expect(ok.stats).toEqual({ bytes: 3, requests: 1 });
     const bad = httpRangeSource("https://example.test/x.ims", {
       fetch: mk(200),
     });
@@ -358,7 +417,8 @@ describe.skipIf(!process.env.HDF5_NETWORK_TEST)("remote Imaris file", () => {
       size: 4596,
       filterMask: 0,
     });
-    const chunk = await d.readChunk(refs[0]!);
+    const stored = await src.read(refs[0]!.address, refs[0]!.size);
+    const chunk = await decodeChunk(stored, d.filters, 0, d.dtype.size);
     expect(chunk.length).toBe(16 * 128 * 128 * 4);
     const ch = (await f.get("/DataSetInfo/Channel 0")) as Hdf5Group;
     expect((await ch.attrs()).Name).toBe("hoechst");

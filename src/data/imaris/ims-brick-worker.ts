@@ -14,20 +14,17 @@
 import { ByteLru } from "../../utils/byte-lru.js";
 import {
   float32ToFloat16Array,
+  float32ToFloat16Bits,
   getFloat16ToFloat32Lut,
 } from "../../utils/float16.js";
 import { decodeChunk, type Hdf5Filter } from "../hdf5/filters.js";
-import { PHYSICAL, WORKER_CHUNK_BUDGET } from "./ims-layout.js";
+import { PHYSICAL } from "./ims-layout.js";
 
-export interface ImsChunkSpec {
-  /** chunk grid coords (x, y, z) */
-  cx: number;
-  cy: number;
-  cz: number;
-  /** null when the chunk is unallocated (fill value 0) */
-  address: number | null;
-  size: number;
-  filterMask: number;
+/** Sent once, before any other request. */
+export interface ImsInitRequest {
+  type: "init";
+  /** Byte budget of this worker's decoded-chunk cache */
+  chunkBudget: number;
 }
 
 export interface ImsExtractRequest {
@@ -54,7 +51,6 @@ export interface ImsExtractResponse {
   data?: ArrayBuffer;
   /** the chunk was not cached and no bytes were sent */
   missing?: boolean;
-  decoded?: boolean;
   error?: string;
 }
 
@@ -80,6 +76,11 @@ export interface ImsAssembleRequest {
   rx: Int32Array;
   ry: Int32Array;
   rz: Int32Array;
+  /**
+   * Source boxes [x0, y0, z0, x1, y1, z1) of ghost-border chunks that were
+   * not fetched: filled by clamping into the brick interior
+   */
+  fills?: Array<[number, number, number, number, number, number]>;
   /** Output encoding: float16 bits (r16float atlas) or 8-bit unorm */
   format: "f16" | "u8";
 }
@@ -96,45 +97,19 @@ export interface ImsBrickResponse {
 }
 
 export type ImsWorkerRequest =
+  | ImsInitRequest
   | ImsExtractRequest
-  | ImsAssembleRequest
-  | { type: "clear" };
+  | ImsAssembleRequest;
 
 const f16ToF32 = getFloat16ToFloat32Lut();
 
 // --- owned-chunk cache (normalised float16) ------------------------------------
 
-const cache = new ByteLru<number, Uint16Array>(
-  WORKER_CHUNK_BUDGET,
+let cache = new ByteLru<number, Uint16Array>(
+  64 * 1024 * 1024,
   (v) => v.byteLength,
 );
 const decoding = new Map<number, Promise<Uint16Array>>();
-
-type Typed =
-  | Uint8Array
-  | Uint16Array
-  | Int16Array
-  | Float32Array
-  | Int32Array
-  | Uint32Array
-  | Float64Array;
-
-function typedView(
-  bytes: Uint8Array,
-  dtype: ImsExtractRequest["dtype"],
-): Typed {
-  const buf =
-    bytes.byteOffset % 8 === 0 && bytes.byteLength === bytes.buffer.byteLength
-      ? bytes.buffer
-      : bytes.slice().buffer;
-  if (dtype.class === "float") {
-    return dtype.size === 8 ? new Float64Array(buf) : new Float32Array(buf);
-  }
-  if (dtype.size === 1) return new Uint8Array(buf);
-  if (dtype.size === 2)
-    return dtype.class === "int" ? new Int16Array(buf) : new Uint16Array(buf);
-  return dtype.class === "int" ? new Int32Array(buf) : new Uint32Array(buf);
-}
 
 // Reused float32 scratch. Fresh multi-MB buffers per brick are mmapped and
 // zero-filled by the OS, and those page faults serialise across workers:
@@ -149,23 +124,90 @@ function scratch(slot: number, n: number): Float32Array {
   return s.subarray(0, n);
 }
 
-/** Normalise to [0, 1] and encode as float16 bits. */
-function normalise(d: Typed, lo: number, hi: number): Uint16Array {
+const NativeFloat16Array = (
+  globalThis as unknown as {
+    Float16Array?: new (
+      n: number,
+    ) => ArrayLike<number> & {
+      [i: number]: number;
+      buffer: ArrayBuffer;
+    };
+  }
+).Float16Array;
+
+/** Raw value (8/16-bit bit pattern) → normalised float16 bits, per dtype and range. */
+const luts = new Map<string, Uint16Array>();
+
+function lutFor(
+  dtype: ImsExtractRequest["dtype"],
+  lo: number,
+  hi: number,
+): Uint16Array {
+  const key = `${dtype.class}${dtype.size}:${lo}:${hi}`;
+  let lut = luts.get(key);
+  if (!lut) {
+    const n = dtype.size === 1 ? 256 : 65536;
+    const signed = dtype.class === "int";
+    const inv = hi > lo ? 1 / (hi - lo) : 0;
+    const f = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = ((signed && i >= 32768 ? i - 65536 : i) - lo) * inv;
+      f[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+    }
+    lut = float32ToFloat16Array(f);
+    if (luts.size >= 16) luts.clear(); // a handful of channels per file
+    luts.set(key, lut);
+  }
+  return lut;
+}
+
+/** Decoded chunk bytes → values normalised to [0, 1], as float16 bits. */
+function normalise(
+  raw: Uint8Array,
+  dtype: ImsExtractRequest["dtype"],
+  lo: number,
+  hi: number,
+): Uint16Array {
+  if (dtype.class !== "float") {
+    // 8/16-bit: one table lookup per voxel (int16 indexed by its bit pattern).
+    const lut = lutFor(dtype, lo, hi);
+    const n = raw.byteLength / dtype.size;
+    const src =
+      dtype.size === 1
+        ? raw
+        : raw.byteOffset % 2 === 0
+          ? new Uint16Array(raw.buffer, raw.byteOffset, n)
+          : new Uint16Array(raw.slice().buffer);
+    const out = new Uint16Array(n);
+    for (let i = 0; i < n; i++) out[i] = lut[src[i]!]!;
+    return out;
+  }
+  const d =
+    raw.byteOffset % 4 === 0
+      ? new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4)
+      : new Float32Array(raw.slice().buffer);
   const inv = hi > lo ? 1 / (hi - lo) : 0;
   const n = d.length;
-  const f = scratch(0, n);
+  if (NativeFloat16Array) {
+    const h = new NativeFloat16Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = (d[i]! - lo) * inv;
+      h[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+    }
+    return new Uint16Array(h.buffer);
+  }
+  const out = new Uint16Array(n);
   for (let i = 0; i < n; i++) {
     const v = (d[i]! - lo) * inv;
-    f[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+    out[i] = float32ToFloat16Bits(v < 0 ? 0 : v > 1 ? 1 : v);
   }
-  return float32ToFloat16Array(f);
+  return out;
 }
 
 async function handleExtract(
   req: ImsExtractRequest,
 ): Promise<ImsExtractResponse> {
   let chunk = cache.get(req.address);
-  let decoded = false;
   if (!chunk) {
     const pending = decoding.get(req.address);
     if (pending) {
@@ -177,7 +219,7 @@ async function handleExtract(
         req.filterMask,
         req.dtype.size,
       ).then((raw) => {
-        const v = normalise(typedView(raw, req.dtype), req.normLo, req.normHi);
+        const v = normalise(raw, req.dtype, req.normLo, req.normHi);
         cache.set(req.address, v);
         return v;
       });
@@ -187,7 +229,6 @@ async function handleExtract(
       } finally {
         decoding.delete(req.address);
       }
-      decoded = true;
     } else {
       return { type: "extract", id: req.id, missing: true };
     }
@@ -205,7 +246,7 @@ async function handleExtract(
       o += sx;
     }
   }
-  return { type: "extract", id: req.id, data: out.buffer, decoded };
+  return { type: "extract", id: req.id, data: out.buffer };
 }
 
 /** Pieces tile the region exactly when their volumes sum to it (they never overlap). */
@@ -213,6 +254,32 @@ function coversRegion(pieces: ImsPiece[], n: number): boolean {
   let v = 0;
   for (const p of pieces) v += p.sx * p.sy * p.sz;
   return v === n;
+}
+
+/** Copy each `fills` voxel from the nearest voxel of the brick interior. */
+function fillClamped(
+  src: Float32Array | Uint16Array,
+  req: ImsAssembleRequest,
+): void {
+  if (!req.fills) return;
+  const [lx, ly, lz] = req.lo;
+  const sx = req.hi[0] - lx;
+  const sy = req.hi[1] - ly;
+  const inner = (PHYSICAL - 2) * 2 + 1;
+  const clamp = (v: number, r: Int32Array) =>
+    Math.min(r[inner]! - 1, Math.max(r[2]!, v));
+  for (const [x0, y0, z0, x1, y1, z1] of req.fills) {
+    for (let z = z0; z < z1; z++) {
+      const cz = clamp(z, req.rz);
+      for (let y = y0; y < y1; y++) {
+        const cy = clamp(y, req.ry);
+        for (let x = x0; x < x1; x++) {
+          src[((z - lz) * sy + (y - ly)) * sx + (x - lx)] =
+            src[((cz - lz) * sy + (cy - ly)) * sx + (clamp(x, req.rx) - lx)]!;
+        }
+      }
+    }
+  }
 }
 
 /** Every output sample covers exactly one source voxel (no resampling). */
@@ -250,6 +317,7 @@ function assembleUnresampled(req: ImsAssembleRequest): {
         src.set(p.data.subarray(si, si + p.sx), di);
       }
   }
+  fillClamped(src, req);
   const P = PHYSICAL;
   const u8 = req.format === "u8";
   const data = u8 ? new Uint8Array(P * P * P) : new Uint16Array(P * P * P);
@@ -301,6 +369,7 @@ function assemble(req: ImsAssembleRequest): {
       }
     }
   }
+  fillClamped(src, req);
 
   // 2. Separable box resample to 66³ (x, then y, then z)
   const P = PHYSICAL;
@@ -366,7 +435,9 @@ const post = postMessage as (m: unknown, t?: Transferable[]) => void;
 
 self.onmessage = (e: MessageEvent<ImsWorkerRequest>) => {
   const msg = e.data;
-  if (msg.type === "extract") {
+  if (msg.type === "init") {
+    cache = new ByteLru(msg.chunkBudget, (v) => v.byteLength);
+  } else if (msg.type === "extract") {
     handleExtract(msg)
       .then((r) => post(r, r.data ? [r.data] : []))
       .catch((err) =>
@@ -401,7 +472,5 @@ self.onmessage = (e: MessageEvent<ImsWorkerRequest>) => {
         error: err instanceof Error ? err.message : String(err),
       } satisfies ImsBrickResponse);
     }
-  } else if (msg.type === "clear") {
-    cache.clear();
   }
 };

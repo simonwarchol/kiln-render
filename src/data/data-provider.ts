@@ -111,6 +111,9 @@ export interface PipelineTimings {
   chunkCacheHitRatio?: number;
 }
 
+/** Pipeline timings a provider reports (uploads are timed by the streaming manager). */
+export type ProviderTimings = Omit<PipelineTimings, "avgUploadMs">;
+
 /**
  * Network/loading statistics for monitoring
  */
@@ -122,6 +125,15 @@ export interface NetworkStats {
   /** Total number of HTTP requests made */
   requestCount: number;
 }
+
+/** See DataProvider.setBrickStaleListener. */
+export type BrickStaleListener = (
+  lod: number,
+  bx: number,
+  by: number,
+  bz: number,
+  channelIndex: number,
+) => void;
 
 /**
  * Thrown when a zarr dataset is valid but uses features not yet supported.
@@ -153,7 +165,11 @@ export interface DataProvider {
    */
   getBrickGrid(lod: number): [number, number, number];
 
-  /** Load a single brick's voxel data with inline statistics. */
+  /**
+   * Load a single brick's voxel data with inline statistics. `priority`
+   * orders fetches where the provider queues them (lower first; the
+   * streaming manager passes its brick priority).
+   */
   loadBrick(
     lod: number,
     bx: number,
@@ -161,7 +177,15 @@ export interface DataProvider {
     bz: number,
     channelIndex?: number,
     signal?: AbortSignal,
+    priority?: number,
   ): Promise<BrickLoadResult | null>;
+
+  /**
+   * Listen for bricks that would now load better than when they were last
+   * returned (e.g. an Imaris brick whose ghost border was edge-clamped while
+   * the neighbouring chunks were not cached). Optional.
+   */
+  setBrickStaleListener?(listener: BrickStaleListener | null): void;
 
   /** Check if a brick is empty (below threshold). */
   isBrickEmpty(
@@ -173,25 +197,12 @@ export interface DataProvider {
   ): Promise<boolean>;
 
   /**
-   * Get statistics for a specific brick
-   * Returns null if stats are not available
-   */
-  getBrickStats(
-    lod: number,
-    bx: number,
-    by: number,
-    bz: number,
-  ): Promise<BrickStats | null>;
-
-  /**
    * Get network/loading statistics
    */
   getNetworkStats(): NetworkStats;
 
-  /**
-   * Get per-stage pipeline timing averages (optional — returns zeros if not implemented)
-   */
-  getPipelineTimings?(): PipelineTimings;
+  /** Per-stage pipeline timing averages (optional). */
+  getPipelineTimings?(): ProviderTimings;
 
   /**
    * Update the float normalisation range after base LOD range derivation.

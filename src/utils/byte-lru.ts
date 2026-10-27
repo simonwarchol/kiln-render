@@ -11,10 +11,6 @@ export class ByteLru<K, V> {
     private readonly sizeOf: (v: V) => number,
   ) {}
 
-  get size(): number {
-    return this.map.size;
-  }
-
   has(key: K): boolean {
     return this.map.has(key);
   }

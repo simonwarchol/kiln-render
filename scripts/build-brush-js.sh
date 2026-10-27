@@ -34,7 +34,9 @@ git -C "$WORK/brush" checkout --detach "$COMMIT"
 BINDGEN_VERSION="$(grep -A1 '^name = "wasm-bindgen"$' "$WORK/brush/Cargo.lock" | sed -n 's/^version = "\(.*\)"$/\1/p')"
 "${CARGO[@]}" install wasm-bindgen-cli --version "$BINDGEN_VERSION" --locked --root "$WORK/tools"
 
+# Without the debug name / producers sections (~5 MB of the module).
 "$WORK/tools/bin/wasm-bindgen" --target web --out-dir "$OUT" --out-name brush_js \
+  --remove-name-section --remove-producers-section \
   "$WORK/brush/target/wasm32-unknown-unknown/release/brush_js.wasm"
 
 # Optional: shrink with binaryen when installed.

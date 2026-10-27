@@ -31,8 +31,6 @@ import {
 import { StatsPanel } from "../../../shared/stats-panel.js";
 
 /** Only 'dvr' | 'mip' | 'iso' | 'slice' are selectable via the Mode segmented control. */
-type BaseRenderMode = "dvr" | "mip" | "iso" | "slice";
-
 export class VolumeUI {
   private viewer: KilnViewer;
   private stats: StatsPanel;
@@ -46,11 +44,10 @@ export class VolumeUI {
   private dragPointIndex = -1;
 
   private params = {
-    renderMode: "dvr" as BaseRenderMode,
+    renderMode: "dvr" as VolumeRenderMode,
     isoValue: 0.2,
     tfPreset: "grayscale" as TFPreset,
     upAxis: "-y" as UpAxis,
-    useIndirection: true,
     showWireframe: false,
     showAxis: false,
     windowCenter: 0.5,
@@ -97,7 +94,6 @@ export class VolumeUI {
   private dataLodSlider!: ReturnType<typeof createSlider>;
   private jitterToggle!: ReturnType<typeof createToggle>;
   private taaToggle!: ReturnType<typeof createToggle>;
-  private indirectionToggle!: ReturnType<typeof createToggle>;
   private tfPresetEl!: HTMLElement;
   private tfCanvasContainer!: HTMLElement;
 
@@ -117,12 +113,11 @@ export class VolumeUI {
     this.params.clipZ = { min: 0, max: dims[2] };
 
     // Sync initial values from camera/renderer
-    this.params.renderMode = this.normalizeMode(this.renderer.volumeRenderMode);
+    this.params.renderMode = this.renderer.volumeRenderMode;
     if (this.renderer.volumeRenderMode !== this.params.renderMode) {
       this.renderer.volumeRenderMode = this.params.renderMode;
     }
     this.params.upAxis = this.camera.getUpAxis();
-    this.params.useIndirection = this.renderer.useIndirection;
     this.params.showWireframe = this.renderer.showWireframe;
     this.params.showAxis = this.renderer.showAxis;
     this.params.windowCenter = this.renderer.windowCenter;
@@ -154,20 +149,6 @@ export class VolumeUI {
     this.initStreaming(viewer.streamingManager, viewer.metadata);
   }
 
-  private normalizeMode(mode: VolumeRenderMode): BaseRenderMode {
-    if (mode === "lod") return "dvr";
-    if (mode === "slice-lod") return "slice";
-    if (
-      mode === "dvr" ||
-      mode === "mip" ||
-      mode === "iso" ||
-      mode === "slice"
-    ) {
-      return mode;
-    }
-    return "dvr";
-  }
-
   private applyMode(): void {
     this.renderer.volumeRenderMode = this.params.renderMode;
     this.renderer.resetAccumulation();
@@ -190,7 +171,7 @@ export class VolumeUI {
       ],
       value: this.params.renderMode,
       onChange: (v) => {
-        this.params.renderMode = v as BaseRenderMode;
+        this.params.renderMode = v as VolumeRenderMode;
         this.applyMode();
         trackRenderMode(v);
       },
@@ -248,6 +229,21 @@ export class VolumeUI {
       },
     });
     sceneSection.appendChild(this.axesToggle.el);
+
+    // Fade with distance from the camera (volume and splats).
+    sceneSection.appendChild(
+      createSlider({
+        label: "Depth fade",
+        min: 0,
+        max: 1,
+        step: 0.01,
+        value: this.viewer.depthCue,
+        format: (v) => (v === 0 ? "Off" : v.toFixed(2)),
+        onChange: (v) => {
+          this.viewer.depthCue = v;
+        },
+      }).el,
+    );
 
     this.clipSection = document.createElement("div");
     sceneSection.appendChild(this.clipSection);
@@ -325,16 +321,6 @@ export class VolumeUI {
       },
     });
     advancedBody.appendChild(this.taaToggle.el);
-
-    this.indirectionToggle = createToggle({
-      label: "Indirection",
-      value: this.params.useIndirection,
-      onChange: (v) => {
-        this.renderer.useIndirection = v;
-        this.renderer.resetAccumulation();
-      },
-    });
-    advancedBody.appendChild(this.indirectionToggle.el);
   }
 
   /** Builds the persistent mode-options widgets once; updateVisibility() swaps which are shown. */
@@ -660,10 +646,6 @@ export class VolumeUI {
     this.renderer.resetAccumulation();
   }
 
-  refreshTFPreview(): void {
-    this.updateTFPreview();
-  }
-
   /** Called when base LOD is loaded - computes and displays histogram */
   private onBaseLodLoaded(brickData: (Uint8Array | Uint16Array)[]): void {
     if (!this.metadata) return;
@@ -683,7 +665,7 @@ export class VolumeUI {
 
   /** Sync UI params from current renderer/camera state (e.g. after applying URL params) */
   syncFromState(): void {
-    this.params.renderMode = this.normalizeMode(this.renderer.volumeRenderMode);
+    this.params.renderMode = this.renderer.volumeRenderMode;
     this.params.isoValue = this.renderer.isoValue;
     this.params.windowCenter = this.renderer.windowCenter;
     this.params.windowWidth = this.renderer.windowWidth;

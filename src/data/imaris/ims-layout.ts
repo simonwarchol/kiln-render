@@ -17,8 +17,10 @@ import {
 
 export { LOGICAL, PHYSICAL };
 
-/** Decoded (float16) chunk cache per brick worker. */
+/** Decoded (float16) chunk cache per brick worker… */
 export const WORKER_CHUNK_BUDGET = 96 * 1024 * 1024;
+/** …and across all of a provider's workers (more workers get less each). */
+export const DECODED_CHUNK_BUDGET = 384 * 1024 * 1024;
 
 export type Vec3 = [number, number, number];
 
@@ -89,6 +91,13 @@ export function planVirtualPyramid(sources: SourceLevel[]): VirtualLevel[] {
   return out;
 }
 
+/** One axis of a brick's sampling (see axisSampling). */
+export interface AxisSampling {
+  ranges: Int32Array;
+  lo: number;
+  hi: number;
+}
+
 /**
  * For each output voxel along one axis of a brick (PHYSICAL samples incl.
  * the 1-voxel ghost border, edge-clamped), the [start, end) range of source
@@ -100,7 +109,7 @@ export function axisSampling(
   virtualDim: number,
   sourceDim: number,
   ratio: number,
-): { ranges: Int32Array; lo: number; hi: number } {
+): AxisSampling {
   const ranges = new Int32Array(PHYSICAL * 2);
   let lo = Number.POSITIVE_INFINITY;
   let hi = 0;
@@ -118,6 +127,104 @@ export function axisSampling(
   return { ranges, lo, hi };
 }
 
+/** Ghost-border face bit: axis 0–2 (x, y, z), side 0 (low) or 1 (high). */
+export const faceBit = (axis: number, side: 0 | 1): number =>
+  (1 + side) << (2 * axis);
+
+/**
+ * The ghost sample on one side repeats its interior neighbour (edge
+ * clamping, as at the volume boundary), so the source span stops at the
+ * interior.
+ */
+export function clampGhost(s: AxisSampling, side: 0 | 1): AxisSampling {
+  const ranges = s.ranges.slice();
+  const ghost = side === 0 ? 0 : PHYSICAL - 1;
+  const inner = side === 0 ? 1 : PHYSICAL - 2;
+  ranges[ghost * 2] = ranges[inner * 2]!;
+  ranges[ghost * 2 + 1] = ranges[inner * 2 + 1]!;
+  return side === 0
+    ? { ranges, lo: ranges[2]!, hi: s.hi }
+    : { ranges, lo: s.lo, hi: ranges[inner * 2 + 1]! };
+}
+
+export interface BorderPlan {
+  /** Faces (faceBit mask) to fill by edge clamping for now */
+  clamped: number;
+  /**
+   * Uncached edge / corner chunks between kept faces: not fetched, their
+   * voxels are clamped into the interior instead (see `fills` in the worker)
+   */
+  filled: Vec3[];
+  /**
+   * Uncached chunks in groups: once every chunk of a group has arrived,
+   * loading the brick again improves it
+   */
+  waiting: Vec3[][];
+}
+
+/**
+ * Which ghost-border faces of a brick to fill from neighbouring chunks.
+ *
+ * The 1-voxel border widens a brick's source box into chunks that hold
+ * nothing but border voxels: with 128×128×16 chunks, a 64³ brick touches 20
+ * chunks instead of 4. A face is filled for real once every chunk bordering
+ * only that face is `cached`; otherwise it is edge-clamped. Edge and corner
+ * chunks never hold a face back — they often belong to a diagonal neighbour
+ * that is never loaded — and are clamp-filled while missing.
+ */
+export function planBorders(
+  axes: readonly [AxisSampling, AxisSampling, AxisSampling],
+  chunk: Vec3,
+  cached: (cx: number, cy: number, cz: number) => boolean,
+): BorderPlan {
+  // Per axis: chunk index span of the whole box and of the brick interior.
+  const c0: Vec3 = [0, 0, 0];
+  const c1: Vec3 = [0, 0, 0];
+  const k0: Vec3 = [0, 0, 0];
+  const k1: Vec3 = [0, 0, 0];
+  let faces = 0;
+  for (let a = 0; a < 3; a++) {
+    const s = axes[a]!;
+    const cs = chunk[a]!;
+    c0[a] = Math.floor(s.lo / cs);
+    c1[a] = Math.floor((s.hi - 1) / cs);
+    k0[a] = Math.floor(s.ranges[2]! / cs);
+    k1[a] = Math.floor((s.ranges[(PHYSICAL - 2) * 2 + 1]! - 1) / cs);
+    if (c0[a]! < k0[a]!) faces |= faceBit(a, 0);
+    if (c1[a]! > k1[a]!) faces |= faceBit(a, 1);
+  }
+  // Uncached border-only chunks: per face for those bordering one face,
+  // with their face mask for edges and corners.
+  const faceMissing = new Map<number, Vec3[]>();
+  const edgeMissing: Array<{ mask: number; at: Vec3 }> = [];
+  if (faces !== 0) {
+    for (let cz = c0[2]; cz <= c1[2]; cz++)
+      for (let cy = c0[1]; cy <= c1[1]; cy++)
+        for (let cx = c0[0]; cx <= c1[0]; cx++) {
+          const at: Vec3 = [cx, cy, cz];
+          let mask = 0;
+          for (let a = 0; a < 3; a++) {
+            if (at[a]! < k0[a]!) mask |= faceBit(a, 0);
+            else if (at[a]! > k1[a]!) mask |= faceBit(a, 1);
+          }
+          if (mask === 0 || cached(cx, cy, cz)) continue;
+          if ((mask & (mask - 1)) !== 0) edgeMissing.push({ mask, at });
+          else faceMissing.set(mask, [...(faceMissing.get(mask) ?? []), at]);
+        }
+  }
+  let clamped = 0;
+  for (const f of faceMissing.keys()) clamped |= f;
+  // Edges touching a clamped face fall outside the narrowed box anyway.
+  const filled = edgeMissing
+    .filter((m) => (m.mask & clamped) === 0)
+    .map((m) => m.at);
+  return {
+    clamped,
+    filled,
+    waiting: [...faceMissing.values(), ...filled.map((at) => [at])],
+  };
+}
+
 /** Chunk grid coordinates (x, y, z) overlapping a source box [lo, hi). */
 export function overlappingChunks(lo: Vec3, hi: Vec3, chunk: Vec3): Vec3[] {
   const out: Vec3[] = [];
@@ -126,32 +233,5 @@ export function overlappingChunks(lo: Vec3, hi: Vec3, chunk: Vec3): Vec3[] {
   for (let cz = c0[2]!; cz <= c1[2]!; cz++)
     for (let cy = c0[1]!; cy <= c1[1]!; cy++)
       for (let cx = c0[0]!; cx <= c1[0]!; cx++) out.push([cx, cy, cz]);
-  return out;
-}
-
-/** Group byte ranges into coalesced reads (sorted by address). */
-export function coalesceRanges(
-  refs: Array<{ address: number; size: number }>,
-  maxGap = 64 * 1024,
-  maxBytes = 16 * 1024 * 1024,
-): Array<{ start: number; end: number; members: number[] }> {
-  const order = refs
-    .map((r, i) => ({ ...r, i }))
-    .sort((a, b) => a.address - b.address);
-  const out: Array<{ start: number; end: number; members: number[] }> = [];
-  for (const r of order) {
-    const last = out[out.length - 1];
-    const end = r.address + r.size;
-    if (
-      last &&
-      r.address - last.end <= maxGap &&
-      Math.max(last.end, end) - last.start <= maxBytes
-    ) {
-      last.end = Math.max(last.end, end);
-      last.members.push(r.i);
-    } else {
-      out.push({ start: r.address, end, members: [r.i] });
-    }
-  }
   return out;
 }

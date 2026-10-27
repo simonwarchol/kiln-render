@@ -3,30 +3,22 @@
  *
  * These tests verify that for a dataset with N channels:
  *  - dataProvider.loadBrick is called once per channel per brick (channelIndex 0…N-1)
- *  - writeToCanvas is called once per channel, writing to the correct atlas canvas
+ *  - resources.writeBrick is called once per channel, with that channel index
  *  - Empty bricks short-circuit before any channel data is fetched
  *
- * WebGPU is avoided by mocking writeToCanvas and supplying lightweight stand-ins
- * for Renderer and GPUDevice.
+ * WebGPU is avoided by supplying a lightweight VolumeResources stand-in whose
+ * upload methods are mocks.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mat4 } from "wgpu-matrix";
 import type {
+  BrickStaleListener,
   DataProvider,
-  NetworkStats,
   VolumeMetadata,
 } from "../src/data/data-provider.js";
 import { StreamingManager } from "../src/streaming/streaming-manager.js";
-
-// ---------------------------------------------------------------------------
-// Mock writeToCanvas — the only WebGPU-touching function called during base
-// LOD loading.  Everything else operates on plain JS objects.
-// ---------------------------------------------------------------------------
-
-vi.mock("../src/core/volume.js", () => ({
-  writeToCanvas: vi.fn(),
-}));
+import { mockProvider, mockResources } from "./helpers/streaming-mocks.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -52,63 +44,10 @@ function makeMetadata(numChannels: number): VolumeMetadata {
   };
 }
 
-function makeProvider(numChannels: number, isEmpty = false): DataProvider {
-  const brickData = new Uint8Array(66 * 66 * 66);
-  return {
-    initialize: vi.fn().mockResolvedValue(makeMetadata(numChannels)),
-    getMetadata: vi.fn().mockReturnValue(makeMetadata(numChannels)),
-    getBrickGrid: vi
-      .fn()
-      .mockReturnValue([1, 1, 1] as [number, number, number]),
-    loadBrick: vi
-      .fn()
-      .mockResolvedValue({ data: brickData, min: 0, max: 128, avg: 64 }),
-    isBrickEmpty: vi.fn().mockResolvedValue(isEmpty),
-    getBrickStats: vi.fn().mockResolvedValue(null),
-    getNetworkStats: vi.fn().mockReturnValue({
-      totalBytesDownloaded: 0,
-      recentBytesPerSecond: 0,
-      requestCount: 0,
-    } as NetworkStats),
-    dispose: vi.fn(),
-  };
-}
-
-/**
- * Minimal VolumeResources stand-in.  Only the properties accessed during
- * loadBaseLod and the streaming loadBrick path are populated.
- * `canvases` is an array of plain objects — the real type is irrelevant
- * because writeToCanvas is mocked.
- */
-function makeResources(numChannels: number) {
-  return {
-    numChannels,
-    allocator: {
-      allocate: vi.fn().mockReturnValue({
-        slot: { x: 0, y: 0, z: 0 },
-        slotIndex: 0,
-        evicted: null,
-      }),
-      hasEvictableSlot: vi.fn().mockReturnValue(true),
-      setMetadata: vi.fn(),
-      pin: vi.fn(),
-      touch: vi.fn(),
-      free: vi.fn(),
-      usedCount: 0,
-      totalSlots: 512,
-    },
-    indirection: {
-      setBrick: vi.fn(),
-      setEmpty: vi.fn(),
-      clearBrick: vi.fn(),
-      clearAll: vi.fn(),
-    },
-    // One canvas per channel — indexed in loadBrick as resources.canvases[ch]
-    canvases: Array.from({ length: Math.max(numChannels, 1) }, (_, i) => ({
-      _ch: i,
-    })),
-  };
-}
+const makeProvider = (numChannels: number, isEmpty = false) =>
+  mockProvider(makeMetadata(numChannels), { isEmpty });
+const makeResources = (numChannels: number) =>
+  mockResources(numChannels, { evictable: true });
 
 /** Minimal DatasetConfig stand-in. */
 function makeConfig() {
@@ -135,7 +74,6 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
       resources as any,
       provider,
       makeMetadata(1),
-      {} as GPUDevice,
       makeConfig() as any,
       vi.fn(),
     );
@@ -156,7 +94,6 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
       resources as any,
       provider,
       makeMetadata(2),
-      {} as GPUDevice,
       makeConfig() as any,
       vi.fn(),
     );
@@ -178,7 +115,6 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
       resources as any,
       provider,
       makeMetadata(4),
-      {} as GPUDevice,
       makeConfig() as any,
       vi.fn(),
     );
@@ -194,8 +130,6 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
   });
 
   it("writes each channel to the corresponding atlas canvas", async () => {
-    const { writeToCanvas } = await import("../src/core/volume.js");
-
     const provider = makeProvider(2);
     const resources = makeResources(2);
 
@@ -203,7 +137,6 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
       resources as any,
       provider,
       makeMetadata(2),
-      {} as GPUDevice,
       makeConfig() as any,
       vi.fn(),
     );
@@ -212,23 +145,17 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
       expect(sm.baseLodLoaded).toBe(true);
     });
 
-    // writeToCanvas must have been called twice — once per channel
-    expect(vi.mocked(writeToCanvas)).toHaveBeenCalledTimes(2);
-
-    // Channel 0 → canvases[0], channel 1 → canvases[1]
-    expect(vi.mocked(writeToCanvas)).toHaveBeenCalledWith(
-      expect.anything(), // device (mocked)
-      resources.canvases[0], // atlas for channel 0
+    // writeBrick must have been called twice — once per channel
+    expect(resources.writeBrick).toHaveBeenCalledTimes(2);
+    expect(resources.writeBrick).toHaveBeenCalledWith(
+      expect.anything(), // slot
+      0,
       expect.any(Uint8Array),
-      expect.anything(),
-      expect.anything(),
     );
-    expect(vi.mocked(writeToCanvas)).toHaveBeenCalledWith(
+    expect(resources.writeBrick).toHaveBeenCalledWith(
       expect.anything(),
-      resources.canvases[1], // atlas for channel 1
+      1,
       expect.any(Uint8Array),
-      expect.anything(),
-      expect.anything(),
     );
   });
 
@@ -240,7 +167,6 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
       resources as any,
       provider,
       makeMetadata(3),
-      {} as GPUDevice,
       makeConfig() as any,
       vi.fn(),
     );
@@ -261,7 +187,6 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
       resources as any,
       provider,
       makeMetadata(2),
-      {} as GPUDevice,
       makeConfig() as any,
       vi.fn(),
     );
@@ -281,7 +206,6 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
       resources as any,
       provider,
       makeMetadata(2),
-      {} as GPUDevice,
       makeConfig() as any,
       vi.fn(),
     );
@@ -322,30 +246,10 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
     };
   }
 
-  function makePyramidProvider(numChannels: number): DataProvider {
-    const brickData = new Uint8Array(66 * 66 * 66);
-    const meta = makePyramidMetadata(numChannels);
-    return {
-      initialize: vi.fn().mockResolvedValue(meta),
-      getMetadata: vi.fn().mockReturnValue(meta),
-      getBrickGrid: vi
-        .fn()
-        .mockImplementation((lod: number) =>
-          lod === 0 ? [2, 2, 2] : [1, 1, 1],
-        ),
-      loadBrick: vi
-        .fn()
-        .mockResolvedValue({ data: brickData, min: 0, max: 128, avg: 64 }),
-      isBrickEmpty: vi.fn().mockResolvedValue(false),
-      getBrickStats: vi.fn().mockResolvedValue(null),
-      getNetworkStats: vi.fn().mockReturnValue({
-        totalBytesDownloaded: 0,
-        recentBytesPerSecond: 0,
-        requestCount: 0,
-      } as NetworkStats),
-      dispose: vi.fn(),
-    };
-  }
+  const pyramidGrid = (lod: number): [number, number, number] =>
+    lod === 0 ? [2, 2, 2] : [1, 1, 1];
+  const makePyramidProvider = (numChannels: number) =>
+    mockProvider(makePyramidMetadata(numChannels), { brickGrid: pyramidGrid });
 
   function stubCamera() {
     const pos: [number, number, number] = [0, 0, 0.5];
@@ -378,7 +282,6 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
       resources as never,
       provider,
       makePyramidMetadata(2),
-      {} as GPUDevice,
       makeConfig() as never,
       vi.fn(),
     );
@@ -419,7 +322,6 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
       resources as never,
       provider,
       makePyramidMetadata(2),
-      {} as GPUDevice,
       makeConfig() as never,
       vi.fn(),
     );
@@ -449,7 +351,6 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
   });
 
   it("does not upload hidden channels when committing a finer brick", async () => {
-    const { writeToCanvas } = await import("../src/core/volume.js");
     const provider = makePyramidProvider(2);
     const resources = makeResources(2);
     let nextSlot = 0;
@@ -462,14 +363,13 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
       resources as never,
       provider,
       makePyramidMetadata(2),
-      {} as GPUDevice,
       makeConfig() as never,
       vi.fn(),
     );
     await vi.waitFor(() => {
       expect(sm.baseLodLoaded).toBe(true);
     });
-    vi.mocked(writeToCanvas).mockClear();
+    resources.writeBrick.mockClear();
 
     sm.setChannelEnabled(1, false);
     sm.forcedLod = 0;
@@ -477,18 +377,13 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
     (sm as unknown as { processLoadQueue(): void }).processLoadQueue();
 
     await vi.waitFor(() => {
-      expect(vi.mocked(writeToCanvas).mock.calls.length).toBeGreaterThan(0);
+      expect(resources.writeBrick.mock.calls.length).toBeGreaterThan(0);
     });
 
-    const canvasesWritten = vi
-      .mocked(writeToCanvas)
-      .mock.calls.map((c) => c[1]);
-    expect(canvasesWritten.every((c) => c === resources.canvases[0])).toBe(
-      true,
-    );
-    expect(canvasesWritten.some((c) => c === resources.canvases[1])).toBe(
-      false,
-    );
+    const channelsWritten = resources.writeBrick.mock.calls.map((c) => c[1]);
+    expect(channelsWritten.every((ch) => ch === 0)).toBe(true);
+    // The hidden channel is marked empty instead of uploaded
+    expect(resources.clearChannel).toHaveBeenCalledWith(expect.anything(), 1);
   });
 
   it("limits concurrent channel fetches across bricks", async () => {
@@ -497,13 +392,7 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
     const brickData = new Uint8Array(66 * 66 * 66);
     const meta = makePyramidMetadata(4);
     const provider: DataProvider = {
-      initialize: vi.fn().mockResolvedValue(meta),
-      getMetadata: vi.fn().mockReturnValue(meta),
-      getBrickGrid: vi
-        .fn()
-        .mockImplementation((lod: number) =>
-          lod === 0 ? [2, 2, 2] : [1, 1, 1],
-        ),
+      ...mockProvider(meta, { brickGrid: pyramidGrid }),
       loadBrick: vi.fn().mockImplementation(async () => {
         inFlight++;
         peak = Math.max(peak, inFlight);
@@ -511,14 +400,6 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
         inFlight--;
         return { data: brickData, min: 0, max: 128, avg: 64 };
       }),
-      isBrickEmpty: vi.fn().mockResolvedValue(false),
-      getBrickStats: vi.fn().mockResolvedValue(null),
-      getNetworkStats: vi.fn().mockReturnValue({
-        totalBytesDownloaded: 0,
-        recentBytesPerSecond: 0,
-        requestCount: 0,
-      } as NetworkStats),
-      dispose: vi.fn(),
     };
     const resources = makeResources(4);
     let nextSlot = 0;
@@ -531,7 +412,6 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
       resources as never,
       provider,
       meta,
-      {} as GPUDevice,
       makeConfig() as never,
       vi.fn(),
     );
@@ -545,5 +425,99 @@ describe("StreamingManager — skip hidden channels on LOD change", () => {
     });
     // Base LOD alone is 1 brick × 4 channels with budget 3 → peak must be ≤ 3.
     expect(peak).toBeLessThanOrEqual(3);
+  });
+
+  /** Streams LOD 0 with a provider that can report stale bricks. */
+  async function streamWithStaleReports(loadBrick: DataProvider["loadBrick"]) {
+    let report!: BrickStaleListener;
+    const provider: DataProvider = {
+      ...makePyramidProvider(2),
+      loadBrick: vi.fn(loadBrick),
+      setBrickStaleListener: (l) => {
+        report = l!;
+      },
+    };
+    const resources = makeResources(2);
+    let nextSlot = 0;
+    resources.allocator.allocate = vi.fn().mockImplementation(() => {
+      const i = nextSlot++;
+      return { slot: { x: i, y: 0, z: 0 }, slotIndex: i, evicted: null };
+    });
+    const sm = new StreamingManager(
+      resources as never,
+      provider,
+      makePyramidMetadata(2),
+      makeConfig() as never,
+      vi.fn(),
+    );
+    await vi.waitFor(() => {
+      expect(sm.baseLodLoaded).toBe(true);
+    });
+    sm.forcedLod = 0;
+    sm.forceUpdate(stubCamera() as never, canvas);
+    (sm as unknown as { processLoadQueue(): void }).processLoadQueue();
+    const loaded = (key: string) =>
+      (
+        sm as unknown as { loadedBricks: Map<string, unknown> }
+      ).loadedBricks.has(key);
+    const callsFor = (ch: number) =>
+      vi
+        .mocked(provider.loadBrick)
+        .mock.calls.filter(
+          (c) =>
+            c[0] === 0 && c[1] === 0 && c[2] === 0 && c[3] === 0 && c[4] === ch,
+        ).length;
+    return { report: () => report, loaded, callsFor, resources };
+  }
+
+  const brick = {
+    data: new Uint8Array(66 * 66 * 66),
+    min: 0,
+    max: 128,
+    avg: 64,
+  };
+
+  it("reloads a resident brick channel the provider reports stale", async () => {
+    const s = await streamWithStaleReports(async () => brick);
+    await vi.waitFor(() => {
+      expect(s.loaded("lod0:0/0/0")).toBe(true);
+    });
+    expect(s.callsFor(1)).toBe(1);
+    s.resources.writeBrick.mockClear();
+    s.report()(0, 0, 0, 0, 1);
+    await vi.waitFor(() => {
+      expect(s.callsFor(1)).toBe(2);
+      expect(s.resources.writeBrick).toHaveBeenCalledWith(
+        expect.anything(),
+        1,
+        expect.anything(),
+      );
+    });
+    expect(s.callsFor(0)).toBe(1);
+  });
+
+  it("reloads a channel reported stale while its brick was loading", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let first = true;
+    const s = await streamWithStaleReports(async (lod, bx, by, bz, ch) => {
+      if (lod === 0 && bx === 0 && by === 0 && bz === 0 && ch === 0 && first) {
+        first = false;
+        await held;
+      }
+      return brick;
+    });
+    await vi.waitFor(() => {
+      expect(s.callsFor(0)).toBe(1);
+    });
+    s.report()(0, 0, 0, 0, 0);
+    release();
+    await vi.waitFor(() => {
+      expect(s.loaded("lod0:0/0/0")).toBe(true);
+      expect(s.callsFor(0)).toBe(2);
+    });
+    expect(s.callsFor(1)).toBe(1);
   });
 });

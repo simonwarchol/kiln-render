@@ -1,5 +1,6 @@
 /**
- * IndexedDB storage for FileSystemDirectoryHandle
+ * IndexedDB storage for the last local dataset's FileSystem handle (one
+ * slot: a zarr directory or an Imaris file).
  */
 
 const DB_NAME = "kiln-zarr-handles";
@@ -7,92 +8,74 @@ const STORE_NAME = "handles";
 const KEY = "local-zarr-dir";
 const IMS_KEY = "local-ims-file";
 
-async function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+/** Run one request in a transaction on a fresh connection, then close it. */
+async function withStore<T>(
+  mode: IDBTransactionMode,
+  run: (store: IDBObjectStore) => IDBRequest<T>,
+): Promise<T> {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, 1);
     request.onerror = () => reject(request.error);
     request.onsuccess = () => resolve(request.result);
     request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME);
+      if (!request.result.objectStoreNames.contains(STORE_NAME)) {
+        request.result.createObjectStore(STORE_NAME);
       }
     };
   });
-}
-
-export async function storeHandle(
-  handle: FileSystemDirectoryHandle,
-): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    const store = tx.objectStore(STORE_NAME);
-    store.delete(IMS_KEY);
-    const request = store.put(handle, KEY);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve();
-  });
-}
-
-export async function storeFileHandle(
-  handle: FileSystemFileHandle,
-): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    const store = tx.objectStore(STORE_NAME);
-    store.delete(KEY);
-    const request = store.put(handle, IMS_KEY);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve();
-  });
-}
-
-export async function getHandle(): Promise<FileSystemDirectoryHandle | null> {
   try {
-    const db = await openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readonly");
-      const store = tx.objectStore(STORE_NAME);
-      const request = store.get(KEY);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => {
-        const handle = request.result as FileSystemDirectoryHandle | undefined;
-        resolve(handle ?? null);
-      };
+    return await new Promise<T>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, mode);
+      const request = run(tx.objectStore(STORE_NAME));
+      tx.oncomplete = () => resolve(request.result);
+      tx.onerror = () => reject(tx.error ?? request.error);
+      tx.onabort = () => reject(tx.error ?? request.error);
     });
+  } finally {
+    db.close();
+  }
+}
+
+/** Store `handle` under `key`, replacing the other slot. */
+async function put(
+  key: string,
+  other: string,
+  handle: FileSystemHandle,
+): Promise<void> {
+  await withStore("readwrite", (store) => {
+    store.delete(other);
+    return store.put(handle, key);
+  });
+}
+
+async function get<T>(key: string): Promise<T | null> {
+  try {
+    return ((await withStore("readonly", (store) => store.get(key))) ??
+      null) as T | null;
   } catch {
     return null;
   }
 }
 
-export async function getFileHandle(): Promise<FileSystemFileHandle | null> {
-  try {
-    const db = await openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readonly");
-      const store = tx.objectStore(STORE_NAME);
-      const request = store.get(IMS_KEY);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => {
-        const handle = request.result as FileSystemFileHandle | undefined;
-        resolve(handle ?? null);
-      };
-    });
-  } catch {
-    return null;
-  }
+export function storeHandle(handle: FileSystemDirectoryHandle): Promise<void> {
+  return put(KEY, IMS_KEY, handle);
+}
+
+export function storeFileHandle(handle: FileSystemFileHandle): Promise<void> {
+  return put(IMS_KEY, KEY, handle);
+}
+
+export function getHandle(): Promise<FileSystemDirectoryHandle | null> {
+  return get(KEY);
+}
+
+export function getFileHandle(): Promise<FileSystemFileHandle | null> {
+  return get(IMS_KEY);
 }
 
 export async function clearHandle(): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    const store = tx.objectStore(STORE_NAME);
+  await withStore("readwrite", (store) => {
     store.delete(KEY);
-    const request = store.delete(IMS_KEY);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve();
+    return store.delete(IMS_KEY);
   });
 }

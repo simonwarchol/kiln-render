@@ -1,7 +1,23 @@
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin, transformWithEsbuild } from "vite";
 
 const srcDir = fileURLToPath(new URL("./src", import.meta.url));
+
+/**
+ * Minify worker bundles. They are inlined into the library as strings
+ * (`?worker&inline`), so consumers' bundlers can't minify them.
+ */
+const minifyWorker = (): Plugin => ({
+  name: "kiln-minify-worker",
+  async renderChunk(code, chunk) {
+    const out = await transformWithEsbuild(code, chunk.fileName, {
+      minify: true,
+      format: "esm",
+      target: "esnext",
+    });
+    return { code: out.code, map: out.map };
+  },
+});
 
 export default defineConfig({
   // Don't copy public/ assets into the library output
@@ -15,14 +31,17 @@ export default defineConfig({
     outDir: "lib",
     emptyOutDir: true,
     target: "esnext",
-    // Don't minify — consumers' bundlers handle that
+    // Don't minify — consumers' bundlers handle that (workers excepted, below)
     minify: false,
     // No externals: wgpu-matrix, zarrita, fflate are implementation
     // details that consumers should not need to install separately
     rollupOptions: {
-      // Optional peers — splat preview (playcanvas) and Brush training (brush-js).
-      external: ["playcanvas", "brush-js"],
+      // Brush (vendor/brush-js, loaded only to train splats) ships in
+      // lib/brush-js/, copied by postbuild-lib, and is imported from there:
+      // installed packages have no vendor/ folder to link to.
+      external: ["brush-js"],
       output: {
+        paths: { "brush-js": "./brush-js/brush_js.js" },
         // Keep all chunks in lib/ root — avoids Vite emitting duplicate
         // copies in lib/assets/ alongside the canonical lib/ versions
         chunkFileNames: "[name]-[hash].js",
@@ -32,6 +51,7 @@ export default defineConfig({
   },
   worker: {
     format: "es",
+    plugins: () => [minifyWorker()],
     rollupOptions: {
       output: {
         // Inline all dynamic imports (zarrita codec chunks) into the worker

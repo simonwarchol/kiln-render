@@ -32,6 +32,9 @@ export class OpfsChunkStore {
     dir: FileSystemDirectoryHandle;
     names: Set<string>;
   } | null>;
+  /** Resolves once the directory has been listed; `has` is then accurate. */
+  readonly ready: Promise<void>;
+  private names: Set<string> | null = null;
   private readonly reads = new Limiter(READ_CONCURRENCY);
   private readonly writes = new Limiter(WRITE_CONCURRENCY);
   private enabled = true;
@@ -51,6 +54,14 @@ export class OpfsChunkStore {
         return null;
       }
     })();
+    this.ready = this.opened.then((o) => {
+      this.names = o?.names ?? null;
+    });
+  }
+
+  /** Stored (as of the last write), without touching the disk. */
+  has(address: number, size: number): boolean {
+    return this.enabled && !!this.names?.has(fileName(address, size));
   }
 
   static supported(): boolean {
@@ -60,12 +71,23 @@ export class OpfsChunkStore {
     );
   }
 
-  /** Stored bytes, or null if absent. */
-  async get(address: number, size: number): Promise<Uint8Array | null> {
+  /**
+   * Stored bytes, or null if absent. Lower `priority` values are read first;
+   * a read whose `cancelled()` is true by its turn rejects with AbortError.
+   */
+  async get(
+    address: number,
+    size: number,
+    priority = 0,
+    cancelled?: () => boolean,
+  ): Promise<Uint8Array | null> {
     const o = await this.opened;
     const name = fileName(address, size);
     if (!o || !this.enabled || !o.names.has(name)) return null;
     return this.reads.run(async () => {
+      if (cancelled?.()) {
+        throw new DOMException("Chunk read cancelled", "AbortError");
+      }
       try {
         const fh = await o.dir.getFileHandle(name);
         const buf = await (await fh.getFile()).arrayBuffer();
@@ -73,7 +95,7 @@ export class OpfsChunkStore {
       } catch {
         return null; // removed meanwhile (e.g. storage cleared)
       }
-    });
+    }, priority);
   }
 
   put(address: number, size: number, bytes: Uint8Array): void {

@@ -11,21 +11,24 @@
  * asynchronously only to grow buffers.
  */
 
+import { type DepthCue, NO_DEPTH_CUE } from "../../core/depth-cue.js";
+import type { SplatCamera } from "../cpu-reference.js";
 import {
   bindGroup,
   createBuffer,
   createKernel,
   dispatch1d,
-  type GpuProfiler,
   type Kernel,
-  PassChain,
+  READBACK,
   readBuffer,
   STORAGE_RW,
+  withMapped,
 } from "./kernel.js";
 import { GpuRadixSort } from "./radix-sort.js";
 import {
   CAMERA_UNIFORM_SIZE,
-  PROJ_STRIDE,
+  MAX_SPLAT_CHANNELS,
+  PROJ_VEC4S,
   PROJECT_WGSL,
   RANGES_WGSL,
   RASTERIZE_WGSL,
@@ -34,24 +37,16 @@ import {
 } from "./raster-wgsl.js";
 import { GpuScan } from "./scan.js";
 
-export interface SplatCamera {
-  /** Column-major view matrix */
-  view: ArrayLike<number>;
-  fx: number;
-  fy: number;
-  cx: number;
-  cy: number;
-  width: number;
-  height: number;
-}
-
 interface RasterKernels {
   project: Kernel;
   countTiles: Kernel;
   emit: Kernel;
   rangesSetup: Kernel;
   ranges: Kernel;
+  /** Front-to-back compositing (plain clouds, channelMode 1) */
   rasterize: Kernel;
+  /** Per-channel additive compositing (channelMode 2) */
+  rasterizeAdd: Kernel;
 }
 
 const kernelCache = new WeakMap<GPUDevice, RasterKernels>();
@@ -75,6 +70,13 @@ function rasterKernels(device: GPUDevice): RasterKernels {
     "read-only-storage",
     "read-only-storage",
     "storage",
+    "storage",
+  ] as const;
+  const rasterBindings = [
+    "uniform",
+    "read-only-storage",
+    "read-only-storage",
+    "read-only-storage",
     "storage",
   ] as const;
   k = {
@@ -118,13 +120,15 @@ function rasterKernels(device: GPUDevice): RasterKernels {
       "splat:rasterize",
       RASTERIZE_WGSL,
       "rasterize",
-      [
-        "uniform",
-        "read-only-storage",
-        "read-only-storage",
-        "read-only-storage",
-        "storage",
-      ],
+      rasterBindings,
+    ),
+    rasterizeAdd: createKernel(
+      device,
+      "splat:rasterize-add",
+      RASTERIZE_WGSL,
+      "rasterize",
+      rasterBindings,
+      { additive: 1 },
     ),
   };
   kernelCache.set(device, k);
@@ -135,6 +139,8 @@ function bitsFor(n: number): number {
   return Math.max(1, Math.ceil(Math.log2(Math.max(2, n))));
 }
 
+type Groups = Record<keyof RasterKernels, GPUBindGroup>;
+
 export class SplatRasterizer {
   readonly device: GPUDevice;
   private readonly k: RasterKernels;
@@ -142,9 +148,12 @@ export class SplatRasterizer {
   // Per-Gaussian
   private gaussianCapacity = 0;
   private count = 0;
+  /** Count last written to countBuf (−1: not written yet) */
+  private countWritten = -1;
   private params: GPUBuffer | null = null;
-  projected!: GPUBuffer;
+  private projected!: GPUBuffer;
   private depthKeys!: GPUBuffer;
+  /** Gaussian indices in depth order after a forward pass (tests read it). */
   depthIdx!: GPUBuffer;
   private offsets!: GPUBuffer;
   private countBuf!: GPUBuffer;
@@ -154,31 +163,38 @@ export class SplatRasterizer {
   // Per-intersection
   private isectCapacity = 0;
   private isectKeys!: GPUBuffer;
-  isectVals!: GPUBuffer;
+  private isectVals!: GPUBuffer;
   private isectSort!: GpuRadixSort;
 
   // Per-pixel / per-tile
-  width = 0;
-  height = 0;
-  tilesX = 0;
-  tilesY = 0;
+  private width = 0;
+  private height = 0;
+  private tilesX = 0;
+  private tilesY = 0;
+  /** Premultiplied RGBA, one vec4f per pixel (row-major). */
   image!: GPUBuffer;
-  tileRanges!: GPUBuffer;
-  readonly camera: GPUBuffer;
+  private tileRanges!: GPUBuffer;
+  private readonly camera: GPUBuffer;
   private readonly rangesIndirect: GPUBuffer;
   private readonly dummy: GPUBuffer;
-  private readonly cameraScratch = new ArrayBuffer(CAMERA_UNIFORM_SIZE);
+  private readonly cameraF32 = new Float32Array(CAMERA_UNIFORM_SIZE / 4);
+  private readonly cameraU32 = new Uint32Array(this.cameraF32.buffer);
+  /** Persistent staging buffer for capacity checks. */
+  private readonly totalReadback: GPUBuffer;
 
-  private groups: Record<string, GPUBindGroup> | null = null;
-  /** Multiplier applied to every Gaussian scale (display only). */
-  scaleMul = 1;
+  private groups: Groups | null = null;
   /**
    * Mip-Splatting opacity compensation for the screen-space dilation. On for
    * Kiln-trained clouds; off for ordinary 3DGS files trained without it.
    */
   mipFilter = true;
+  /** See `channelMode` in the WGSL Camera struct (0 = plain cloud). */
+  channelMode: 0 | 1 | 2 = 0;
+  /** Per-channel tint, rgba × MAX_SPLAT_CHANNELS (a = visible). */
+  readonly channelTint = new Float32Array(MAX_SPLAT_CHANNELS * 4).fill(1);
+  /** Depth cue (core/depth-cue.ts); off by default (training, evaluation). */
+  depthCue: DepthCue = NO_DEPTH_CUE;
 
-  private readbackPending = false;
   private lastCapacityCheck = 0;
 
   constructor(device: GPUDevice) {
@@ -197,6 +213,7 @@ export class SplatRasterizer {
       12,
       GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT,
     );
+    this.totalReadback = createBuffer(device, "splat:isect-total", 4, READBACK);
   }
 
   get gaussianCount(): number {
@@ -255,7 +272,7 @@ export class SplatRasterizer {
     this.projected = createBuffer(
       d,
       "splat:projected",
-      capacity * PROJ_STRIDE * 4,
+      capacity * PROJ_VEC4S * 16,
       STORAGE_RW,
     );
     this.depthKeys = createBuffer(
@@ -277,6 +294,7 @@ export class SplatRasterizer {
       STORAGE_RW,
     );
     this.countBuf = createBuffer(d, "splat:count", 16, STORAGE_RW);
+    this.countWritten = -1;
     this.depthSort = new GpuRadixSort(d, capacity);
     this.scan = new GpuScan(d, capacity + 1);
   }
@@ -304,8 +322,8 @@ export class SplatRasterizer {
   }
 
   private writeCamera(cam: SplatCamera): void {
-    const f = new Float32Array(this.cameraScratch);
-    const u = new Uint32Array(this.cameraScratch);
+    const f = this.cameraF32;
+    const u = this.cameraU32;
     for (let i = 0; i < 16; i++) f[i] = cam.view[i]!;
     f[16] = cam.fx;
     f[17] = cam.fy;
@@ -317,21 +335,44 @@ export class SplatRasterizer {
     u[23] = this.tilesY;
     u[24] = this.count;
     u[25] = this.isectCapacity;
-    f[26] = this.scaleMul;
-    u[27] = this.mipFilter ? 1 : 0;
-    this.device.queue.writeBuffer(this.camera, 0, this.cameraScratch);
-    this.device.queue.writeBuffer(
-      this.countBuf,
-      0,
-      new Uint32Array([this.count, this.count + 1, 0, 0]),
-    );
+    u[26] = this.mipFilter ? 1 : 0;
+    u[27] = this.channelMode;
+    f.set(this.channelTint, 28);
+    f[28 + MAX_SPLAT_CHANNELS * 4] = this.depthCue.near;
+    f[29 + MAX_SPLAT_CHANNELS * 4] = this.depthCue.scale;
+    this.device.queue.writeBuffer(this.camera, 0, f);
+    if (this.countWritten !== this.count) {
+      // [0]: Gaussians (depth sort), [1]: offsets entries (scan)
+      this.device.queue.writeBuffer(
+        this.countBuf,
+        0,
+        new Uint32Array([this.count, this.count + 1]),
+      );
+      this.countWritten = this.count;
+    }
   }
 
-  private bindGroups(): Record<string, GPUBindGroup> {
+  private bindGroups(): Groups {
     if (this.groups) return this.groups;
     const d = this.device;
     const k = this.k;
     if (!this.params) throw new Error("SplatRasterizer: no Gaussians set");
+    const tiles = [
+      this.camera,
+      this.projected,
+      this.depthIdx,
+      this.offsets,
+      this.isectKeys,
+      this.isectVals,
+    ];
+    const ranges = [this.camera, this.offsets, this.isectKeys, this.tileRanges];
+    const raster = [
+      this.camera,
+      this.projected,
+      this.isectVals,
+      this.tileRanges,
+      this.image,
+    ];
     this.groups = {
       project: bindGroup(d, k.project, [
         this.camera,
@@ -340,54 +381,22 @@ export class SplatRasterizer {
         this.depthKeys,
         this.depthIdx,
       ]),
-      tiles: bindGroup(d, k.countTiles, [
-        this.camera,
-        this.projected,
-        this.depthIdx,
-        this.offsets,
-        this.isectKeys,
-        this.isectVals,
-      ]),
-      emit: bindGroup(d, k.emit, [
-        this.camera,
-        this.projected,
-        this.depthIdx,
-        this.offsets,
-        this.isectKeys,
-        this.isectVals,
-      ]),
+      countTiles: bindGroup(d, k.countTiles, tiles),
+      emit: bindGroup(d, k.emit, tiles),
       rangesSetup: bindGroup(d, k.rangesSetup, [
-        this.camera,
-        this.offsets,
-        this.isectKeys,
-        this.tileRanges,
+        ...ranges,
         this.rangesIndirect,
       ]),
       // The indirect buffer can't be bound while it drives this dispatch.
-      ranges: bindGroup(d, k.ranges, [
-        this.camera,
-        this.offsets,
-        this.isectKeys,
-        this.tileRanges,
-        this.dummy,
-      ]),
-      rasterize: bindGroup(d, k.rasterize, [
-        this.camera,
-        this.projected,
-        this.isectVals,
-        this.tileRanges,
-        this.image,
-      ]),
+      ranges: bindGroup(d, k.ranges, [...ranges, this.dummy]),
+      rasterize: bindGroup(d, k.rasterize, raster),
+      rasterizeAdd: bindGroup(d, k.rasterizeAdd, raster),
     };
     return this.groups;
   }
 
   /** Encode the full forward pass. Output lands in `image`. */
-  encodeForward(
-    encoder: GPUCommandEncoder,
-    cam: SplatCamera,
-    profiler?: GpuProfiler,
-  ): void {
+  encodeForward(encoder: GPUCommandEncoder, cam: SplatCamera): void {
     if (!this.params || this.width === 0) return;
     this.writeCamera(cam);
     const g = this.bindGroups();
@@ -398,50 +407,46 @@ export class SplatRasterizer {
       encoder.clearBuffer(this.image);
       return;
     }
-    const chain = new PassChain(encoder, "splat:forward", profiler);
-    dispatch1d(
-      chain.stage("project"),
-      k.project,
-      g.project!,
-      Math.ceil(n / 256),
-    );
+    // One pass: dispatches in a pass see each other's writes.
+    const pass = encoder.beginComputePass({ label: "splat:forward" });
+    dispatch1d(pass, k.project, g.project, Math.ceil(n / 256));
     this.depthSort.encode(
-      chain.stage("depth sort"),
+      pass,
       this.depthKeys,
       this.depthIdx,
       { buffer: this.countBuf, index: 0 },
       32,
     );
-    dispatch1d(
-      chain.stage("count tiles"),
-      k.countTiles,
-      g.tiles!,
-      Math.ceil((n + 1) / 256),
-    );
-    this.scan.encode(chain.stage("scan"), this.offsets, {
-      buffer: this.countBuf,
-      index: 1,
-    });
-    dispatch1d(chain.stage("emit"), k.emit, g.emit!, Math.ceil(n / 256));
+    dispatch1d(pass, k.countTiles, g.countTiles, Math.ceil((n + 1) / 256));
+    this.scan.encode(pass, this.offsets, { buffer: this.countBuf, index: 1 });
+    dispatch1d(pass, k.emit, g.emit, Math.ceil(n / 256));
     this.isectSort.encode(
-      chain.stage("tile sort"),
+      pass,
       this.isectKeys,
       this.isectVals,
       { buffer: this.offsets, index: n },
       bitsFor(this.tilesX * this.tilesY),
     );
-    let pass = chain.stage("ranges");
     pass.setPipeline(k.rangesSetup.pipeline);
-    pass.setBindGroup(0, g.rangesSetup!);
+    pass.setBindGroup(0, g.rangesSetup);
     pass.dispatchWorkgroups(1);
     pass.setPipeline(k.ranges.pipeline);
-    pass.setBindGroup(0, g.ranges!);
+    pass.setBindGroup(0, g.ranges);
     pass.dispatchWorkgroupsIndirect(this.rangesIndirect, 0);
-    pass = chain.stage("rasterize");
-    pass.setPipeline(k.rasterize.pipeline);
-    pass.setBindGroup(0, g.rasterize!);
+    const additive = this.channelMode === 2;
+    pass.setPipeline((additive ? k.rasterizeAdd : k.rasterize).pipeline);
+    pass.setBindGroup(0, additive ? g.rasterizeAdd : g.rasterize);
     pass.dispatchWorkgroups(this.tilesX, this.tilesY, 1);
-    chain.end();
+    pass.end();
+  }
+
+  /** Copy the last forward pass's intersection total (u32) into `dst`. */
+  copyIntersectionTotal(
+    encoder: GPUCommandEncoder,
+    dst: GPUBuffer,
+    dstOffset: number,
+  ): void {
+    encoder.copyBufferToBuffer(this.offsets, this.count * 4, dst, dstOffset, 4);
   }
 
   /**
@@ -449,24 +454,22 @@ export class SplatRasterizer {
    * asynchronously and grow buffers when close to capacity.
    */
   checkCapacity(): void {
-    const now = performance.now();
-    if (this.readbackPending || this.count === 0) return;
+    const buf = this.totalReadback;
+    if (this.count === 0 || buf.mapState !== "unmapped") return;
     // Capacity drifts slowly; a readback per displayed frame isn't needed.
+    const now = performance.now();
     if (now - this.lastCapacityCheck < CAPACITY_CHECK_MS) return;
     this.lastCapacityCheck = now;
-    this.readbackPending = true;
-    const n = this.count;
-    readBuffer(this.device, this.offsets, n * 4, 4)
-      .then((buf) => {
-        const m = new Uint32Array(buf)[0] ?? 0;
+    const enc = this.device.createCommandEncoder();
+    this.copyIntersectionTotal(enc, buf, 0);
+    this.device.queue.submit([enc.finish()]);
+    withMapped(buf, (d) => new Uint32Array(d, 0, 1)[0]!)
+      .then((m) => {
         if (m > this.isectCapacity * 0.85) {
           this.ensureIsectCapacity(Math.ceil(m * 1.5));
         }
       })
-      .catch(() => {})
-      .finally(() => {
-        this.readbackPending = false;
-      });
+      .catch(() => {});
   }
 
   /** Await the exact intersection total (offline evaluation). */
@@ -480,10 +483,6 @@ export class SplatRasterizer {
     if (m <= this.isectCapacity) return false;
     this.ensureIsectCapacity(Math.ceil(m * 1.3));
     return true;
-  }
-
-  get intersectionCapacity(): number {
-    return this.isectCapacity;
   }
 
   destroy(): void {
@@ -500,6 +499,7 @@ export class SplatRasterizer {
       this.camera,
       this.rangesIndirect,
       this.dummy,
+      this.totalReadback,
     ])
       b?.destroy();
     this.depthSort?.destroy();

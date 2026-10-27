@@ -16,7 +16,7 @@ import {
   WGSL_LINEAR_WORKGROUP,
 } from "./kernel.js";
 
-export const SCAN_BLOCK = 1024;
+const SCAN_BLOCK = 1024;
 const MAX_LEVELS = 8;
 const UNIFORM_STRIDE = 256;
 
@@ -159,7 +159,7 @@ export interface CountSource {
 }
 
 /** Number of reduction levels needed so the top level fits one block. */
-export function scanLevelCount(capacity: number): number {
+function scanLevelCount(capacity: number): number {
   let levels = 1;
   let n = Math.max(1, capacity);
   while (n > SCAN_BLOCK) {

@@ -28,7 +28,6 @@ import {
   trackEvent,
   trackRenderMode,
 } from "../../shared/analytics.js";
-import { maybeRunBench } from "../../shared/bench.js";
 import {
   mountDatasetDialog,
   showDialogError,
@@ -74,6 +73,8 @@ function parseURLParams(): {
   wc?: number;
   ww?: number;
   density?: number;
+  /** Depth cue strength 0–1 (`depth=`) */
+  depth?: number;
   iso?: number;
   tf?: string;
   up?: string;
@@ -209,6 +210,7 @@ function parseURLParams(): {
     wc: params.has("wc") ? Number(params.get("wc")) : undefined,
     ww: params.has("ww") ? Number(params.get("ww")) : undefined,
     density: params.has("density") ? Number(params.get("density")) : undefined,
+    depth: params.has("depth") ? Number(params.get("depth")) : undefined,
     iso: params.has("iso") ? Number(params.get("iso")) : undefined,
     tf: params.get("tf") ?? undefined,
     up: params.get("up") ?? undefined,
@@ -291,6 +293,7 @@ async function main() {
     windowCenter: urlParams.wc,
     windowWidth: urlParams.ww,
     densityScale: urlParams.density,
+    depthCue: urlParams.depth,
     isoValue: urlParams.iso,
     tfPreset: urlParams.tf as TFPreset | undefined,
     tfPoints: urlParams.tfPoints,
@@ -349,8 +352,10 @@ async function main() {
   trackDataset(viewer.metadata.name);
   trackRenderMode(viewer.getState().mode);
 
-  // Fetch-pattern benchmark — no-op unless ?bench=1 (see examples/shared/bench.ts).
-  void maybeRunBench(viewer);
+  // Fetch-pattern benchmark, loaded only with ?bench=1 (see examples/shared/bench.ts).
+  if (new URLSearchParams(window.location.search).get("bench") === "1") {
+    void import("../../shared/bench.js").then((b) => b.maybeRunBench(viewer));
+  }
 
   // ── UI (skipped in embed mode — rendering + camera interaction only) ───────
 

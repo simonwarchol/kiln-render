@@ -1,7 +1,7 @@
 /// <reference types="@webgpu/types" />
 /** kiln-render — public API */
 
-export type { UpAxis } from "./core/camera.js";
+export type { OrbitState, UpAxis } from "./core/camera.js";
 // Render state enums/types (needed to construct ViewerOptions)
 export type { VolumeRenderMode } from "./core/renderer.js";
 export type { OpacityPoint, TFPreset } from "./core/transfer-function.js";
@@ -23,13 +23,11 @@ export type {
   ImsChannelInfo,
 } from "./data/imaris-provider.js";
 export { ImarisDataProvider } from "./data/imaris-provider.js";
-export type { ImsProbeResult } from "./data/imaris-validator.js";
 export {
   isRemoteIms,
   looksLikeImsUrl,
   preValidateLocalIms,
   preValidateRemoteIms,
-  probeRemoteIms,
 } from "./data/imaris-validator.js";
 export type { FsReadPermission } from "./data/local-loader.js";
 // Local file loader utilities (File System Access API)
@@ -54,7 +52,14 @@ export {
 } from "./data/zarr-validator.js";
 // Gaussian splats
 export type { GaussianCloud } from "./splat/cloud.js";
-export { createCloud, readPly, writePly } from "./splat/cloud.js";
+export {
+  createCloud,
+  mergeClouds,
+  readPly,
+  splitByChannel,
+  withChannel,
+  writePly,
+} from "./splat/cloud.js";
 export type {
   BuildProgress,
   BuildStage,

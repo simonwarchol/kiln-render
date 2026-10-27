@@ -4,12 +4,15 @@
  */
 
 import type { Camera } from "../core/camera.js";
+import { type DepthCue, NO_DEPTH_CUE } from "../core/depth-cue.js";
 import type { GaussianCloud } from "./cloud.js";
-import { PARAM_STRIDE } from "./cpu-reference.js";
+import {
+  intrinsicsFor,
+  PARAM_STRIDE,
+  type SplatCamera,
+} from "./cpu-reference.js";
 import { createBuffer, STORAGE_RW } from "./gpu/kernel.js";
-import { type SplatCamera, SplatRasterizer } from "./gpu/rasterizer.js";
-
-const FOV_Y = Math.PI / 4;
+import { SplatRasterizer } from "./gpu/rasterizer.js";
 
 const COMPOSITE_WGSL = /* wgsl */ `
 struct Params {
@@ -45,16 +48,11 @@ export function splatCameraFor(
   width: number,
   height: number,
 ): SplatCamera {
-  const f = (0.5 * height) / Math.tan(FOV_Y / 2);
-  return {
-    view: Float32Array.from(camera.getViewMatrix()),
-    fx: f,
-    fy: f,
-    cx: width / 2,
-    cy: height / 2,
+  return intrinsicsFor(
+    Float32Array.from(camera.getViewMatrix()),
     width,
     height,
-  };
+  );
 }
 
 export class SplatLayer {
@@ -65,7 +63,8 @@ export class SplatLayer {
   private bindGroup: GPUBindGroup | null = null;
   private boundImage: GPUBuffer | null = null;
   private count = 0;
-  /** Cloud currently displayed (null when showing an external buffer). */
+  private readonly uniformData = new ArrayBuffer(32);
+  /** Cloud currently displayed (null when none). */
   cloud: GaussianCloud | null = null;
   /** Bumped whenever the Gaussians change, so the viewer re-renders. */
   version = 0;
@@ -129,6 +128,12 @@ export class SplatLayer {
     );
     this.count = cloud.count;
     this.rasterizer.mipFilter = cloud.antialiased ?? false;
+    this.rasterizer.channelMode =
+      cloud.channelComposite === "add"
+        ? 2
+        : cloud.channelComposite === "over"
+          ? 1
+          : 0;
     this.rasterizer.setGaussians(this.ownParams, cloud.count);
     this.version++;
   }
@@ -136,23 +141,43 @@ export class SplatLayer {
   /**
    * Rasterise and composite onto `target`. With `splitX > 0`, only pixels at
    * or right of splitX are drawn (the volume stays visible on the left).
+   * `channelColors` (rgba per channel, a = shown) tint per-channel clouds;
+   * `depthCue` fades them with distance (core/depth-cue.ts).
    */
   render(
     target: GPUTextureView,
     camera: Camera,
     width: number,
     height: number,
-    opts: { background: ArrayLike<number>; splitX?: number; clear?: boolean },
+    opts: {
+      background: ArrayLike<number>;
+      splitX?: number;
+      clear?: boolean;
+      channelColors?: ArrayLike<number>;
+      depthCue?: DepthCue;
+    },
   ): void {
     const r = this.rasterizer;
     r.resize(width, height);
+    r.depthCue = opts.depthCue ?? NO_DEPTH_CUE;
+    if (opts.channelColors) {
+      const t = r.channelTint;
+      for (let i = 0; i < t.length; i += 4) {
+        const a = opts.channelColors[i + 3] ?? 0;
+        // Volume rendering weights a channel's colour by its alpha.
+        t[i] = (opts.channelColors[i] ?? 0) * a;
+        t[i + 1] = (opts.channelColors[i + 1] ?? 0) * a;
+        t[i + 2] = (opts.channelColors[i + 2] ?? 0) * a;
+        t[i + 3] = a;
+      }
+    }
     const encoder = this.device.createCommandEncoder({ label: "splat:frame" });
     if (this.count > 0) {
       r.encodeForward(encoder, splatCameraFor(camera, width, height));
     } else {
       encoder.clearBuffer(r.image);
     }
-    const u = new ArrayBuffer(32);
+    const u = this.uniformData;
     const ui = new Uint32Array(u);
     const uf = new Float32Array(u);
     ui[0] = width;

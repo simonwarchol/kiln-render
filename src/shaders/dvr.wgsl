@@ -9,28 +9,21 @@ fn rayMarchDVR(
 
     let windowCenter = uniforms.windowCenter;
     let windowWidth = uniforms.windowWidth;
-    let numCh = uniforms.numChannels;
 
-    // precompute per-channel windowing constants, a local copy of the channel
-    // colors, and a compacted list of visible channels (alpha > 0) — hidden
-    // channels then cost nothing in the per-sample loop below instead of a
-    // dynamically-indexed uniform read + branch per channel per sample.
+    // precompute per-channel windowing constants and premultiplied colours,
+    // plus a bitmask of the visible channels (alpha > 0)
     var chLower: array<f32, 6>;
     var chInvWidth: array<f32, 6>;
-    var chColorLocal: array<vec4f, 6>;
-    var visibleCh: array<u32, 6>;
-    var numVisible = 0u;
-    if (numCh > 1u) {
-        for (var ch = 0u; ch < numCh; ch++) {
+    var chColor: array<vec3f, 6>;
+    var visible = 0u;
+    if (NUM_CHANNELS > 1u) {
+        for (var ch = 0u; ch < NUM_CHANNELS; ch++) {
             let ww = max(chWindowWidth(ch), 0.0001);
             chLower[ch] = chWindowCenter(ch) - ww * 0.5;
             chInvWidth[ch] = 1.0 / ww;
             let c = uniforms.channelColors[ch];
-            chColorLocal[ch] = c;
-            if (c.a > 0.0) {
-                visibleCh[numVisible] = ch;
-                numVisible++;
-            }
+            chColor[ch] = c.rgb * c.a;
+            if (c.a > 0.0) { visible |= 1u << ch; }
         }
     }
 
@@ -38,12 +31,7 @@ fn rayMarchDVR(
     // paths (identity for uint data where floatMin=0, floatMax=1)
     let floatInvRange = 1.0 / max(uniforms.floatMax - uniforms.floatMin, 0.0001);
 
-    // compute jitter fraction once for the whole ray
-    // select() is not short-circuiting in WGSL — rand() would run even with jitter off.
-    var jitterFrac = 0.0;
-    if (uniforms.jitter != 0u) {
-        jitterFrac = rand(rayToSeed(rayDir) + uniforms.frameIndex);
-    }
+    let jitterFrac = rayJitter(rayDir);
 
     var color = vec3f(0.0);
     var alpha = 0.0;
@@ -56,9 +44,27 @@ fn rayMarchDVR(
 
         let brick = setupBrick(rayOrigin, rayDir, invDir, t, tEnd, normalizedSize, datasetSize);
 
-        if (!brick.valid) {
-            // scale-sensitive epsilon
-            t = brick.tEnd + max(0.0001, brick.tEnd * 1e-6);
+        // Skip bricks (and, multi-channel, single channels of a brick) whose
+        // stored maximum can't clear the window: a channel below its window
+        // adds nothing, and samples at or below 0.01 composite nothing.
+        var mask = 0u;
+        var peak = 0.0;
+        if (brick.valid) {
+            if (NUM_CHANNELS > 1u) {
+                for (var ch = 0u; ch < NUM_CHANNELS; ch++) {
+                    if ((visible & (1u << ch)) == 0u) { continue; }
+                    let d = clamp((brickMax(brick.slot, ch, floatInvRange) - chLower[ch]) * chInvWidth[ch], 0.0, 1.0);
+                    if (d > 0.0) {
+                        mask |= 1u << ch;
+                        peak = max(peak, d);
+                    }
+                }
+            } else {
+                peak = applyWindow(brickMax(brick.slot, 0u, floatInvRange), windowCenter, windowWidth);
+            }
+        }
+        if (peak <= 0.01) {
+            t = nextBrickT(brick);
             continue;
         }
 
@@ -68,7 +74,7 @@ fn rayMarchDVR(
             // First valid brick: start the sampling comb with jitter
             tSample = t + jitterFrac * brick.stepSize;
         } else if (tSample < t) {
-            // after skipping invalid bricks, advance by whole steps
+            // after skipping bricks, advance by whole steps
             // to preserve the jitter phase instead of snapping to t
             let steps = ceil((t - tSample) / brick.stepSize);
             tSample += steps * brick.stepSize;
@@ -79,38 +85,35 @@ fn rayMarchDVR(
 
             let pos = rayOrigin + rayDir * tSample;
             let voxel = normalizedToVoxel(pos, normalizedSize, datasetSize);
+            let fade = depthFade(tSample);
 
-            if (numCh > 1u) {
+            if (NUM_CHANNELS > 1u) {
                 // Multi-channel: per-channel windowing + additive composite
                 var weightedColor = vec3f(0.0);
                 var maxDensity = 0.0;
-                for (var vi = 0u; vi < numVisible; vi++) {
-                    let ch = visibleCh[vi];
-                    let chColor = chColorLocal[ch];
+                for (var ch = 0u; ch < NUM_CHANNELS; ch++) {
+                    if ((mask & (1u << ch)) == 0u) { continue; }
                     let raw = sampleAtlasChAffine(ch, voxel, brick.atlasOffset, brick.atlasScale);
                     // Normalise raw float range to [0,1] BEFORE per-channel
-                    // windowing (identity for uint data). Without this,
-                    // float32 datasets compared raw values (e.g. 0–3000)
-                    // against [0,1]-space windows.
+                    // windowing (identity for uint data).
                     let norm = clamp((raw - uniforms.floatMin) * floatInvRange, 0.0, 1.0);
                     let density = clamp((norm - chLower[ch]) * chInvWidth[ch], 0.0, 1.0);
-                    weightedColor += density * chColor.rgb * chColor.a;
+                    weightedColor += density * chColor[ch];
                     maxDensity = max(maxDensity, density);
                 }
-                composeSampleAdditive(weightedColor, maxDensity, extinctionScale, &color, &alpha);
+                composeSampleAdditive(weightedColor * fade, maxDensity, extinctionScale, &color, &alpha);
             } else {
                 // Single channel: TF-based DVR with windowing and float normalisation
                 let rawDensity = sampleAtlasAffine(voxel, brick.atlasOffset, brick.atlasScale);
                 let density = clamp((rawDensity - uniforms.floatMin) * floatInvRange, 0.0, 1.0);
-                composeSampleWindowed(density, extinctionScale, windowCenter, windowWidth, &color, &alpha);
+                composeSampleWindowed(density, extinctionScale, windowCenter, windowWidth, fade, &color, &alpha);
             }
 
             if (alpha > uniforms.earlyExitAlpha) { break; }
             tSample += brick.stepSize;
         }
 
-        // scale-sensitive epsilon
-        t = brick.tEnd + max(0.0001, brick.tEnd * 1e-6);
+        t = nextBrickT(brick);
     }
 
     return vec4f(color, alpha);

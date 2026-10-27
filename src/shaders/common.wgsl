@@ -3,41 +3,17 @@
 const LOGICAL_BRICK_SIZE: f32 = 64.0;
 const PHYSICAL_BRICK_SIZE: f32 = 66.0;
 const ATLAS_SIZE: f32 = 660.0;
+const ATLAS_GRID: u32 = 10u; // atlas slots per axis
 const BORDER: f32 = 1.0;
 const STEPS_PER_BRICK: f32 = 64.0;
 const MAX_BRICK_TRAVERSALS: u32 = 512u;
-const EARLY_EXIT_ALPHA: f32 = 0.95;
 const LOG2E: f32 = 1.4426950408889634; // pre computed LOG2E
-
-const RENDER_MODE_DVR: i32 = 0;
-const RENDER_MODE_MIP: i32 = 1;
-const RENDER_MODE_ISO: i32 = 2;
-const RENDER_MODE_LOD: i32 = 3;
 
 // Lighting constants
 const AMBIENT: f32 = 0.3;
 const DIFFUSE: f32 = 0.9;
 const SPECULAR: f32 = 0.3;
 const SHININESS: f32 = 32.0;
-
-// LOD level colors for debugging (lodLevel is stored as lod+1, so 1=LOD0, 2=LOD1, etc.)
-// Maximally distinct hues so adjacent LOD levels are easy to tell apart.
-fn getLodColor(lodLevel: u32) -> vec3f {
-    switch(lodLevel) {
-        case 1u: { return vec3f(0.15, 0.85, 0.25); } // LOD 0 = Green (finest)
-        case 2u: { return vec3f(0.0,  0.75, 1.0);  } // LOD 1 = Cyan
-        case 3u: { return vec3f(1.0,  0.85, 0.0);  } // LOD 2 = Yellow
-        case 4u: { return vec3f(1.0,  0.2,  0.2);  } // LOD 3 = Red
-        case 5u: { return vec3f(0.7,  0.3,  1.0);  } // LOD 4 = Purple
-        case 6u: { return vec3f(1.0,  0.55, 0.0);  } // LOD 5 = Orange
-        case 7u: { return vec3f(0.2,  0.4,  1.0);  } // LOD 6 = Blue
-        case 8u: { return vec3f(1.0,  0.4,  0.7);  } // LOD 7 = Pink
-        case 9u: { return vec3f(0.0,  0.65, 0.55); } // LOD 8 = Teal
-        case 10u: { return vec3f(0.75, 0.55, 1.0); } // LOD 9 = Lavender
-        case 11u: { return vec3f(0.85, 0.6,  0.2); } // LOD 10 = Amber (coarsest)
-        default: { return vec3f(0.2, 0.2, 0.2); }    // Not loaded = Dark gray
-    }
-}
 
 // Random number generation
 fn hash(n: u32) -> u32 {
@@ -70,19 +46,8 @@ fn voxelToNormalized(voxelPos: vec3f, normalizedSize: vec3f, datasetSize: vec3f)
     return (unitPos - 0.5) * normalizedSize;
 }
 
-// Ray-box intersection
-fn intersectBox(rayOrigin: vec3f, rayDir: vec3f, boxMin: vec3f, boxMax: vec3f) -> vec2f {
-    let invDir = 1.0 / rayDir;
-    let t0 = (boxMin - rayOrigin) * invDir;
-    let t1 = (boxMax - rayOrigin) * invDir;
-    let tmin = min(t0, t1);
-    let tmax = max(t0, t1);
-    let tNear = max(max(tmin.x, tmin.y), tmin.z);
-    let tFar = min(min(tmax.x, tmax.y), tmax.z);
-    return vec2f(tNear, tFar);
-}
-
-fn intersectBoxInv(rayOrigin: vec3f, invDir: vec3f, boxMin: vec3f, boxMax: vec3f) -> vec2f {
+// Ray-box intersection (invDir = 1 / rayDir); returns (tNear, tFar).
+fn intersectBox(rayOrigin: vec3f, invDir: vec3f, boxMin: vec3f, boxMax: vec3f) -> vec2f {
     let t0 = (boxMin - rayOrigin) * invDir;
     let t1 = (boxMax - rayOrigin) * invDir;
     let tmin = min(t0, t1);
@@ -106,34 +71,6 @@ fn phongLighting(normal: vec3f, lightDir: vec3f, baseColor: vec3f) -> vec3f {
 
 // Window/Level: remap a density sub-range to [0,1] for contrast adjustment.
 fn applyWindow(density: f32, windowCenter: f32, windowWidth: f32) -> f32 {
-    let halfWidth = windowWidth * 0.5;
-    let minVal = windowCenter - halfWidth;
-    let maxVal = windowCenter + halfWidth;
+    let minVal = windowCenter - windowWidth * 0.5;
     return clamp((density - minVal) / max(windowWidth, 0.001), 0.0, 1.0);
-}
-
-// Apply axis-aligned clipping planes to ray-box intersection
-// clipMin/clipMax are in [0,1] range, converted to normalized volume space
-// Returns modified tStart/tEnd that clip the ray to the specified box
-fn applyClippingPlanes(
-    rayOrigin: vec3f,
-    rayDir: vec3f,
-    tStart: f32,
-    tEnd: f32,
-    normalizedSize: vec3f,
-    clipMin: vec3f,
-    clipMax: vec3f
-) -> vec2f {
-    // Convert [0,1] clip bounds to normalized volume space [-size/2, +size/2]
-    let clipBoxMin = (clipMin - 0.5) * normalizedSize;
-    let clipBoxMax = (clipMax - 0.5) * normalizedSize;
-
-    // Intersect ray with clipping box
-    let clipHit = intersectBox(rayOrigin, rayDir, clipBoxMin, clipBoxMax);
-
-    // Take intersection of original bounds with clip bounds
-    let clippedStart = max(tStart, clipHit.x);
-    let clippedEnd = min(tEnd, clipHit.y);
-
-    return vec2f(clippedStart, clippedEnd);
 }

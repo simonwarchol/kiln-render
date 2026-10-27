@@ -11,9 +11,6 @@ importers:
       '@webgpu/types':
         specifier: ^0.1.69
         version: 0.1.71
-      brush-js:
-        specifier: link:./vendor/brush-js
-        version: link:vendor/brush-js
     devDependencies:
       '@biomejs/biome':
         specifier: 2.3.14
@@ -21,6 +18,9 @@ importers:
       '@types/node':
         specifier: ^26.2.0
         version: 26.2.0
+      brush-js:
+        specifier: link:./vendor/brush-js
+        version: link:vendor/brush-js
       fflate:
         specifier: ^0.8.2
         version: 0.8.3

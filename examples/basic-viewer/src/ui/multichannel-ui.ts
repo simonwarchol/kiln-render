@@ -318,9 +318,7 @@ export class MultichannelUI {
   }
 
   private normalizeMode(mode: VolumeRenderMode): BaseRenderMode {
-    if (mode === "dvr" || mode === "mip" || mode === "slice") return mode;
-    if (mode === "slice-lod") return "slice";
-    return "dvr";
+    return mode === "iso" ? "dvr" : mode;
   }
 
   private applyMode(): void {
@@ -401,6 +399,21 @@ export class MultichannelUI {
       },
     });
     sceneSection.appendChild(this.axesToggle.el);
+
+    // Fade with distance from the camera (volume and splats).
+    sceneSection.appendChild(
+      createSlider({
+        label: "Depth fade",
+        min: 0,
+        max: 1,
+        step: 0.01,
+        value: this.viewer.depthCue,
+        format: (v) => (v === 0 ? "Off" : v.toFixed(2)),
+        onChange: (v) => {
+          this.viewer.depthCue = v;
+        },
+      }).el,
+    );
 
     this.updateVisibility();
   }

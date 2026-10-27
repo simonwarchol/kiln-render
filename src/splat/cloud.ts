@@ -12,6 +12,7 @@
 import {
   colorParam,
   logit,
+  P_CHANNEL,
   P_COLOR,
   P_MEAN,
   P_OPACITY,
@@ -20,7 +21,8 @@ import {
   PARAM_STRIDE,
 } from "./cpu-reference.js";
 
-const SH_C0 = 0.28209479177387814;
+/** Zeroth-order spherical-harmonic basis constant (DC colour). */
+export const SH_C0 = 0.28209479177387814;
 
 export interface GaussianCloud {
   count: number;
@@ -34,6 +36,84 @@ export interface GaussianCloud {
   /** Physical units per normalised unit (optional metadata) */
   worldScale?: number;
   worldUnit?: string;
+  /**
+   * Set on per-channel clouds: param P_CHANNEL holds each Gaussian's channel
+   * (the viewer's channel slot) and colours are that channel rendered in
+   * white, tinted with the live channel colours at display. "over" composites
+   * front to back (volume / surface); "add" composites each channel on its
+   * own and sums them, as a maximum-intensity projection does.
+   */
+  channelComposite?: "over" | "add";
+}
+
+/**
+ * Concatenate clouds (metadata from the first). With `slots`, the result is
+ * a per-channel cloud: part i's Gaussians are tagged with channel slots[i]
+ * in the same copy, and it composites as `composite` (default: the first
+ * part's, else "over").
+ */
+export function mergeClouds(
+  parts: readonly GaussianCloud[],
+  slots?: readonly number[],
+  composite?: "over" | "add",
+): GaussianCloud {
+  const first = parts[0];
+  if (!first) return createCloud(0);
+  const count = parts.reduce((n, c) => n + c.count, 0);
+  const params = new Float32Array(count * PARAM_STRIDE);
+  let o = 0;
+  parts.forEach((c, i) => {
+    const n = c.count * PARAM_STRIDE;
+    params.set(c.params.subarray(0, n), o);
+    const slot = slots?.[i];
+    if (slot !== undefined)
+      for (let k = o + P_CHANNEL; k < o + n; k += PARAM_STRIDE)
+        params[k] = slot;
+    o += n;
+  });
+  const merged = { ...first, count, params };
+  if (slots)
+    merged.channelComposite = composite ?? first.channelComposite ?? "over";
+  return merged;
+}
+
+/** Copy of `cloud` with every Gaussian in channel `slot`. */
+export function withChannel(
+  cloud: GaussianCloud,
+  slot: number,
+  composite: "over" | "add",
+): GaussianCloud {
+  return mergeClouds([cloud], [slot], composite);
+}
+
+/** The per-channel sub-clouds of a channel cloud, by channel slot. */
+export function splitByChannel(
+  cloud: GaussianCloud,
+): Map<number, GaussianCloud> {
+  const src = cloud.params;
+  const S = PARAM_STRIDE;
+  // Runs of one slot (a merged cloud is one run per channel), copied whole.
+  const runs: number[] = []; // start, end pairs
+  const counts = new Map<number, number>();
+  for (let i = 0; i < cloud.count; ) {
+    const slot = src[i * S + P_CHANNEL]!;
+    let j = i + 1;
+    while (j < cloud.count && src[j * S + P_CHANNEL] === slot) j++;
+    runs.push(i, j);
+    counts.set(slot, (counts.get(slot) ?? 0) + j - i);
+    i = j;
+  }
+  const out = new Map<number, GaussianCloud>();
+  for (const [slot, n] of counts)
+    out.set(slot, { ...cloud, count: 0, params: new Float32Array(n * S) });
+  for (let r = 0; r < runs.length; r += 2) {
+    const i = runs[r]!;
+    const j = runs[r + 1]!;
+    const part = out.get(src[i * S + P_CHANNEL]!)!;
+    part.params.set(src.subarray(i * S, j * S), part.count * S);
+    part.count += j - i;
+  }
+  return out;
 }
 
 export function createCloud(count: number): GaussianCloud {
@@ -55,7 +135,7 @@ export function cloudFromParams(
   };
 }
 
-export interface GaussianInit {
+interface GaussianInit {
   x: number;
   y: number;
   z: number;
@@ -118,15 +198,22 @@ const PLY_PROPS = [
   "rot_3",
 ] as const;
 
-/** Encode as a binary little-endian INRIA-style 3DGS PLY (SH degree 0). */
-export function writePly(cloud: GaussianCloud): Uint8Array {
+/**
+ * Encode as a binary little-endian INRIA-style 3DGS PLY (SH degree 0), with
+ * colours multiplied by `colorScale`. The header is padded to a multiple of
+ * four bytes so the float body can be read in place.
+ */
+export function writePly(cloud: GaussianCloud, colorScale = 1): Uint8Array {
   const n = cloud.count;
+  const channels = !!cloud.channelComposite;
   const lines = [
     "ply",
     "format binary_little_endian 1.0",
     "comment kiln-render gaussian splats",
   ];
   if (cloud.antialiased) lines.push("comment kiln mip_filter 1");
+  if (cloud.channelComposite)
+    lines.push(`comment kiln channel_composite ${cloud.channelComposite}`);
   if (cloud.worldScale) {
     lines.push(`comment kiln world_scale ${cloud.worldScale}`);
     if (cloud.worldUnit)
@@ -134,10 +221,18 @@ export function writePly(cloud: GaussianCloud): Uint8Array {
   }
   lines.push(`element vertex ${n}`);
   for (const p of PLY_PROPS) lines.push(`property float ${p}`);
+  if (channels) lines.push("property float channel");
   lines.push("end_header\n");
-  const header = new TextEncoder().encode(lines.join("\n"));
-  const stride = PLY_PROPS.length;
-  const body = new Float32Array(n * stride);
+  const utf8 = new TextEncoder();
+  let header = utf8.encode(lines.join("\n"));
+  if (header.length % 4) {
+    lines[2] += " ".repeat(4 - (header.length % 4));
+    header = utf8.encode(lines.join("\n"));
+  }
+  const stride = PLY_PROPS.length + (channels ? 1 : 0);
+  const out = new Uint8Array(header.length + n * stride * 4);
+  out.set(header);
+  const body = new Float32Array(out.buffer, header.length, n * stride);
   const p = cloud.params;
   for (let i = 0; i < n; i++) {
     const b = i * PARAM_STRIDE;
@@ -145,8 +240,10 @@ export function writePly(cloud: GaussianCloud): Uint8Array {
     body[o] = p[b + P_MEAN]!;
     body[o + 1] = p[b + P_MEAN + 1]!;
     body[o + 2] = p[b + P_MEAN + 2]!;
+    // [3..5] normals stay 0
     for (let c = 0; c < 3; c++) {
-      body[o + 6 + c] = (Math.exp(p[b + P_COLOR + c]!) - 0.5) / SH_C0;
+      body[o + 6 + c] =
+        (Math.exp(p[b + P_COLOR + c]!) * colorScale - 0.5) / SH_C0;
     }
     body[o + 9] = p[b + P_OPACITY]!;
     body[o + 10] = p[b + P_SCALE]!;
@@ -161,10 +258,8 @@ export function writePly(cloud: GaussianCloud): Uint8Array {
     body[o + 14] = qx / ql;
     body[o + 15] = qy / ql;
     body[o + 16] = qz / ql;
+    if (channels) body[o + 17] = p[b + P_CHANNEL]!;
   }
-  const out = new Uint8Array(header.length + body.byteLength);
-  out.set(header, 0);
-  out.set(new Uint8Array(body.buffer), header.length);
   return out;
 }
 
@@ -215,6 +310,31 @@ function reader(type: string): (v: DataView, o: number) => number {
   }
 }
 
+/** PLY properties readPly uses (any others, e.g. higher-order SH, are skipped). */
+const READ_PROPS = [
+  "x",
+  "y",
+  "z",
+  "scale_0",
+  "scale_1",
+  "scale_2",
+  "rot_0",
+  "rot_1",
+  "rot_2",
+  "rot_3",
+  "f_dc_0",
+  "f_dc_1",
+  "f_dc_2",
+  "red",
+  "green",
+  "blue",
+  "opacity",
+  "channel",
+] as const;
+
+const DEFAULT_LOG_SCALE = Math.log(0.002);
+const DEFAULT_OPACITY = logit(0.9);
+
 /**
  * Parse a binary little-endian 3DGS PLY (INRIA layout; extra properties such
  * as higher-order SH are ignored — only the DC colour is kept).
@@ -225,7 +345,10 @@ export function readPly(bytes: Uint8Array): GaussianCloud {
   );
   const end = headText.indexOf("end_header");
   if (!headText.startsWith("ply") || end < 0) throw new Error("Not a PLY file");
-  const headerLen = headText.indexOf("\n", end) + 1;
+  // Byte length (the header may hold multi-byte UTF-8, e.g. a "µm" unit).
+  const headerLen = new TextEncoder().encode(
+    headText.slice(0, headText.indexOf("\n", end) + 1),
+  ).length;
   const lines = headText.slice(0, end).split(/\r?\n/);
   if (!lines.some((l) => l.startsWith("format binary_little_endian"))) {
     throw new Error("Only binary little-endian PLY files are supported");
@@ -235,6 +358,7 @@ export function readPly(bytes: Uint8Array): GaussianCloud {
   let worldScale: number | undefined;
   let worldUnit: string | undefined;
   let antialiased = false;
+  let channelComposite: GaussianCloud["channelComposite"];
   const props: Array<{ name: string; type: string; offset: number }> = [];
   let stride = 0;
   for (const line of lines) {
@@ -243,6 +367,12 @@ export function readPly(bytes: Uint8Array): GaussianCloud {
       worldScale = Number(t[3]);
     } else if (t[0] === "comment" && t[1] === "kiln" && t[2] === "mip_filter") {
       antialiased = t[3] === "1";
+    } else if (
+      t[0] === "comment" &&
+      t[1] === "kiln" &&
+      t[2] === "channel_composite"
+    ) {
+      if (t[3] === "over" || t[3] === "add") channelComposite = t[3];
     } else if (t[0] === "comment" && t[1] === "kiln" && t[2] === "world_unit") {
       worldUnit = t[3];
     } else if (t[0] === "element") {
@@ -257,68 +387,81 @@ export function readPly(bytes: Uint8Array): GaussianCloud {
       stride += TYPE_SIZE[type] ?? 4;
     }
   }
-  const view = new DataView(bytes.buffer, bytes.byteOffset + headerLen);
-  // All-float32 files (Kiln's, standard 3DGS) read through a Float32Array.
-  const allFloat =
+  const used = READ_PROPS.map((name) => props.find((q) => q.name === name));
+  // Rows of floats: all-float32 files (Kiln's, standard 3DGS) are read in
+  // place; others have the used properties converted first.
+  let rows: Float32Array;
+  let s: number;
+  let col: number[];
+  const bodyOffset = bytes.byteOffset + headerLen;
+  if (
     stride % 4 === 0 &&
-    props.every((q) => TYPE_SIZE[q.type] === 4 && /^float/.test(q.type));
-  const floats = allFloat
-    ? (bytes.byteOffset + headerLen) % 4 === 0
-      ? new Float32Array(
-          bytes.buffer,
-          bytes.byteOffset + headerLen,
-          (count * stride) / 4,
-        )
-      : new Float32Array(
-          bytes.slice(headerLen, headerLen + count * stride).buffer,
-        )
-    : null;
-  const get = (name: string) => {
-    const p = props.find((q) => q.name === name);
-    if (!p) return null;
-    if (floats) {
-      const s4 = stride / 4;
-      const o4 = p.offset / 4;
-      return (i: number) => floats[i * s4 + o4]!;
-    }
-    const r = reader(p.type);
-    return (i: number) => r(view, i * stride + p.offset);
-  };
-  const x = get("x");
-  const y = get("y");
-  const z = get("z");
-  if (!x || !y || !z) throw new Error("PLY has no x/y/z");
-  const dc = [get("f_dc_0"), get("f_dc_1"), get("f_dc_2")];
-  const rgb = [get("red"), get("green"), get("blue")];
-  const op = get("opacity");
-  const sc = [get("scale_0"), get("scale_1"), get("scale_2")];
-  const rot = [get("rot_0"), get("rot_1"), get("rot_2"), get("rot_3")];
+    props.every((q) => TYPE_SIZE[q.type] === 4 && /^float/.test(q.type))
+  ) {
+    rows =
+      bodyOffset % 4 === 0
+        ? new Float32Array(bytes.buffer, bodyOffset, (count * stride) / 4)
+        : new Float32Array(
+            bytes.slice(headerLen, headerLen + count * stride).buffer,
+          );
+    s = stride / 4;
+    col = used.map((q) => (q ? q.offset / 4 : -1));
+  } else {
+    const view = new DataView(bytes.buffer, bodyOffset);
+    s = READ_PROPS.length;
+    rows = new Float32Array(count * s);
+    col = used.map((q, k) => {
+      if (!q) return -1;
+      const read = reader(q.type);
+      for (let i = 0; i < count; i++)
+        rows[i * s + k] = read(view, i * stride + q.offset);
+      return k;
+    });
+  }
+  const at = (name: (typeof READ_PROPS)[number]) =>
+    col[READ_PROPS.indexOf(name)]!;
+  const x = at("x");
+  const y = at("y");
+  const z = at("z");
+  if (x < 0 || y < 0 || z < 0) throw new Error("PLY has no x/y/z");
+  const scale = [at("scale_0"), at("scale_1"), at("scale_2")];
+  const rot = [at("rot_0"), at("rot_1"), at("rot_2"), at("rot_3")];
+  const dc = [at("f_dc_0"), at("f_dc_1"), at("f_dc_2")];
+  const rgb = [at("red"), at("green"), at("blue")];
+  const opacity = at("opacity");
+  const channel = at("channel");
   const cloud = createCloud(count);
   cloud.worldScale = worldScale;
   cloud.worldUnit = worldUnit;
   cloud.antialiased = antialiased;
+  if (channelComposite) cloud.channelComposite = channelComposite;
   const p = cloud.params;
   for (let i = 0; i < count; i++) {
+    const r = i * s;
     const b = i * PARAM_STRIDE;
-    p[b] = x(i);
-    p[b + 1] = y(i);
-    p[b + 2] = z(i);
+    p[b] = rows[r + x]!;
+    p[b + 1] = rows[r + y]!;
+    p[b + 2] = rows[r + z]!;
     for (let k = 0; k < 3; k++) {
-      p[b + P_SCALE + k] = sc[k] ? sc[k]!(i) : Math.log(0.002);
+      const c = scale[k]!;
+      p[b + P_SCALE + k] = c >= 0 ? rows[r + c]! : DEFAULT_LOG_SCALE;
     }
-    if (rot[0]) {
-      for (let k = 0; k < 4; k++) p[b + P_QUAT + k] = rot[k]!(i);
+    if (rot[0]! >= 0) {
+      for (let k = 0; k < 4; k++) {
+        const c = rot[k]!;
+        p[b + P_QUAT + k] = c >= 0 ? rows[r + c]! : 0;
+      }
     } else {
       p[b + P_QUAT] = 1;
     }
     for (let k = 0; k < 3; k++) {
-      let c: number;
-      if (dc[k]) c = 0.5 + SH_C0 * dc[k]!(i);
-      else if (rgb[k]) c = rgb[k]!(i) / 255;
-      else c = 1;
+      let c = 1;
+      if (dc[k]! >= 0) c = 0.5 + SH_C0 * rows[r + dc[k]!]!;
+      else if (rgb[k]! >= 0) c = rows[r + rgb[k]!]! / 255;
       p[b + P_COLOR + k] = colorParam(c);
     }
-    p[b + P_OPACITY] = op ? op(i) : logit(0.9);
+    p[b + P_OPACITY] = opacity >= 0 ? rows[r + opacity]! : DEFAULT_OPACITY;
+    if (channel >= 0) p[b + P_CHANNEL] = rows[r + channel]!;
   }
   return cloud;
 }

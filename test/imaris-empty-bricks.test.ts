@@ -2,36 +2,6 @@ import { describe, expect, it } from "vitest";
 import { imsBrickIsEmpty } from "../src/data/imaris/empty-bricks.js";
 
 describe("IMS empty-brick skip", () => {
-  it("skips the volume when every channel HistogramMax is below threshold", () => {
-    expect(
-      imsBrickIsEmpty({
-        lod: 0,
-        bx: 3,
-        by: 1,
-        bz: 2,
-        maxLod: 3,
-        threshold: 100,
-        getStats: () => null,
-        channelHistogramMax: [0, 12],
-      }),
-    ).toBe(true);
-  });
-
-  it("does not skip when any channel histogram still has signal", () => {
-    expect(
-      imsBrickIsEmpty({
-        lod: 0,
-        bx: 0,
-        by: 0,
-        bz: 0,
-        maxLod: 3,
-        threshold: 100,
-        getStats: () => null,
-        channelHistogramMax: [0, 400],
-      }),
-    ).toBe(false);
-  });
-
   it("uses cached stats at the requested brick", () => {
     expect(
       imsBrickIsEmpty({

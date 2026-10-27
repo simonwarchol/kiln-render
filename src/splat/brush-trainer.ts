@@ -24,10 +24,13 @@
  */
 
 import type { BrushApp, Training } from "brush-js";
-import { zlibSync } from "fflate";
 import { mat4 } from "wgpu-matrix";
-import { getFloat16ToFloat32Lut } from "../utils/float16.js";
-import { cloudFromParams, type GaussianCloud, writePly } from "./cloud.js";
+import {
+  cloudFromParams,
+  type GaussianCloud,
+  SH_C0,
+  writePly,
+} from "./cloud.js";
 import {
   colorParam,
   P_COLOR,
@@ -37,10 +40,18 @@ import {
   P_SCALE,
   PARAM_STRIDE,
 } from "./cpu-reference.js";
-import { createBuffer, readBuffer, STORAGE_RW } from "./gpu/kernel.js";
-import type { SplatCamera } from "./gpu/rasterizer.js";
+import {
+  bindGroup,
+  createBuffer,
+  createKernel,
+  type Kernel,
+  READBACK,
+  readBuffer,
+  STORAGE_RW,
+  withMapped,
+} from "./gpu/kernel.js";
+import type { CapturedViews } from "./splat-builder.js";
 
-const SH_C0 = 0.28209479177387814;
 const SUBGROUP_PRELUDE =
   "enable subgroups;\ndiagnostic(off, subgroup_uniformity);\n";
 /** Training folders older than this are left over from a crashed tab. */
@@ -49,20 +60,18 @@ const OPFS_ROOT = "kiln-brush";
 /** Floats per splat in Brush's transforms buffer: mean, quat wxyz, log scale. */
 const TRANSFORM_STRIDE = 10;
 
-export interface TrainViews {
-  /** rgba16float array texture, premultiplied, one layer per view */
-  texture: GPUTexture;
-  cameras: SplatCamera[];
-  width: number;
-  height: number;
-}
-
-export interface BrushTrainOptions {
+interface BrushTrainOptions {
   iterations: number;
   /** Cap on splats after densification */
   maxSplats: number;
   signal?: AbortSignal;
   onProgress?: (fraction: number, label: string, splats?: number) => void;
+}
+
+/** Throw the AbortError a cancelled splat build ends with. */
+export function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted)
+    throw new DOMException("Splat build cancelled", "AbortError");
 }
 
 interface Brush {
@@ -160,7 +169,19 @@ function pngChunk(type: string, data: Uint8Array): Uint8Array {
   return out;
 }
 
-export function encodePng(rgba: Uint8Array, width: number, height: number) {
+/** zlib-wrapped deflate (PNG's IDAT payload), with the browser's codec. */
+async function deflate(data: Uint8Array<ArrayBuffer>): Promise<Uint8Array> {
+  const stream = new Blob([data])
+    .stream()
+    .pipeThrough(new CompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+export async function encodePng(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+): Promise<Uint8Array> {
   const ihdr = new Uint8Array(13);
   const v = new DataView(ihdr.buffer);
   v.setUint32(0, width);
@@ -177,7 +198,7 @@ export function encodePng(rgba: Uint8Array, width: number, height: number) {
   const parts = [
     new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     pngChunk("IHDR", ihdr),
-    pngChunk("IDAT", zlibSync(raw, { level: 6 })),
+    pngChunk("IDAT", await deflate(raw)),
     pngChunk("IEND", new Uint8Array(0)),
   ];
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -189,66 +210,87 @@ export function encodePng(rgba: Uint8Array, width: number, height: number) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Training targets: rgba16float premultiplied views → straight RGBA8 on the
+// GPU, so each view is read back once, at 4 bytes per pixel.
+// ---------------------------------------------------------------------------
+
 /** Alpha below which a pixel's colour ratio is noise, not signal. */
 const GAIN_MIN_ALPHA = 2 / 255;
 const MAX_GAIN = 16;
 
-/** Largest straight colour (premultiplied colour ÷ alpha) in a view. */
-function maxStraight(
-  half: Uint16Array,
-  width: number,
-  height: number,
-  rowHalfs: number,
-): number {
-  const f16 = getFloat16ToFloat32Lut();
-  let m = 0;
-  for (let y = 0; y < height; y++)
-    for (let x = 0; x < width; x++) {
-      const s = y * rowHalfs + x * 4;
-      const a = f16[half[s + 3]!]!;
-      if (a < GAIN_MIN_ALPHA) continue;
-      const c = Math.max(
-        f16[half[s]!]!,
-        f16[half[s + 1]!]!,
-        f16[half[s + 2]!]!,
-      );
-      if (c > m * a) m = c / a;
+/** Bindings: 0 convert params, 1 views, 2 rgba8 out, 3 max straight colour */
+const TARGETS_WGSL = /* wgsl */ `
+struct Convert { layer: u32, gain: f32, _a: u32, _b: u32 }
+@group(0) @binding(0) var<uniform> convert: Convert;
+@group(0) @binding(1) var views: texture_2d_array<f32>;
+@group(0) @binding(2) var<storage, read_write> rgba: array<u32>;
+@group(0) @binding(3) var<storage, read_write> maxBits: atomic<u32>;
+
+var<workgroup> wgMax: atomic<u32>;
+
+/** Largest straight colour (premultiplied colour ÷ alpha) of all views. */
+@compute @workgroup_size(16, 16)
+fn maxStraight(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(local_invocation_index) lid: u32,
+) {
+  if (all(gid.xy < textureDimensions(views))) {
+    let t = textureLoad(views, gid.xy, gid.z, 0);
+    if (t.a >= ${GAIN_MIN_ALPHA}) {
+      let s = max(t.r, max(t.g, t.b)) / t.a;
+      // Positive floats order like their bits.
+      if (s > 0.0) { atomicMax(&wgMax, bitcast<u32>(s)); }
     }
-  return m;
+  }
+  workgroupBarrier();
+  if (lid == 0u) { atomicMax(&maxBits, atomicLoad(&wgMax)); }
 }
 
-/** Premultiplied half-float RGBA (padded rows) ÷ gain → straight RGBA8. */
-function toStraightRgba8(
-  half: Uint16Array,
-  width: number,
-  height: number,
-  rowHalfs: number,
-  gain: number,
-): Uint8Array {
-  const f16 = getFloat16ToFloat32Lut();
-  const out = new Uint8Array(width * height * 4);
-  const to8 = (x: number) => Math.round(Math.max(0, Math.min(1, x)) * 255);
-  for (let y = 0; y < height; y++)
-    for (let x = 0; x < width; x++) {
-      const s = y * rowHalfs + x * 4;
-      const d = (y * width + x) * 4;
-      const a = f16[half[s + 3]!]!;
-      const inv = a > 1e-6 ? 1 / (a * gain) : 0;
-      out[d] = to8(f16[half[s]!]! * inv);
-      out[d + 1] = to8(f16[half[s + 1]!]! * inv);
-      out[d + 2] = to8(f16[half[s + 2]!]! * inv);
-      out[d + 3] = to8(a);
-    }
-  return out;
+/** View \`convert.layer\` ÷ gain → straight RGBA8, one u32 per pixel. */
+@compute @workgroup_size(16, 16)
+fn toRgba8(@builtin(global_invocation_id) gid: vec3u) {
+  let size = textureDimensions(views);
+  if (any(gid.xy >= size)) { return; }
+  let t = textureLoad(views, gid.xy, convert.layer, 0);
+  let inv = select(0.0, 1.0 / (t.a * convert.gain), t.a > 1e-6);
+  rgba[gid.y * size.x + gid.x] = pack4x8unorm(vec4f(t.rgb * inv, t.a));
 }
+`;
 
-/** Copy of `cloud` with colours multiplied by `gain` (colour = exp(param)). */
-function scaleColours(cloud: GaussianCloud, gain: number): GaussianCloud {
-  const params = cloud.params.slice();
-  const d = Math.log(gain);
-  for (let i = 0; i < cloud.count; i++)
-    for (let k = 0; k < 3; k++) params[i * PARAM_STRIDE + P_COLOR + k]! += d;
-  return { ...cloud, params };
+const targetKernelCache = new WeakMap<
+  GPUDevice,
+  { max: Kernel; convert: Kernel }
+>();
+
+function targetKernels(device: GPUDevice) {
+  let k = targetKernelCache.get(device);
+  if (!k) {
+    const bindings = [
+      "uniform",
+      "texture-unfilterable-array",
+      "storage",
+      "storage",
+    ] as const;
+    k = {
+      max: createKernel(
+        device,
+        "brush:max-straight",
+        TARGETS_WGSL,
+        "maxStraight",
+        bindings,
+      ),
+      convert: createKernel(
+        device,
+        "brush:to-rgba8",
+        TARGETS_WGSL,
+        "toRgba8",
+        bindings,
+      ),
+    };
+    targetKernelCache.set(device, k);
+  }
+  return k;
 }
 
 /** Nerfstudio camera-to-world (row-major rows) from Kiln's view matrix. */
@@ -276,43 +318,74 @@ async function writeDataset(
   device: GPUDevice,
   dir: FileSystemDirectoryHandle,
   init: GaussianCloud,
-  views: TrainViews,
+  views: CapturedViews,
   opts: BrushTrainOptions,
 ): Promise<number> {
   const { width: w, height: h } = views;
+  const n = views.cameras.length;
   const images = await dir.getDirectoryHandle("images", { create: true });
-  const rowBytes = Math.ceil((w * 8) / 256) * 256;
-  const staging = createBuffer(device, "brush:view", rowBytes * h, STORAGE_RW);
-  const readView = async (i: number) => {
+  const k = targetKernels(device);
+  const convert = createBuffer(
+    device,
+    "brush:convert",
+    16,
+    GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  );
+  const rgba = createBuffer(device, "brush:rgba8", w * h * 4, STORAGE_RW);
+  const maxBits = createBuffer(device, "brush:max-straight", 4, STORAGE_RW);
+  const staging = createBuffer(device, "brush:readback", w * h * 4, READBACK);
+  const resources = [
+    convert,
+    views.texture.createView({ dimension: "2d-array" }),
+    rgba,
+    maxBits,
+  ];
+  /** Run `kernel` over `layers` views and copy `result` to the staging buffer. */
+  const run = (kernel: Kernel, layers: number, result: GPUBuffer) => {
     const enc = device.createCommandEncoder();
-    enc.copyTextureToBuffer(
-      { texture: views.texture, origin: [0, 0, i] },
-      { buffer: staging, bytesPerRow: rowBytes },
-      [w, h, 1],
+    const pass = enc.beginComputePass();
+    pass.setPipeline(kernel.pipeline);
+    pass.setBindGroup(0, bindGroup(device, kernel, resources));
+    pass.dispatchWorkgroups(Math.ceil(w / 16), Math.ceil(h / 16), layers);
+    pass.end();
+    enc.copyBufferToBuffer(
+      result,
+      0,
+      staging,
+      0,
+      Math.min(result.size, staging.size),
     );
     device.queue.submit([enc.finish()]);
-    return new Uint16Array(await readBuffer(device, staging, 0, rowBytes * h));
   };
   const frames: Array<{ file_path: string; transform_matrix: number[][] }> = [];
-  const n = views.cameras.length;
   let gain = 1;
   try {
-    for (let i = 0; i < n; i++) {
-      if (opts.signal?.aborted) throw abortError();
-      gain = Math.max(gain, maxStraight(await readView(i), w, h, rowBytes / 2));
-    }
-    gain = Math.min(MAX_GAIN, gain);
+    run(k.max, n, maxBits);
+    const brightest = await withMapped(
+      staging,
+      (d) => new Float32Array(d, 0, 1)[0]!,
+    );
+    gain = Math.min(MAX_GAIN, Math.max(1, brightest));
     if (gain > 1)
       console.log(`[Kiln] Brush targets scaled by 1/${gain.toFixed(2)}`);
+    const params = new ArrayBuffer(16);
+    new Float32Array(params)[1] = gain;
+    // Each PNG is compressed and written while the next view converts.
+    let writing: Promise<void> = Promise.resolve();
     for (const [i, cam] of views.cameras.entries()) {
-      if (opts.signal?.aborted) throw abortError();
-      const half = await readView(i);
-      const name = `${String(i).padStart(4, "0")}.png`;
-      await writeFile(
-        images,
-        name,
-        encodePng(toStraightRgba8(half, w, h, rowBytes / 2, gain), w, h),
+      throwIfAborted(opts.signal);
+      new Uint32Array(params)[0] = i;
+      device.queue.writeBuffer(convert, 0, params);
+      run(k.convert, 1, rgba);
+      const pixels = await withMapped(staging, (d) =>
+        new Uint8Array(d, 0, w * h * 4).slice(),
       );
+      await writing;
+      const name = `${String(i).padStart(4, "0")}.png`;
+      writing = encodePng(pixels, w, h).then((png) =>
+        writeFile(images, name, png),
+      );
+      writing.catch(() => {}); // awaited with the next view
       frames.push({
         file_path: `images/${name}`,
         transform_matrix: cameraToWorldRows(cam.view),
@@ -322,8 +395,9 @@ async function writeDataset(
         `Writing training view ${i + 1}/${n} for Brush`,
       );
     }
+    await writing;
   } finally {
-    staging.destroy();
+    for (const b of [convert, rgba, maxBits, staging]) b.destroy();
   }
   const cam = views.cameras[0]!;
   const transforms = {
@@ -341,15 +415,51 @@ async function writeDataset(
     "transforms.json",
     new TextEncoder().encode(JSON.stringify(transforms)),
   );
-  await writeFile(dir, "init.ply", writePly(scaleColours(init, 1 / gain)));
+  await writeFile(dir, "init.ply", writePly(init, 1 / gain));
   return gain;
 }
 
-function abortError(): DOMException {
-  return new DOMException("Splat build cancelled", "AbortError");
+/**
+ * Brush's splat arrays → Kiln's parameter layout, colours × `gain`. Brush can
+ * leave a few faint splats with NaN colour; they are dropped (one NaN splat
+ * turns every pixel it covers, and the held-out PSNR, into NaN).
+ */
+export function kilnParamsFromBrush(
+  transforms: Float32Array,
+  sh: Float32Array,
+  opacity: Float32Array,
+  n: number,
+  nCoeffs: number,
+  gain: number,
+): { params: Float32Array; count: number } {
+  const params = new Float32Array(n * PARAM_STRIDE);
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i * TRANSFORM_STRIDE;
+    const b = count * PARAM_STRIDE;
+    for (let k = 0; k < 3; k++) {
+      params[b + P_MEAN + k] = transforms[t + k]!;
+      params[b + P_SCALE + k] = transforms[t + 7 + k]!;
+      params[b + P_COLOR + k] = colorParam(
+        gain * (0.5 + SH_C0 * sh[i * nCoeffs * 3 + k]!),
+      );
+    }
+    for (let k = 0; k < 4; k++) params[b + P_QUAT + k] = transforms[t + 3 + k]!;
+    params[b + P_OPACITY] = opacity[i]!;
+    let finite = true;
+    for (let k = 0; k < PARAM_STRIDE; k++)
+      if (!Number.isFinite(params[b + k]!)) finite = false;
+    if (finite) count++;
+  }
+  if (count < n)
+    console.warn(`[Kiln] Dropped ${n - count} Brush splats with NaN values`);
+  return {
+    params: count < n ? params.slice(0, count * PARAM_STRIDE) : params,
+    count,
+  };
 }
 
-/** Brush's splats → Kiln's parameter layout, colours × `gain`. */
+/** Read the trained splats out of Brush's GPU buffers. */
 async function readSplats(
   device: GPUDevice,
   training: Training,
@@ -368,22 +478,7 @@ async function readSplats(
   ]).then((bufs) => bufs.map((b) => new Float32Array(b)));
   buffers.free();
   splats.free();
-  const params = new Float32Array(n * PARAM_STRIDE);
-  for (let i = 0; i < n; i++) {
-    const t = i * TRANSFORM_STRIDE;
-    const b = i * PARAM_STRIDE;
-    for (let k = 0; k < 3; k++) {
-      params[b + P_MEAN + k] = transforms![t + k]!;
-      params[b + P_SCALE + k] = transforms![t + 7 + k]!;
-      params[b + P_COLOR + k] = colorParam(
-        gain * (0.5 + SH_C0 * sh![i * nCoeffs * 3 + k]!),
-      );
-    }
-    for (let k = 0; k < 4; k++)
-      params[b + P_QUAT + k] = transforms![t + 3 + k]!;
-    params[b + P_OPACITY] = opacity![i]!;
-  }
-  return { params, count: n };
+  return kilnParamsFromBrush(transforms!, sh!, opacity!, n, nCoeffs, gain);
 }
 
 /** Delete training folders a crashed or closed tab left behind. */
@@ -416,7 +511,7 @@ function withOverrides(
 export async function trainWithBrush(
   device: GPUDevice,
   init: GaussianCloud,
-  views: TrainViews,
+  views: CapturedViews,
   opts: BrushTrainOptions,
 ): Promise<GaussianCloud> {
   const onProgress = opts.onProgress ?? (() => {});
@@ -487,7 +582,7 @@ export async function trainWithBrush(
     let iter = 0;
     let splats = init.count;
     for (;;) {
-      if (opts.signal?.aborted) throw abortError();
+      throwIfAborted(opts.signal);
       const msgs = await Promise.race([training.trainSteps(step), failed]);
       if (msgs.length === 0) break;
       for (const m of msgs) {

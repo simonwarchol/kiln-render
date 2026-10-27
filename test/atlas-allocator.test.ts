@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { GRID_SIZE, TOTAL_BRICK_SLOTS } from "../src/core/config.js";
+import { GRID_SIZE } from "../src/core/config.js";
 import { AtlasAllocator } from "../src/streaming/atlas-allocator.js";
+
+const TOTAL_BRICK_SLOTS = GRID_SIZE ** 3;
 
 describe("AtlasAllocator", () => {
   let allocator: AtlasAllocator;
@@ -12,7 +14,6 @@ describe("AtlasAllocator", () => {
   it("should start with all slots free", () => {
     expect(allocator.freeCount).toBe(TOTAL_BRICK_SLOTS);
     expect(allocator.usedCount).toBe(0);
-    expect(allocator.isFull).toBe(false);
   });
 
   it("should allocate a slot", () => {
@@ -36,25 +37,6 @@ describe("AtlasAllocator", () => {
     }
   });
 
-  it("should free a slot", () => {
-    const result = allocator.allocate()!;
-    expect(allocator.usedCount).toBe(1);
-
-    allocator.free(result.slot);
-    expect(allocator.usedCount).toBe(0);
-    expect(allocator.freeCount).toBe(TOTAL_BRICK_SLOTS);
-  });
-
-  it("should reuse freed slots", () => {
-    const result1 = allocator.allocate()!;
-    allocator.free(result1.slot);
-
-    const result2 = allocator.allocate()!;
-    expect(result2.slot.x).toBe(result1.slot.x);
-    expect(result2.slot.y).toBe(result1.slot.y);
-    expect(result2.slot.z).toBe(result1.slot.z);
-  });
-
   it("should evict LRU when full", () => {
     // Allocate all slots
     for (let i = 0; i < TOTAL_BRICK_SLOTS; i++) {
@@ -70,7 +52,7 @@ describe("AtlasAllocator", () => {
       });
     }
 
-    expect(allocator.isFull).toBe(true);
+    expect(allocator.freeCount).toBe(0);
 
     // Next allocation should evict the oldest (frame 0)
     const result = allocator.allocate(TOTAL_BRICK_SLOTS);
@@ -89,15 +71,6 @@ describe("AtlasAllocator", () => {
     allocator.reset();
     expect(allocator.usedCount).toBe(0);
     expect(allocator.freeCount).toBe(TOTAL_BRICK_SLOTS);
-  });
-
-  it("should return all allocated slots", () => {
-    allocator.allocate();
-    allocator.allocate();
-    allocator.allocate();
-
-    const allocated = allocator.getAllocatedSlots();
-    expect(allocated.length).toBe(3);
   });
 
   it("should have valid slot coordinates", () => {
@@ -141,20 +114,6 @@ describe("AtlasAllocator", () => {
       expect(newResult).not.toBeNull();
       expect(newResult!.evicted).not.toBeNull();
       expect(newResult!.evicted!.key).not.toBe("first");
-    });
-
-    it("should track pinned count", () => {
-      const r1 = allocator.allocate()!;
-      const r2 = allocator.allocate()!;
-
-      allocator.pin(r1.slotIndex);
-      expect(allocator.pinnedCount).toBe(1);
-
-      allocator.pin(r2.slotIndex);
-      expect(allocator.pinnedCount).toBe(2);
-
-      allocator.unpin(r1.slotIndex);
-      expect(allocator.pinnedCount).toBe(1);
     });
   });
 

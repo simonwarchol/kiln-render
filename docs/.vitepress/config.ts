@@ -41,10 +41,6 @@ export default defineConfig({
   base,
   // Dark by default (still toggleable) to match the renderer's aesthetic.
   appearance: "dark",
-  // Internal audit docs must not ship in the public site. README.md stays in
-  // the build: it's the "Documentation index" every doc footer links back to
-  // (via README.md), so it must resolve as a page here and on GitHub alike.
-  srcExclude: ["audits/**"],
   head: [
     // Preview builds: never index a staging copy (esp. public-repo previews,
     // which live under the production domain at kilnrender.com/preview/<b>/).
@@ -65,7 +61,7 @@ export default defineConfig({
     [
       "script",
       {},
-      `(function(){var b=${JSON.stringify(base)};var p=location.pathname;if(p!==b&&p!==b+'index.html')return;var k=['dataset','mode','cam','up','scale','lod','sse','wc','ww','iso','tf','tfpts','tfPreset','density','channels','slice','clipMin','clipMax','wireframe','renderScale'];var q=new URLSearchParams(location.search);for(var i=0;i<k.length;i++){if(q.has(k[i])){location.replace(b+'app/'+location.search+location.hash);return;}}})();`,
+      `(function(){var b=${JSON.stringify(base)};var p=location.pathname;if(p!==b&&p!==b+'index.html')return;var k=['dataset','mode','cam','up','lod','sse','wc','ww','iso','tf','tfpts','tfPreset','density','channels','slice','clipMin','clipMax','wireframe'];var q=new URLSearchParams(location.search);for(var i=0;i<k.length;i++){if(q.has(k[i])){location.replace(b+'app/'+location.search+location.hash);return;}}})();`,
     ],
     [
       "link",
@@ -224,28 +220,11 @@ export default defineConfig({
     search: { provider: "local" },
   },
   vite: {
-    server: {
-      // Must be 3000: the CloudFront CDN hosting the demo datasets sends a
-      // static Access-Control-Allow-Origin of http://localhost:3000, so the
-      // live hero embed's dataset fetch only clears CORS from that port in dev.
-      port: 3000,
-      strictPort: true,
-    },
     build: {
       // outDir (../dist) sits outside VitePress's root (docs/), so Vite won't
       // empty it unless we say so. Emptying here is intentional: the site build
       // runs first and clears dist/, then the viewer builds add dist/app/.
       emptyOutDir: true,
-    },
-    resolve: {
-      alias: {
-        // Same aliases the example viewers use, so the live hero embed renders
-        // the current repo source rather than a published package.
-        "kiln-render": fileURLToPath(
-          new URL("../../src/index.ts", import.meta.url),
-        ),
-        "@kiln": fileURLToPath(new URL("../../src", import.meta.url)),
-      },
     },
   },
   // Build the site into the repo-root dist/ (shared with the viewer builds).

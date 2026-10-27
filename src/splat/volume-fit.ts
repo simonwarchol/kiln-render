@@ -28,8 +28,6 @@ import {
 import { getFloat16ToFloat32Lut } from "../utils/float16.js";
 import { createCloud, type GaussianCloud, setGaussian } from "./cloud.js";
 
-export { LOGICAL, PHYSICAL };
-
 /** Rendering state the fit must reproduce (mirrors the DVR uniforms). */
 export interface ClassifyParams {
   numChannels: number;
@@ -97,6 +95,8 @@ export class VolumeFitter {
   private readonly grid1: [number, number, number];
   private nodes1: Float32Array;
   private readonly f16 = getFloat16ToFloat32Lut();
+  /** Raw voxel value → window weight, per channel and storage type. */
+  private readonly weightLuts = new Map<string, Float64Array>();
   occupiedVoxels = 0;
 
   /** Nodes per brick axis (a 64³ brick covers 32³ 2³-nodes). */
@@ -229,56 +229,61 @@ export class VolumeFitter {
     const B = VolumeFitter.BLOCK;
     const nodes = new Float32Array(B * B * B * N_STRIDE);
     let occupied = 0;
-    const floatInv = 1 / Math.max(1e-4, p.floatMax - p.floatMin);
-    const wLo = p.windowCenter - p.windowWidth / 2;
-    const wInv = 1 / Math.max(1e-3, p.windowWidth);
     const sigmaScale = p.densityScale * p.maxDim0 * 0.5;
     const [dx, dy, dz] = this.dims;
     const [hx, hy, hz] = this.h;
     const V = hx * hy * hz;
-    const f16 = this.f16;
     const tf = p.tf;
-    const decode = (data: Uint16Array | Uint8Array, idx: number) =>
-      data instanceof Uint8Array ? data[idx]! / 255 : f16[data[idx]!]!;
-    const cmin = p.clipMin;
-    const cmax = p.clipMax;
+    // Visible channels' data, weight tables and colours (rgb, a).
+    const data = vis.map((ch) => channels[ch]!);
+    const luts = vis.map((ch, k) =>
+      multi
+        ? this.weightLut(data[k]!, `${ch}`, lower[ch]!, invW[ch]!)
+        : this.weightLut(
+            data[k]!,
+            "single",
+            p.windowCenter - p.windowWidth / 2,
+            1 / Math.max(1e-3, p.windowWidth),
+          ),
+    );
+    const colour = (ch: number, c: number) =>
+      p.channelColors[ch * 4 + c] ?? (c === 3 ? 1 : 0);
+    const cr = vis.map((ch) => colour(ch, 0));
+    const cg = vis.map((ch) => colour(ch, 1));
+    const cb = vis.map((ch) => colour(ch, 2));
+    const ca = vis.map((ch) => colour(ch, 3));
+    const nv = vis.length;
+    const [cminX, cminY, cminZ] = [0, 1, 2].map((a) => p.clipMin[a] ?? 0);
+    const [cmaxX, cmaxY, cmaxZ] = [0, 1, 2].map((a) => p.clipMax[a] ?? 1);
 
     for (let lz = 0; lz < LOGICAL; lz++) {
       const vz = bz * LOGICAL + lz;
       if (vz >= dz) break;
       const uz = ((vz + 0.5) * hz) / this.nsize[2];
-      if (uz < (cmin[2] ?? 0) || uz > (cmax[2] ?? 1)) continue;
+      if (uz < cminZ! || uz > cmaxZ!) continue;
       for (let ly = 0; ly < LOGICAL; ly++) {
         const vy = by * LOGICAL + ly;
         if (vy >= dy) break;
         const uy = ((vy + 0.5) * hy) / this.nsize[1];
-        if (uy < (cmin[1] ?? 0) || uy > (cmax[1] ?? 1)) continue;
+        if (uy < cminY! || uy > cmaxY!) continue;
         for (let lx = 0; lx < LOGICAL; lx++) {
           const vx = bx * LOGICAL + lx;
           if (vx >= dx) break;
           const ux = ((vx + 0.5) * hx) / this.nsize[0];
-          if (ux < (cmin[0] ?? 0) || ux > (cmax[0] ?? 1)) continue;
+          if (ux < cminX! || ux > cmaxX!) continue;
           const idx = ((lz + 1) * PHYSICAL + (ly + 1)) * PHYSICAL + (lx + 1);
           let r = 0;
           let g = 0;
           let b = 0;
           let dens = 0;
           if (multi) {
-            for (const ch of vis) {
-              const raw = decode(channels[ch]!, idx);
-              const norm = Math.min(
-                1,
-                Math.max(0, (raw - p.floatMin) * floatInv),
-              );
-              const d = Math.min(
-                1,
-                Math.max(0, (norm - lower[ch]!) * invW[ch]!),
-              );
+            for (let k = 0; k < nv; k++) {
+              const d = luts[k]![data[k]![idx]!]!;
               if (d <= 0) continue;
-              const a = p.channelColors[ch * 4 + 3] ?? 1;
-              r += d * (p.channelColors[ch * 4] ?? 0) * a;
-              g += d * (p.channelColors[ch * 4 + 1] ?? 0) * a;
-              b += d * (p.channelColors[ch * 4 + 2] ?? 0) * a;
+              const a = ca[k]!;
+              r += d * cr[k]! * a;
+              g += d * cg[k]! * a;
+              b += d * cb[k]! * a;
               if (d > dens) dens = d;
             }
             if (dens <= 0.01) continue;
@@ -286,12 +291,7 @@ export class VolumeFitter {
             g /= dens;
             b /= dens;
           } else {
-            const raw = decode(channels[vis[0]!]!, idx);
-            const norm = Math.min(
-              1,
-              Math.max(0, (raw - p.floatMin) * floatInv),
-            );
-            const w = Math.min(1, Math.max(0, (norm - wLo) * wInv));
+            const w = luts[0]![data[0]![idx]!]!;
             if (w <= 0.01) continue;
             if (tf) {
               const t = Math.min(255, Math.max(0, w * 255));
@@ -336,6 +336,33 @@ export class VolumeFitter {
       }
     }
     return occupied > 0 ? { block: nodes, occupied } : null;
+  }
+
+  /**
+   * Window weight of every raw value of `data`'s type (8-bit unorm or
+   * float16 bits): clamp((normalised value − lo) · inv, 0, 1), as the DVR
+   * shader applies it. Built once per channel and type.
+   */
+  private weightLut(
+    data: Uint16Array | Uint8Array,
+    channel: string,
+    lo: number,
+    inv: number,
+  ): Float64Array {
+    const u8 = data instanceof Uint8Array;
+    const key = `${channel}:${u8 ? 8 : 16}`;
+    let lut = this.weightLuts.get(key);
+    if (lut) return lut;
+    const p = this.params;
+    const floatInv = 1 / Math.max(1e-4, p.floatMax - p.floatMin);
+    lut = new Float64Array(u8 ? 256 : 65536);
+    for (let v = 0; v < lut.length; v++) {
+      const raw = u8 ? v / 255 : this.f16[v]!;
+      const norm = Math.min(1, Math.max(0, (raw - p.floatMin) * floatInv));
+      lut[v] = Math.min(1, Math.max(0, (norm - lo) * inv));
+    }
+    this.weightLuts.set(key, lut);
+    return lut;
   }
 
   /** Build coarser node levels (4³, 8³) by merging children with parallel-axis shifts. */
@@ -457,55 +484,30 @@ export class VolumeFitter {
       return e;
     });
 
-    const top = levels[2]!;
-    // Count Gaussians produced by threshold `thr` (descending where error > thr).
-    const visit = (
-      thr: number,
-      emit: ((li: number, i: number) => void) | null,
-    ): number => {
-      let n = 0;
-      const rec = (li: number, x: number, y: number, z: number) => {
-        const L = levels[li]!;
-        if (x >= L.grid[0] || y >= L.grid[1] || z >= L.grid[2]) return;
-        const i = (z * L.grid[1] + y) * L.grid[0] + x;
-        if (L.nodes[i * N_STRIDE + A_M]! <= 0) return;
-        if (li > 0 && errors[li]![i]! > thr) {
-          for (let k = 0; k < 8; k++)
-            rec(
-              li - 1,
-              x * 2 + (k & 1),
-              y * 2 + ((k >> 1) & 1),
-              z * 2 + (k >> 2),
-            );
-          return;
-        }
-        n++;
-        emit?.(li, i);
-      };
-      for (let z = 0; z < top.grid[2]; z++)
-        for (let y = 0; y < top.grid[1]; y++)
-          for (let x = 0; x < top.grid[0]; x++) rec(2, x, y, z);
-      return n;
-    };
-
-    let lo = 0;
-    let hi = 0;
-    for (const e of errors)
-      if (e) for (let i = 0; i < e.length; i++) hi = Math.max(hi, e[i]!);
-    let thr = hi;
-    if (visit(0, null) <= target) {
-      thr = 0;
-    } else {
-      for (let it = 0; it < 40; it++) {
-        const mid = (lo + hi) / 2;
-        if (visit(mid, null) > target) lo = mid;
-        else hi = mid;
-      }
-      thr = hi;
-    }
-
+    const thr = splitThreshold(levels, errors[1]!, errors[2]!, target);
+    // Descend from the top level where error > thr.
     const selected: Array<[number, number]> = [];
-    visit(thr, (li, i) => selected.push([li, i]));
+    const rec = (li: number, x: number, y: number, z: number) => {
+      const L = levels[li]!;
+      if (x >= L.grid[0] || y >= L.grid[1] || z >= L.grid[2]) return;
+      const i = (z * L.grid[1] + y) * L.grid[0] + x;
+      if (L.nodes[i * N_STRIDE + A_M]! <= 0) return;
+      if (li > 0 && errors[li]![i]! > thr) {
+        for (let k = 0; k < 8; k++)
+          rec(
+            li - 1,
+            x * 2 + (k & 1),
+            y * 2 + ((k >> 1) & 1),
+            z * 2 + (k >> 2),
+          );
+        return;
+      }
+      selected.push([li, i]);
+    };
+    const top = levels[2]!;
+    for (let z = 0; z < top.grid[2]; z++)
+      for (let y = 0; y < top.grid[1]; y++)
+        for (let x = 0; x < top.grid[0]; x++) rec(2, x, y, z);
     const cloud = createCloud(selected.length);
     let out = 0;
     // Voxel-extent regulariser so single-voxel nodes aren't degenerate.
@@ -565,6 +567,104 @@ export class VolumeFitter {
     cloud.params = cloud.params.subarray(0, out * 16);
     return cloud;
   }
+}
+
+interface NodeLevel {
+  grid: [number, number, number];
+  nodes: Float32Array;
+}
+
+const bitsF32 = new Float32Array(1);
+const bitsU32 = new Uint32Array(bitsF32.buffer);
+/** Bits of +Infinity: larger patterns are NaN (errors are never negative). */
+const INF_BITS = 0x7f800000;
+
+/**
+ * Smallest split threshold whose cut (descend where error > threshold) has
+ * at most `target` Gaussians — 0 if the full cut fits, the largest error
+ * (no splits) if not even the top level does.
+ *
+ * The cut size is a step function: N(thr) = T + Σ wᵢ·[keyᵢ > thr], with T
+ * the non-empty top nodes and one event per non-empty node — a top node
+ * splitting adds (non-empty children − 1), and a level-1 node, which splits
+ * only once its parent has, adds (non-empty children − 1) below
+ * min(its error, its parent's). Sorting the events gives N exactly.
+ */
+function splitThreshold(
+  levels: readonly NodeLevel[],
+  e1: Float32Array,
+  e2: Float32Array,
+  target: number,
+): number {
+  const [l0, l1, l2] = levels as [NodeLevel, NodeLevel, NodeLevel];
+  const filled = (L: NodeLevel, i: number) => L.nodes[i * N_STRIDE + A_M]! > 0;
+  /** Calls fn(node, parent node) for every non-empty node of `child`. */
+  const eachFilled = (
+    child: NodeLevel,
+    parent: NodeLevel,
+    fn: (i: number, parent: number) => void,
+  ) => {
+    const [gx, gy, gz] = child.grid;
+    const [px, py] = parent.grid;
+    let i = 0;
+    for (let z = 0; z < gz; z++)
+      for (let y = 0; y < gy; y++) {
+        const row = ((z >> 1) * py + (y >> 1)) * px;
+        for (let x = 0; x < gx; x++, i++)
+          if (filled(child, i)) fn(i, row + (x >> 1));
+      }
+  };
+  // Non-empty children per node.
+  const kids1 = new Uint8Array(e1.length);
+  const kids2 = new Uint8Array(e2.length);
+  eachFilled(l0, l1, (_, up) => {
+    kids1[up] = kids1[up]! + 1;
+  });
+  eachFilled(l1, l2, (_, up) => {
+    kids2[up] = kids2[up]! + 1;
+  });
+
+  const bits1 = new Uint32Array(e1.buffer, e1.byteOffset, e1.length);
+  const bits2 = new Uint32Array(e2.buffer, e2.byteOffset, e2.length);
+  // Event = key bits · 8 + weight (weights are 0…7): sorts by key.
+  const events: number[] = [];
+  let T = 0;
+  let total = 0;
+  let maxBits = 0;
+  const push = (key: number, w: number) => {
+    // Error 0 never splits; NaN never compares greater.
+    if (w <= 0 || key === 0 || key > INF_BITS) return;
+    events.push(key * 8 + w);
+    total += w;
+  };
+  for (let i = 0; i < e2.length; i++) {
+    if (!filled(l2, i)) continue;
+    T++;
+    if (bits2[i]! <= INF_BITS) maxBits = Math.max(maxBits, bits2[i]!);
+    push(bits2[i]!, kids2[i]! - 1);
+  }
+  eachFilled(l1, l2, (i, up) => {
+    const own = bits1[i]!;
+    const parent = bits2[up]!;
+    if (own <= INF_BITS) maxBits = Math.max(maxBits, own);
+    if (parent <= INF_BITS) push(Math.min(own, parent), kids1[i]! - 1);
+  });
+  if (T + total <= target) return 0;
+  const sorted = Float64Array.from(events).sort();
+  const toFloat = (b: number) => {
+    bitsU32[0] = b;
+    return bitsF32[0]!;
+  };
+  // Walk keys downwards: n = N(key) = T + weights of larger keys.
+  let thr = toFloat(maxBits);
+  let n = T;
+  for (let i = sorted.length - 1; i >= 0 && n <= target; ) {
+    const key = Math.floor(sorted[i]! / 8);
+    thr = toFloat(key);
+    for (; i >= 0 && Math.floor(sorted[i]! / 8) === key; i--)
+      n += sorted[i]! % 8;
+  }
+  return thr;
 }
 
 /**

@@ -12,10 +12,6 @@ export const MAX_CHANNELS = 6;
 // ATLAS_SIZE = GRID_SIZE * PHYSICAL_BRICK_SIZE
 // 528 = 8 * 66, 660 = 10 * 66, 792 = 12 * 66, etc.
 export const GRID_SIZE = Math.floor(ATLAS_SIZE / PHYSICAL_BRICK_SIZE);
-export const TOTAL_BRICK_SLOTS = GRID_SIZE * GRID_SIZE * GRID_SIZE;
-
-// For backward compatibility with existing code
-export const BRICK_SIZE = LOGICAL_BRICK_SIZE;
 
 /** Leaves GPU headroom for splat generation/training next to the atlas. */
 export const DEFAULT_ATLAS_BUDGET_BYTES = 2_000_000_000;
@@ -101,25 +97,13 @@ export function computeAtlasGrid(
   return { gridSize, atlasSize: gridSize * PHYSICAL_BRICK_SIZE };
 }
 
-// Grouped config object (static constants only)
-export const CONFIG = {
-  LOGICAL_BRICK_SIZE,
-  PHYSICAL_BRICK_SIZE,
-  BRICK_SIZE,
-  ATLAS_SIZE,
-  GRID_SIZE,
-  TOTAL_BRICK_SLOTS,
-  MAX_BRICK_TRAVERSALS,
-  MAX_CHANNELS,
-} as const;
-
 function computeDatasetGrid(
   dimensions: [number, number, number],
 ): [number, number, number] {
   return [
-    Math.ceil(dimensions[0] / BRICK_SIZE),
-    Math.ceil(dimensions[1] / BRICK_SIZE),
-    Math.ceil(dimensions[2] / BRICK_SIZE),
+    Math.ceil(dimensions[0] / LOGICAL_BRICK_SIZE),
+    Math.ceil(dimensions[1] / LOGICAL_BRICK_SIZE),
+    Math.ceil(dimensions[2] / LOGICAL_BRICK_SIZE),
   ];
 }
 

@@ -74,9 +74,7 @@ function defineUniformStruct<T extends string>(
 export const COMPUTE_UNIFORMS = defineUniformStruct([
   { name: "inverseViewProj", type: "mat4x4f" },
   { name: "cameraPos", type: "vec3f" },
-  { name: "useIndirection", type: "f32" },
   { name: "datasetSize", type: "vec3f" },
-  { name: "renderMode", type: "i32" },
   { name: "normalizedSize", type: "vec3f" },
   { name: "isoValue", type: "f32" },
   { name: "screenSize", type: "vec2f" },
@@ -89,7 +87,6 @@ export const COMPUTE_UNIFORMS = defineUniformStruct([
   { name: "clipMin", type: "vec3f" },
   { name: "densityScale", type: "f32" },
   { name: "clipMax", type: "vec3f" },
-  { name: "numChannels", type: "u32" },
   // Up to MAX_CHANNELS (6). Window center/width packed as two vec4s
   // (ch0–3 in [0], ch4–5 in [1].xy) so shaders can index with ch/4, ch%4.
   { name: "channelColors", type: "array<vec4f, 6>" },
@@ -100,6 +97,11 @@ export const COMPUTE_UNIFORMS = defineUniformStruct([
   { name: "background", type: "vec4f" },
   // Front-to-back early termination threshold
   { name: "earlyExitAlpha", type: "f32" },
+  // Ray step multiplier (1 = full quality; larger for draft frames)
+  { name: "stepScale", type: "f32" },
+  // Depth cue (core/depth-cue.ts): emission × exp(−scale · max(0, t − near))
+  { name: "depthCueNear", type: "f32" },
+  { name: "depthCueScale", type: "f32" },
 ]);
 
 // ---------------------------------------------------------------------------
@@ -118,7 +120,6 @@ export const SLICE_UNIFORMS = defineUniformStruct([
   { name: "sliceYEnabled", type: "u32" },
   { name: "sliceZEnabled", type: "u32" },
   { name: "numChannels", type: "u32" },
-  { name: "lodDebug", type: "u32" },
   { name: "channelColors", type: "array<vec4f, 6>" },
   { name: "channelWindowCenter", type: "array<vec4f, 2>" },
   { name: "channelWindowWidth", type: "array<vec4f, 2>" },

@@ -8,6 +8,8 @@ struct BrickInfo {
     numSteps: u32,
     stepSize: f32,
     valid: bool,
+    // Linear atlas slot index (for slotMax)
+    slot: u32,
     // affine atlas transform: atlasPos = atlasOffset + voxelPos * atlasScale
     // precomputed per brick to replace fmod + divides in the hot loop
     atlasOffset: vec3f,
@@ -34,7 +36,7 @@ fn setupBrick(
     let brickMinWorld = voxelToNormalized(brickMinVoxel, normalizedSize, datasetSize);
     let brickMaxWorld = voxelToNormalized(brickMaxVoxel, normalizedSize, datasetSize);
 
-    let tBrick = intersectBoxInv(rayOrigin, invDir, brickMinWorld, brickMaxWorld);
+    let tBrick = intersectBox(rayOrigin, invDir, brickMinWorld, brickMaxWorld);
     info.tEnd = min(tBrick.y, tEnd);
 
     info.indirection = lookupIndirection(brickIndex);
@@ -43,13 +45,14 @@ fn setupBrick(
 
     if (info.valid) {
         info.lodScale = getLodScale(info.indirection);
+        info.slot = (info.indirection.z * ATLAS_GRID + info.indirection.y) * ATLAS_GRID + info.indirection.x;
 
         // LOD-adaptive step size — coarse bricks use larger steps
         // compositing uses exact Beer-Lambert (1 - exp2)
         let brickWorldSize = length(brickMaxWorld - brickMinWorld);
         let brickLength = info.tEnd - t;
         let lodStepMul = min(info.lodScale, 4.0);
-        info.stepSize = (brickWorldSize / STEPS_PER_BRICK) * lodStepMul;
+        info.stepSize = (brickWorldSize / STEPS_PER_BRICK) * lodStepMul * uniforms.stepScale;
         info.numSteps = max(1u, u32(ceil(brickLength / info.stepSize)) + 1u);
 
         // precompute affine atlas transform for the hot loop
@@ -65,21 +68,30 @@ fn setupBrick(
     return info;
 }
 
-// Refine isosurface position using bisection
-fn refineIsoSurface(
-    rayOrigin: vec3f, rayDir: vec3f, tLow: f32, tHigh: f32, isoValue: f32,
-    normalizedSize: vec3f, datasetSize: vec3f
-) -> f32 {
-    var lo = tLow;
-    var hi = tHigh;
-    for (var i = 0u; i < 4u; i++) {
-        let mid = (lo + hi) * 0.5;
-        let pos = rayOrigin + rayDir * mid;
-        let voxel = normalizedToVoxel(pos, normalizedSize, datasetSize);
-        let density = sampleWithIndirection(voxel);
-        if (density >= isoValue) { hi = mid; } else { lo = mid; }
-    }
-    return (lo + hi) * 0.5;
+// Sample-comb offset in [0, 1) for this ray: a per-pixel random start
+// advanced by the golden ratio each frame, so the accumulated TAA frames
+// cover the step evenly rather than at random.
+fn rayJitter(rayDir: vec3f) -> f32 {
+    if (uniforms.jitter == 0u) { return 0.0; }
+    return fract(rand(rayToSeed(rayDir)) + f32(uniforms.frameIndex % 4096u) * 0.618034);
+}
+
+// Depth cue (core/depth-cue.ts): emission fades with distance `t` from the
+// camera; 1 = no fade.
+fn depthFade(t: f32) -> f32 {
+    return exp(-uniforms.depthCueScale * max(0.0, t - uniforms.depthCueNear));
+}
+
+// Ray parameter just past a brick's exit (scale-sensitive epsilon)
+fn nextBrickT(brick: BrickInfo) -> f32 {
+    return brick.tEnd + max(0.0001, brick.tEnd * 1e-6);
+}
+
+// Largest normalised value channel `ch` holds in an atlas slot, from the
+// per-slot maxima (slot-max.wgsl). Every sample in the brick is at most this.
+fn brickMax(slot: u32, ch: u32, floatInvRange: f32) -> f32 {
+    let raw = slotMax[slot * 2u + ch / 4u][ch % 4u];
+    return clamp((raw - uniforms.floatMin) * floatInvRange, 0.0, 1.0);
 }
 
 // Refine isosurface position using bisection with windowing.
@@ -101,33 +113,4 @@ fn refineIsoSurfaceWindowed(
         if (density >= isoValue) { hi = mid; } else { lo = mid; }
     }
     return (lo + hi) * 0.5;
-}
-
-// Simple ray march without brick traversal (direct atlas sampling)
-// This renders the raw atlas texture as a debug view
-fn rayMarchSimple(
-    rayOrigin: vec3f, rayDir: vec3f, tStart: f32, tEnd: f32,
-    normalizedSize: vec3f, datasetSize: vec3f
-) -> vec4f {
-    // For atlas debug view, use atlas size as the volume dimension
-    let atlasSize = ATLAS_SIZE;
-    let rayLength = tEnd - tStart;
-    let numSteps = 512u;  // More steps for full atlas
-    let stepSize = rayLength / f32(numSteps);
-    let extinctionScale = stepSize * atlasSize * 0.5 * LOG2E;
-
-    var color = vec3f(0.0);
-    var alpha = 0.0;
-
-    for (var i = 0u; i < numSteps; i++) {
-        let t = tStart + f32(i) * stepSize;
-        let pos = rayOrigin + rayDir * t;
-        // Convert normalized position [-0.5, 0.5] to UV [0, 1] for atlas sampling
-        let atlasUV = (pos / normalizedSize) + 0.5;
-        let density = textureSampleLevel(volumeTexture, volumeSampler, atlasUV, 0.0).r;
-        composeSampleWindowed(density, extinctionScale, uniforms.windowCenter, uniforms.windowWidth, &color, &alpha);
-        if (alpha > EARLY_EXIT_ALPHA) { break; }
-    }
-
-    return vec4f(color, alpha);
 }

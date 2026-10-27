@@ -2,6 +2,9 @@
 
 import { mat4 } from "wgpu-matrix";
 
+/** Camera placement: [rotationX, rotationY, distance, targetX, targetY, targetZ]. */
+export type OrbitState = [number, number, number, number, number, number];
+
 export type UpAxis = "x" | "y" | "z" | "-x" | "-y" | "-z";
 
 // Orbit distance clamp (normalized units), shared by mouse wheel and touch pinch
@@ -361,7 +364,7 @@ export class Camera {
   }
 
   /** Get orbital state: [rotationX, rotationY, distance, targetX, targetY, targetZ] */
-  getOrbitState(): [number, number, number, number, number, number] {
+  getOrbitState(): OrbitState {
     return [
       this.rotationX,
       this.rotationY,

@@ -11,17 +11,21 @@
  *               views with Brush, on the same GPU device (brush-trainer.ts).
  */
 
-import type { Camera } from "../core/camera.js";
-import { clipToWorld, type DatasetConfig } from "../core/config.js";
+import type { Camera, OrbitState } from "../core/camera.js";
+import {
+  clipToWorld,
+  type DatasetConfig,
+  LOGICAL_BRICK_SIZE,
+} from "../core/config.js";
 import type { Renderer } from "../core/renderer.js";
 import type { TransferFunction } from "../core/transfer-function.js";
 import type { DataProvider, VolumeMetadata } from "../data/data-provider.js";
 import type { StreamingManager } from "../streaming/streaming-manager.js";
 import { getFloat16ToFloat32Lut } from "../utils/float16.js";
-import { trainWithBrush } from "./brush-trainer.js";
+import { throwIfAborted, trainWithBrush } from "./brush-trainer.js";
 import { cloudFromParams, type GaussianCloud } from "./cloud.js";
-import { createBuffer, readBuffer, STORAGE_RW } from "./gpu/kernel.js";
-import type { SplatCamera } from "./gpu/rasterizer.js";
+import { quatToRot, type SplatCamera } from "./cpu-reference.js";
+import { createBuffer, READBACK, withMapped } from "./gpu/kernel.js";
 import { SplatRasterizer } from "./gpu/rasterizer.js";
 import { splatCameraFor } from "./splat-layer.js";
 import type { ClassifyParams } from "./volume-fit.js";
@@ -62,6 +66,16 @@ export interface SplatBuildOptions {
   viewSeed?: number;
   /** Held-out views to score the result on (PSNR vs. the volume); 0 = skip */
   evaluateViews?: number;
+  /**
+   * Extra training cameras — e.g. the views a story will show — rendered and
+   * trained on alongside the generated ones. Tiled builds ignore them.
+   */
+  extraViews?: OrbitState[];
+  /**
+   * Cameras to score the result at instead of generated held-out views
+   * (`evaluateViews`). Tiled builds ignore them.
+   */
+  evaluateAt?: OrbitState[];
   /** Fit pyramid level (default: finest that fits the memory budget) */
   fitLod?: number;
   /** Fit memory budget in bytes (default 512 MB) */
@@ -99,11 +113,6 @@ function yieldTask(delayMs = 0): Promise<void> {
   });
 }
 
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted)
-    throw new DOMException("Splat build cancelled", "AbortError");
-}
-
 function createFitWorker(): Worker {
   if (import.meta.env.DEV) {
     return new Worker(new URL("./volume-fit-worker.ts", import.meta.url), {
@@ -113,7 +122,7 @@ function createFitWorker(): Worker {
   return new FitWorkerInline();
 }
 
-export function classifyParamsFor(host: SplatBuildHost): ClassifyParams {
+function classifyParamsFor(host: SplatBuildHost): ClassifyParams {
   const r = host.renderer;
   const tf = new Float32Array(256 * 4);
   for (let i = 0; i < 256; i++) {
@@ -138,7 +147,7 @@ export function classifyParamsFor(host: SplatBuildHost): ClassifyParams {
 }
 
 /** Finest LOD whose fit fits in the memory budget. */
-export function chooseFitLod(metadata: VolumeMetadata, budget: number): number {
+function chooseFitLod(metadata: VolumeMetadata, budget: number): number {
   for (const level of [...metadata.levels].sort((a, b) => a.lod - b.lod)) {
     if (VolumeFitter.estimateBytes(level.dimensions) <= budget)
       return level.lod;
@@ -194,6 +203,32 @@ class FitWorker {
   }
 }
 
+/** Idle fit workers are kept this long for the next fit (tiles, channels). */
+const POOL_IDLE_MS = 5 * 60 * 1000;
+let idlePool: FitWorker[] | null = null;
+let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+function takePool(): FitWorker[] {
+  clearTimeout(idleTimer);
+  const pool = idlePool;
+  idlePool = null;
+  if (pool) return pool;
+  const n = Math.max(1, Math.min(6, (navigator.hardwareConcurrency || 4) - 2));
+  return Array.from({ length: n }, () => new FitWorker());
+}
+
+function releasePool(pool: FitWorker[]): void {
+  if (idlePool) {
+    for (const w of pool) w.terminate();
+    return;
+  }
+  idlePool = pool;
+  idleTimer = setTimeout(() => {
+    for (const w of pool) w.terminate();
+    idlePool = null;
+  }, POOL_IDLE_MS);
+}
+
 /** Stage 1: direct fit from bricks (classification parallelised over workers). */
 export async function fitVolume(
   host: SplatBuildHost,
@@ -204,16 +239,18 @@ export async function fitVolume(
     opts.fitLod ?? chooseFitLod(meta, opts.fitMemoryBytes ?? 512 * 1024 * 1024);
   const level = meta.levels.find((l) => l.lod === lod)!;
   const onProgress = opts.onProgress ?? (() => {});
+  const dims0 = host.config.dimensions;
+  // The renderer places LOD-L voxel j over LOD-0 voxels [j·2^L, (j+1)·2^L).
+  const lodScale = 2 ** lod;
   const grid = {
     dims: level.dimensions,
     normalizedSize: host.config.normalizedSize,
+    dims0,
+    lodScale,
   };
   const params = classifyParamsFor(host);
-  const nWorkers = Math.max(
-    1,
-    Math.min(6, (navigator.hardwareConcurrency || 4) - 2),
-  );
-  const pool = Array.from({ length: nWorkers }, () => new FitWorker());
+  const pool = takePool();
+  let stop = false;
   try {
     await Promise.all(
       pool.map((w) => w.call({ type: "init", id: 0, grid, params })),
@@ -222,20 +259,24 @@ export async function fitVolume(
     const merged = new VolumeFitter(grid, params);
     // Only bricks overlapping the clip box (tiles are built one clip box at
     // a time; the fitter also clips per voxel).
-    const [gx, gy, gz] = level.brickGrid;
     const clipMin = host.renderer.clipMin;
     const clipMax = host.renderer.clipMax;
-    const span = (a: number, n: number) => [
-      Math.max(0, Math.floor((clipMin[a] ?? 0) * n)),
-      Math.min(n - 1, Math.ceil((clipMax[a] ?? 1) * n) - 1),
-    ];
+    const span = (a: number, n: number) => {
+      // Clip-space extent of one brick
+      const b = (LOGICAL_BRICK_SIZE * lodScale) / dims0[a]!;
+      return [
+        Math.max(0, Math.floor((clipMin[a] ?? 0) / b)),
+        Math.min(n - 1, Math.ceil((clipMax[a] ?? 1) / b) - 1),
+      ] as const;
+    };
+    const [gx, gy, gz] = level.brickGrid;
     const [x0, x1] = span(0, gx);
     const [y0, y1] = span(1, gy);
     const [z0, z1] = span(2, gz);
     const bricks: Array<[number, number, number]> = [];
-    for (let z = z0!; z <= z1!; z++)
-      for (let y = y0!; y <= y1!; y++)
-        for (let x = x0!; x <= x1!; x++) bricks.push([x, y, z]);
+    for (let z = z0; z <= z1; z++)
+      for (let y = y0; y <= y1; y++)
+        for (let x = x0; x <= x1; x++) bricks.push([x, y, z]);
     const nch = host.renderer.numChannels;
     const visible = Array.from({ length: nch }, (_, ch) =>
       nch === 1 ? true : (host.renderer.channelColors[ch * 4 + 3] ?? 0) > 0,
@@ -245,7 +286,7 @@ export async function fitVolume(
     let next = 0;
     let rr = 0;
     const loader = async () => {
-      while (next < bricks.length) {
+      while (!stop && next < bricks.length) {
         const [bx, by, bz] = bricks[next++]!;
         throwIfAborted(opts.signal);
         if (!(await host.provider.isBrickEmpty(lod, bx, by, bz, threshold))) {
@@ -300,7 +341,9 @@ export async function fitVolume(
     });
     return cloud;
   } finally {
-    for (const w of pool) w.terminate();
+    // Loaders still running after a failure stop at their next brick.
+    stop = true;
+    releasePool(pool);
   }
 }
 
@@ -321,7 +364,7 @@ export function sphereDirections(n: number): Array<[number, number, number]> {
 }
 
 /** Orbit angles (Kiln Camera convention) that place the eye along `dir`. */
-export function orbitForDirection(
+function orbitForDirection(
   dir: [number, number, number],
   upAxis: string,
 ): { rotX: number; rotY: number } {
@@ -346,7 +389,7 @@ export function orbitForDirection(
   };
 }
 
-export async function waitForBricks(
+async function waitForBricks(
   streaming: StreamingManager,
   camera: Camera,
   canvas: HTMLCanvasElement,
@@ -368,7 +411,6 @@ export async function waitForBricks(
   }
 }
 
-/** Deterministic random rotation (row-major 3×3) from a seed. */
 /** Deterministic uniform [0, 1) generator (LCG) — reproducible view layouts. */
 function lcg(seed: number): () => number {
   let s = seed >>> 0;
@@ -378,6 +420,7 @@ function lcg(seed: number): () => number {
   };
 }
 
+/** Deterministic random rotation (row-major 3×3) from a seed. */
 function randomRotation(seed: number): number[] {
   const r = lcg(seed);
   // Uniform random unit quaternion (Shoemake)
@@ -386,54 +429,36 @@ function randomRotation(seed: number): number[] {
   const u3 = r() * 2 * Math.PI;
   const a = Math.sqrt(1 - u1);
   const b = Math.sqrt(u1);
-  const [x, y, z, w] = [
+  return quatToRot(
+    b * Math.cos(u3),
     a * Math.sin(u2),
     a * Math.cos(u2),
     b * Math.sin(u3),
-    b * Math.cos(u3),
-  ];
-  return [
-    1 - 2 * (y * y + z * z),
-    2 * (x * y - w * z),
-    2 * (x * z + w * y),
-    2 * (x * y + w * z),
-    1 - 2 * (x * x + z * z),
-    2 * (y * z - w * x),
-    2 * (x * z - w * y),
-    2 * (y * z + w * x),
-    1 - 2 * (x * x + y * y),
-  ];
+  );
 }
 
+/** Training views: rendered targets and the cameras they were taken with. */
 export interface CapturedViews {
+  /**
+   * rgba16float array texture, premultiplied, one layer per view (usage
+   * TEXTURE_BINDING | COPY_SRC)
+   */
   texture: GPUTexture;
   cameras: SplatCamera[];
   width: number;
   height: number;
-  /** radius of the bounding sphere the views were placed around */
-  radius: number;
 }
 
-/** Stage 2: render training views with Kiln's renderer (state is restored). */
-export async function captureViews(
+/**
+ * Generated training cameras around the clip box: a whole-volume orbit, a
+ * closer orbit, and close-ups aimed at random points inside.
+ */
+function planViews(
   host: SplatBuildHost,
-  opts: SplatBuildOptions = {},
-): Promise<CapturedViews> {
+  opts: SplatBuildOptions,
+): OrbitState[] {
   const n = Math.max(4, Math.min(256, opts.views ?? 96));
-  const size = Math.max(64, opts.resolution ?? 640);
-  const settle = Math.max(1, opts.settleFrames ?? 16);
-  const onProgress = opts.onProgress ?? (() => {});
-  const { renderer, camera, canvas, device } = host;
-
-  const saved = {
-    width: canvas.width,
-    height: canvas.height,
-    orbit: camera.getOrbitState(),
-    bg: Float32Array.from(renderer.background),
-    early: renderer.earlyExitAlpha,
-    wire: renderer.showWireframe,
-    axis: renderer.showAxis,
-  };
+  const { renderer, camera } = host;
   const { lo, hi } = clipToWorld(
     host.config.normalizedSize,
     renderer.clipMin,
@@ -511,7 +536,52 @@ export async function captureViews(
   };
   detail.sort((a, b) => morton(a.target) - morton(b.target));
   shots.push(...detail);
+  return shots.map(({ dir, dist, target }) => {
+    const { rotX, rotY } = orbitForDirection(dir, camera.getUpAxis());
+    return [rotX, rotY, dist, target[0], target[1], target[2]];
+  });
+}
 
+/**
+ * Stage 2: render training views with Kiln's renderer (state is restored):
+ * the generated ones, then `extraViews`.
+ */
+export function captureViews(
+  host: SplatBuildHost,
+  opts: SplatBuildOptions = {},
+): Promise<CapturedViews> {
+  return captureViewsAt(
+    host,
+    [...planViews(host, opts), ...(opts.extraViews ?? [])],
+    opts,
+  );
+}
+
+/** Render the volume from each camera into a training-target texture array. */
+export async function captureViewsAt(
+  host: SplatBuildHost,
+  orbits: readonly OrbitState[],
+  opts: SplatBuildOptions = {},
+): Promise<CapturedViews> {
+  const { renderer, camera, canvas, device } = host;
+  const shots = orbits.slice(0, device.limits.maxTextureArrayLayers);
+  const n = shots.length;
+  const size = Math.max(64, opts.resolution ?? 640);
+  const settle = Math.max(1, opts.settleFrames ?? 16);
+  const onProgress = opts.onProgress ?? (() => {});
+
+  const saved = {
+    width: canvas.width,
+    height: canvas.height,
+    orbit: camera.getOrbitState(),
+    bg: Float32Array.from(renderer.background),
+    early: renderer.earlyExitAlpha,
+    wire: renderer.showWireframe,
+    axis: renderer.showAxis,
+    step: renderer.stepScale,
+    accum: renderer.maxAccumFrames,
+    depthCue: renderer.depthCue,
+  };
   const texture = device.createTexture({
     label: "splat:train-targets",
     size: [size, size, n],
@@ -540,21 +610,18 @@ export async function captureViews(
   renderer.activateScale(1);
   renderer.background.set([0, 0, 0, 0]);
   renderer.earlyExitAlpha = 0.995;
+  // Full quality regardless of the viewer's draft settings; no depth cue
+  // (view-dependent shading the splats can't learn).
+  renderer.stepScale = 1;
+  renderer.depthCue = 0;
+  renderer.maxAccumFrames = Math.max(settle, saved.accum);
   renderer.showWireframe = false;
   renderer.showAxis = false;
   try {
     let index = 0;
     for (const shot of shots) {
       throwIfAborted(opts.signal);
-      const { rotX, rotY } = orbitForDirection(shot.dir, camera.getUpAxis());
-      camera.setOrbitState([
-        rotX,
-        rotY,
-        shot.dist,
-        shot.target[0],
-        shot.target[1],
-        shot.target[2],
-      ]);
+      camera.setOrbitState(shot);
       renderer.resetAccumulation();
       renderer.render(offscreenView, camera);
       await waitForBricks(host.streaming, camera, canvas);
@@ -594,8 +661,11 @@ export async function captureViews(
     renderer.earlyExitAlpha = saved.early;
     renderer.showWireframe = saved.wire;
     renderer.showAxis = saved.axis;
+    renderer.stepScale = saved.step;
+    renderer.maxAccumFrames = saved.accum;
+    renderer.depthCue = saved.depthCue;
   }
-  return { texture, cameras, width: size, height: size, radius };
+  return { texture, cameras, width: size, height: size };
 }
 
 // ---------------------------------------------------------------------------
@@ -636,15 +706,40 @@ export async function evaluateCloud(
 ): Promise<number> {
   const r = new SplatRasterizer(device);
   const { width: w, height: h } = views;
+  const imageBytes = w * h * 16;
   const rowBytes = Math.ceil((w * 8) / 256) * 256;
+  const targetBytes = rowBytes * h;
+  // One readback per view: splat image, volume target, intersection total.
   const staging = createBuffer(
     device,
-    "splat:eval-target",
-    rowBytes * h,
-    STORAGE_RW,
+    "splat:eval-readback",
+    imageBytes + targetBytes + 4,
+    READBACK,
   );
   const f16 = getFloat16ToFloat32Lut();
   const bg = [background[0] ?? 0, background[1] ?? 0, background[2] ?? 0];
+  const psnrOf = (data: ArrayBuffer): number | null => {
+    const m = new Uint32Array(data, imageBytes + targetBytes, 1)[0]!;
+    // Intersections overflowed: grow and render the view again.
+    if (r.reserveIntersections(m)) return null;
+    const img = new Float32Array(data, 0, w * h * 4);
+    const tgt = new Uint16Array(data, imageBytes, targetBytes / 2);
+    let se = 0;
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const p = (y * w + x) * 4;
+        const t = (y * rowBytes) / 2 + x * 4;
+        const pa = img[p + 3]!;
+        const ta = f16[tgt[t + 3]!]!;
+        for (let c = 0; c < 3; c++) {
+          const a = Math.min(1, img[p + c]! + bg[c]! * (1 - pa));
+          const b = Math.min(1, f16[tgt[t + c]!]! + bg[c]! * (1 - ta));
+          se += (a - b) * (a - b);
+        }
+      }
+    const mse = se / (w * h * 3);
+    return 10 * Math.log10(1 / Math.max(1e-10, mse));
+  };
   let psnrSum = 0;
   try {
     r.resize(w, h);
@@ -652,38 +747,17 @@ export async function evaluateCloud(
     for (let v = 0; v < views.cameras.length; v++) {
       const enc = device.createCommandEncoder();
       r.encodeForward(enc, views.cameras[v]!);
+      enc.copyBufferToBuffer(r.image, 0, staging, 0, imageBytes);
       enc.copyTextureToBuffer(
         { texture: views.texture, origin: [0, 0, v] },
-        { buffer: staging, bytesPerRow: rowBytes },
+        { buffer: staging, offset: imageBytes, bytesPerRow: rowBytes },
         [w, h, 1],
       );
+      r.copyIntersectionTotal(enc, staging, imageBytes + targetBytes);
       device.queue.submit([enc.finish()]);
-      const m = await r.intersectionTotal();
-      if (r.reserveIntersections(m)) {
-        v--;
-        continue;
-      }
-      const img = new Float32Array(
-        await readBuffer(device, r.image, 0, w * h * 16),
-      );
-      const tgt = new Uint16Array(
-        await readBuffer(device, staging, 0, rowBytes * h),
-      );
-      let se = 0;
-      for (let y = 0; y < h; y++)
-        for (let x = 0; x < w; x++) {
-          const p = (y * w + x) * 4;
-          const t = (y * rowBytes) / 2 + x * 4;
-          const pa = img[p + 3]!;
-          const ta = f16[tgt[t + 3]!]!;
-          for (let c = 0; c < 3; c++) {
-            const a = Math.min(1, img[p + c]! + bg[c]! * (1 - pa));
-            const b = Math.min(1, f16[tgt[t + c]!]! + bg[c]! * (1 - ta));
-            se += (a - b) * (a - b);
-          }
-        }
-      const mse = se / (w * h * 3);
-      psnrSum += 10 * Math.log10(1 / Math.max(1e-10, mse));
+      const psnr = await withMapped(staging, psnrOf);
+      if (psnr === null) v--;
+      else psnrSum += psnr;
     }
   } finally {
     r.destroy();

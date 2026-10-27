@@ -10,19 +10,12 @@ export interface RangeSource {
     length: number,
     signal?: AbortSignal,
   ): Promise<Uint8Array>;
-  /** Bytes fetched / requests issued so far (for stats). */
-  readonly stats: { bytes: number; requests: number };
 }
 
-export interface CacheStats {
-  /** Bytes fetched from the underlying source (cache misses only). */
-  bytes: number;
-  /** Requests issued to the underlying source. */
-  requests: number;
-  /** Page lookups served from the cache (including in-flight pages). */
-  hits: number;
-  /** Pages fetched. */
-  misses: number;
+/** A page-cached RangeSource (see cachedRangeSource). */
+export interface CachedRangeSource extends RangeSource {
+  /** Lower (or raise) the page cap, evicting least recently used pages. */
+  setMaxPages(maxPages: number): void;
 }
 
 const EMPTY = new Uint8Array(0);
@@ -37,12 +30,9 @@ export function httpRangeSource(
   opts: { fetch?: typeof fetch } = {},
 ): RangeSource {
   const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
-  const stats = { bytes: 0, requests: 0 };
   return {
-    stats,
     async read(offset, length, signal) {
       if (length <= 0) return EMPTY;
-      stats.requests++;
       const res = await doFetch(url, {
         headers: { Range: `bytes=${offset}-${offset + length - 1}` },
         signal,
@@ -66,7 +56,6 @@ export function httpRangeSource(
         );
       }
       const buf = new Uint8Array(await res.arrayBuffer());
-      stats.bytes += buf.length;
       return buf.length > length ? buf.subarray(0, length) : buf;
     },
   };
@@ -74,17 +63,12 @@ export function httpRangeSource(
 
 /** Range source over a local Blob / File. */
 export function blobRangeSource(blob: Blob): RangeSource {
-  const stats = { bytes: 0, requests: 0 };
   return {
-    stats,
     async read(offset, length) {
       if (length <= 0 || offset >= blob.size) return EMPTY;
-      stats.requests++;
-      const buf = new Uint8Array(
+      return new Uint8Array(
         await blob.slice(offset, offset + length).arrayBuffer(),
       );
-      stats.bytes += buf.length;
-      return buf;
     },
   };
 }
@@ -113,39 +97,40 @@ interface Waiter {
 export function cachedRangeSource(
   src: RangeSource,
   opts: CachedRangeSourceOptions = {},
-): RangeSource & { readonly stats: CacheStats } {
+): CachedRangeSource {
   const pageSize = opts.pageSize ?? 64 * 1024;
-  const maxPages = Math.max(1, opts.maxPages ?? 512);
+  let maxPages = Math.max(1, opts.maxPages ?? 512);
   const maxGap = opts.maxGapPages ?? 2;
   const maxRunPages = Math.max(
     1,
     Math.floor((opts.maxRequestBytes ?? 8 * 1024 * 1024) / pageSize),
   );
-  const stats: CacheStats = { bytes: 0, requests: 0, hits: 0, misses: 0 };
   const pages = new Map<number, Promise<Uint8Array>>();
   let pending = new Map<number, Waiter>();
   let flushScheduled = false;
 
-  function insert(i: number, p: Promise<Uint8Array>): void {
-    pages.set(i, p);
-    p.catch(() => {
-      if (pages.get(i) === p) pages.delete(i);
-    });
+  function evict(): void {
     while (pages.size > maxPages) {
       const oldest = pages.keys().next().value as number;
       pages.delete(oldest);
     }
   }
 
+  function insert(i: number, p: Promise<Uint8Array>): void {
+    pages.set(i, p);
+    p.catch(() => {
+      if (pages.get(i) === p) pages.delete(i);
+    });
+    evict();
+  }
+
   function getPage(i: number): Promise<Uint8Array> {
     const hit = pages.get(i);
     if (hit) {
-      stats.hits++;
       pages.delete(i);
       pages.set(i, hit);
       return hit;
     }
-    stats.misses++;
     let waiter!: Waiter;
     const p = new Promise<Uint8Array>((resolve, reject) => {
       waiter = { resolve, reject };
@@ -185,10 +170,8 @@ export function cachedRangeSource(
 
   function fetchRun(start: number, end: number, batch: Map<number, Waiter>) {
     const n = end - start + 1;
-    stats.requests++;
     src.read(start * pageSize, n * pageSize).then(
       (buf) => {
-        stats.bytes += buf.length;
         for (let i = start; i <= end; i++) {
           const lo = Math.min(buf.length, (i - start) * pageSize);
           const page = buf.subarray(lo, Math.min(buf.length, lo + pageSize));
@@ -204,7 +187,10 @@ export function cachedRangeSource(
   }
 
   return {
-    stats,
+    setMaxPages(n) {
+      maxPages = Math.max(1, n);
+      evict();
+    },
     async read(offset, length) {
       if (length <= 0) return EMPTY;
       const first = Math.floor(offset / pageSize);

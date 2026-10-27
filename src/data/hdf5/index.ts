@@ -16,8 +16,8 @@ export {
 } from "./reader.js";
 export {
   blobRangeSource,
+  type CachedRangeSource,
   type CachedRangeSourceOptions,
-  type CacheStats,
   cachedRangeSource,
   httpRangeSource,
   type RangeSource,

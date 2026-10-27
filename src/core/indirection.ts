@@ -3,20 +3,7 @@
  * for virtual volume texturing.
  */
 
-import type { DatasetConfig } from './config.js';
-
-export interface BrickLocation {
-  // Virtual position (which brick in the logical volume)
-  virtualX: number;
-  virtualY: number;
-  virtualZ: number;
-  // Atlas position (where the brick data is stored in the atlas texture)
-  atlasX: number;
-  atlasY: number;
-  atlasZ: number;
-  // Is this brick loaded?
-  loaded: boolean;
-}
+import type { DatasetConfig } from "./config.js";
 
 export class IndirectionTable {
   private device: GPUDevice;
@@ -47,8 +34,8 @@ export class IndirectionTable {
     // Using rgba8uint for exact integer slot indices (no precision loss)
     this.texture = device.createTexture({
       size: [this.gridX, this.gridY, this.gridZ],
-      format: 'rgba8uint',
-      dimension: '3d',
+      format: "rgba8uint",
+      dimension: "3d",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
 
@@ -61,9 +48,13 @@ export class IndirectionTable {
    * Coarser LODs fill (2^lod)³ cells to cover the equivalent region.
    */
   setBrick(
-    virtualX: number, virtualY: number, virtualZ: number,
-    atlasX: number, atlasY: number, atlasZ: number,
-    lod: number = 0
+    virtualX: number,
+    virtualY: number,
+    virtualZ: number,
+    atlasX: number,
+    atlasY: number,
+    atlasZ: number,
+    lod: number = 0,
   ) {
     // How many LOD 0 cells does this brick cover?
     const scale = 1 << lod; // 2^lod: 1, 2, 4, 8 for LOD 0, 1, 2, 3
@@ -113,8 +104,10 @@ export class IndirectionTable {
    * doesn't show through. Unlike clearBrick, this means "loaded but empty".
    */
   setEmpty(
-    virtualX: number, virtualY: number, virtualZ: number,
-    lod: number = 0
+    virtualX: number,
+    virtualY: number,
+    virtualZ: number,
+    lod: number = 0,
   ) {
     const scale = 1 << lod;
     const baseX = virtualX * scale;
@@ -157,10 +150,12 @@ export class IndirectionTable {
    * cells still pointing to this LOD. Optional fallback restores parent brick.
    */
   clearBrick(
-    virtualX: number, virtualY: number, virtualZ: number,
+    virtualX: number,
+    virtualY: number,
+    virtualZ: number,
     lod: number = 0,
     fallbackAtlas?: [number, number, number],
-    fallbackLod?: number
+    fallbackLod?: number,
   ) {
     const scale = 1 << lod;
     const baseX = virtualX * scale;
@@ -216,7 +211,12 @@ export class IndirectionTable {
    * Update a region of the indirection texture on the GPU
    * Used for multi-cell updates when setting/clearing coarse LOD bricks
    */
-  private updateRegionGPU(baseX: number, baseY: number, baseZ: number, size: number) {
+  private updateRegionGPU(
+    baseX: number,
+    baseY: number,
+    baseZ: number,
+    size: number,
+  ) {
     // Clamp region to grid bounds
     const endX = Math.min(baseX + size, this.gridX);
     const endY = Math.min(baseY + size, this.gridY);
@@ -230,21 +230,25 @@ export class IndirectionTable {
     // For small regions, write directly
     // For larger regions, extract the subregion into a contiguous buffer
     if (size === 1) {
-      const idx = (baseX + baseY * this.gridX + baseZ * this.gridX * this.gridY) * 4;
+      const idx =
+        (baseX + baseY * this.gridX + baseZ * this.gridX * this.gridY) * 4;
       this.device.queue.writeTexture(
         { texture: this.texture, origin: [baseX, baseY, baseZ] },
         new Uint8Array(this.data.buffer as ArrayBuffer, idx, 4),
         { bytesPerRow: 4, rowsPerImage: 1 },
-        [1, 1, 1]
+        [1, 1, 1],
       );
     } else {
       // Extract contiguous subregion
-      const regionData = new Uint8Array(actualSizeX * actualSizeY * actualSizeZ * 4);
+      const regionData = new Uint8Array(
+        actualSizeX * actualSizeY * actualSizeZ * 4,
+      );
       let writeIdx = 0;
 
       for (let z = baseZ; z < endZ; z++) {
         for (let y = baseY; y < endY; y++) {
-          const rowStart = (baseX + y * this.gridX + z * this.gridX * this.gridY) * 4;
+          const rowStart =
+            (baseX + y * this.gridX + z * this.gridX * this.gridY) * 4;
           for (let x = 0; x < actualSizeX; x++) {
             regionData[writeIdx++] = this.data[rowStart + x * 4 + 0]!;
             regionData[writeIdx++] = this.data[rowStart + x * 4 + 1]!;
@@ -258,7 +262,7 @@ export class IndirectionTable {
         { texture: this.texture, origin: [baseX, baseY, baseZ] },
         regionData as Uint8Array<ArrayBuffer>,
         { bytesPerRow: actualSizeX * 4, rowsPerImage: actualSizeY },
-        [actualSizeX, actualSizeY, actualSizeZ]
+        [actualSizeX, actualSizeY, actualSizeZ],
       );
     }
   }
@@ -271,7 +275,7 @@ export class IndirectionTable {
       { texture: this.texture },
       this.data as Uint8Array<ArrayBuffer>,
       { bytesPerRow: this.gridX * 4, rowsPerImage: this.gridY },
-      [this.gridX, this.gridY, this.gridZ]
+      [this.gridX, this.gridY, this.gridZ],
     );
   }
 }

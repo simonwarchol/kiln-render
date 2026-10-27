@@ -14,9 +14,9 @@ import {
   PHYSICAL_BRICK_SIZE,
   readDeviceMemoryGiB,
 } from "./core/config.js";
+import { type DepthCue, depthCueFor } from "./core/depth-cue.js";
 import { Renderer, type VolumeRenderMode } from "./core/renderer.js";
 import { type TFPreset, TransferFunction } from "./core/transfer-function.js";
-import { detectBest16BitFormat } from "./core/volume.js";
 import { VolumeResources } from "./core/volume-resources.js";
 import type {
   BitDepth,
@@ -25,18 +25,17 @@ import type {
 } from "./data/data-provider.js";
 import { ImarisDataProvider } from "./data/imaris-provider.js";
 import { isRemoteIms, looksLikeImsUrl } from "./data/imaris-validator.js";
-import { ShardedDataProvider } from "./data/sharded-provider.js";
-import { ZarrDataProvider } from "./data/zarr-provider.js";
-import { isRemoteZarr } from "./data/zarr-validator.js";
 import {
   cloudFromParams,
   type GaussianCloud,
+  mergeClouds,
   readPly,
   writePly,
 } from "./splat/cloud.js";
 import {
   type CapturedViews,
   captureViews,
+  captureViewsAt,
   evaluateCloud,
   fitVolume,
   type SplatBuildHost,
@@ -64,13 +63,14 @@ export interface ViewerOptions {
   windowWidth?: number;
   /** DVR density / opacity scale (0.1–10, default 1) */
   densityScale?: number;
+  /** Depth cue strength, 0 (off, default) to 1 — see {@link KilnViewer.depthCue} */
+  depthCue?: number;
   /** Isosurface threshold (0–1) */
   isoValue?: number;
-  /** Ignored — rendering is always at full canvas resolution. */
-  renderScale?: number;
   /**
    * Canvas pixels per CSS pixel (default 1). Pass `devicePixelRatio` for a
-   * sharp image on high-DPI screens; LOD selection follows the pixel count.
+   * sharp image on high-DPI screens. Data detail (LOD) is still chosen in CSS
+   * pixels, so this sharpens the rendering without fetching finer bricks.
    */
   pixelRatio?: number;
   /** LOD screen-space error threshold in pixels */
@@ -123,8 +123,6 @@ export interface ViewerState {
   windowWidth: number;
   densityScale: number;
   isoValue: number;
-  /** Always 1 — rendering is at full canvas resolution. */
-  renderScale: number;
   /** Forced stream LOD, or `null` for automatic SSE selection */
   forcedLod: number | null;
   tfPreset: TFPreset;
@@ -147,11 +145,10 @@ const ATLAS_GRID_CAP_KEY = "kiln-atlas-grid-cap";
 
 async function requestKilnDevice(adapter: GPUAdapter): Promise<GPUDevice> {
   const limits = adapter.limits;
-  // Optional: subgroups speed up the splat depth sort; timestamp-query
-  // enables GpuProfiler.
-  const features = (
-    ["subgroups", "timestamp-query"] as GPUFeatureName[]
-  ).filter((f) => adapter.features.has(f));
+  // Optional: subgroups speed up the splat depth sort.
+  const features = (["subgroups"] as GPUFeatureName[]).filter((f) =>
+    adapter.features.has(f),
+  );
   return adapter.requestDevice({
     requiredFeatures: features,
     requiredLimits: {
@@ -250,7 +247,15 @@ export interface GenerateSplatsOptions extends SplatBuildOptions {
    * own close-up views, for finer detail; `targetCount` is shared.
    */
   tileSplits?: number;
-  /** Called as each tile starts. */
+  /**
+   * Train each visible channel on its own, rendered in white, and return one
+   * cloud tagged by channel (see `GaussianCloud.channelComposite`). The
+   * display tints it with the live channel colours, so channels can be hidden
+   * or recoloured without retraining. `targetCount` is shared among the
+   * channels. Multichannel volumes only.
+   */
+  perChannel?: boolean;
+  /** Called as each build starts (channels × tiles). */
   onTile?: (index: number, count: number) => void;
 }
 
@@ -271,6 +276,14 @@ function setChannelWindowFromRange(
   const width = Math.max(0.01, Math.min(1, (w.end - w.start) / range));
   renderer.setChannelWindow(ch, center, width);
 }
+
+/** Render scale and accumulation length for draft (moving / loading) frames. */
+const DRAFT_SCALE = 0.5;
+const DRAFT_ACCUM_FRAMES = 4;
+const DRAFT_STEP_SCALE = 2;
+const FINAL_ACCUM_FRAMES = 16;
+/** Frames stay draft this long after the camera last moved (flights, wheel). */
+const DRAFT_AFTER_MOVE_MS = 150;
 
 /** Viewer currently presenting to each canvas. */
 const canvasOwner = new WeakMap<HTMLCanvasElement, KilnViewer>();
@@ -315,6 +328,9 @@ export class KilnViewer {
   private dirty = true;
   private lastCameraVersion = -1;
   private paused = false;
+  /** A rendered frame is still executing on the GPU. */
+  private gpuBusy = false;
+  private lastCameraChange = 0;
   private pixelRatio_ = 1;
 
   private constructor(
@@ -383,58 +399,33 @@ export class KilnViewer {
 
     // Data provider
     let dataProvider: DataProvider;
-    const isExternalProvider = typeof dataset !== "string";
-
-    if (isExternalProvider) {
-      dataProvider = dataset as DataProvider;
+    if (typeof dataset !== "string") {
+      dataProvider = dataset;
+    } else if (looksLikeImsUrl(dataset) && (await isRemoteIms(dataset))) {
+      dataProvider = new ImarisDataProvider(dataset);
     } else {
-      const url = dataset as string;
-      if (looksLikeImsUrl(url) && (await isRemoteIms(url))) {
-        dataProvider = new ImarisDataProvider(url);
-      } else if (await isRemoteZarr(url)) {
-        dataProvider = new ZarrDataProvider(url);
-      } else {
-        dataProvider = new ShardedDataProvider(url);
-      }
+      // Zarr / sharded support (and zarrita) loads only when a URL needs it.
+      const [{ isRemoteZarr }, { ZarrDataProvider }, { ShardedDataProvider }] =
+        await Promise.all([
+          import("./data/zarr-validator.js"),
+          import("./data/zarr-provider.js"),
+          import("./data/sharded-provider.js"),
+        ]);
+      dataProvider = (await isRemoteZarr(dataset))
+        ? new ZarrDataProvider(dataset)
+        : new ShardedDataProvider(dataset);
     }
 
-    // Metadata and texture format detection
+    // Metadata. 16-bit data lives in r16float atlases (a core, filterable
+    // format); built-in providers convert into it.
     const metadata = await dataProvider.initialize();
-    const sourceBitDepth = metadata.bitDepth;
-
-    let textureFormat: GPUTextureFormat;
-    let effectiveBitDepth = sourceBitDepth;
-
-    if (sourceBitDepth === 16) {
-      textureFormat = detectBest16BitFormat(device);
-      if (textureFormat === "r8unorm") {
-        effectiveBitDepth = 8;
-        console.warn(
-          "[Kiln] ⚠️  GPU does not support 16-bit textures (r16unorm/r16float).\n" +
-            "Downsampling to 8-bit (quality loss).",
-        );
-      }
-    } else {
-      textureFormat = "r8unorm";
-    }
-
-    if (dataProvider instanceof ZarrDataProvider) {
-      await dataProvider.setTargetFormat(
-        textureFormat as "r8unorm" | "r16float",
-      );
-    } else if (dataProvider instanceof ImarisDataProvider) {
-      await dataProvider.setTargetFormat(
-        textureFormat as "r8unorm" | "r16float",
-      );
-    } else if (!isExternalProvider) {
-      if (textureFormat !== "r16unorm" || sourceBitDepth !== 16) {
-        (dataProvider as ShardedDataProvider).setTargetFormat(
-          textureFormat as "r8unorm" | "r16float",
-        );
-      }
-    } else if ("setTargetFormat" in dataProvider) {
-      (
-        dataProvider as { setTargetFormat: (f: string) => void }
+    const effectiveBitDepth = metadata.bitDepth;
+    const textureFormat = effectiveBitDepth === 16 ? "r16float" : "r8unorm";
+    if ("setTargetFormat" in dataProvider) {
+      await (
+        dataProvider as {
+          setTargetFormat(f: typeof textureFormat): void | Promise<void>;
+        }
       ).setTargetFormat(textureFormat);
     }
 
@@ -554,6 +545,10 @@ export class KilnViewer {
       renderer.densityScale = options.densityScale;
       renderer.resetAccumulation();
     }
+    if (options.depthCue !== undefined) {
+      renderer.depthCue = Math.max(0, Math.min(1, options.depthCue));
+      renderer.resetAccumulation();
+    }
     if (options.isoValue !== undefined) {
       renderer.isoValue = options.isoValue;
       renderer.resetAccumulation();
@@ -598,7 +593,6 @@ export class KilnViewer {
       resources,
       dataProvider,
       metadata,
-      device,
       config,
       () => renderer.resetAccumulation(),
       options.pageLoadStart,
@@ -720,16 +714,38 @@ export class KilnViewer {
     const next = Math.max(0.25, Math.min(4, value || 1));
     if (next === this.pixelRatio_) return;
     this.pixelRatio_ = next;
+    this.streamingManager.pixelRatio = next;
     this.resize();
     this.streamingManager.forceUpdate(this.camera, this.canvas);
   }
 
-  /** Always 1. Setting this has no effect. */
-  get renderScale(): number {
-    return 1;
+  /**
+   * Depth cue strength, 0 (off) to 1: colour fades with distance from the
+   * camera, so structures behind others read as farther away instead of
+   * stacking up to the same brightness. Applies to the volume (across the
+   * clip box; MIP fades before taking the maximum) and the splats (across
+   * the whole volume). Splat training captures without it.
+   */
+  get depthCue(): number {
+    return this.renderer.depthCue;
   }
-  set renderScale(_value: number) {
-    // Full resolution only.
+  set depthCue(value: number) {
+    const next = Math.max(0, Math.min(1, value || 0));
+    if (next === this.renderer.depthCue) return;
+    this.renderer.depthCue = next;
+    this.renderer.resetAccumulation();
+    this.dirty = true;
+  }
+
+  /** Depth cue for the splats: across the whole volume (they aren't clipped). */
+  private splatDepthCue(): DepthCue {
+    const h = this.config.normalizedSize.map((s) => s / 2);
+    return depthCueFor(
+      this.camera.position,
+      h.map((v) => -v),
+      h,
+      this.renderer.depthCue,
+    );
   }
 
   /** Forced stream LOD (`null` = automatic SSE). 0 = finest. */
@@ -764,7 +780,6 @@ export class KilnViewer {
       windowWidth: this.renderer.windowWidth,
       densityScale: this.renderer.densityScale,
       isoValue: this.renderer.isoValue,
-      renderScale: 1,
       forcedLod: this.streamingManager.forcedLod,
       tfPreset: this.transferFunction.preset,
       tfPoints: this.transferFunction.getOpacityPoints(),
@@ -911,6 +926,8 @@ export class KilnViewer {
       clipMax: Float32Array.from(r.clipMax),
       forcedLod: this.forcedLod,
       display: this.displayMode_,
+      pixelRatio: this.streamingManager.pixelRatio,
+      colors: Float32Array.from(r.channelColors),
     };
     const mode =
       opts.renderMode ??
@@ -925,37 +942,74 @@ export class KilnViewer {
         mode === "mip" ? MIP_FIT_DENSITY : (opts.density ?? saved.density);
       this.displayMode_ = "volume";
       this.forcedLod = null; // build at screen-matched detail
+      // Captures render at their own size: detail follows capture pixels.
+      this.streamingManager.pixelRatio = 1;
       const boxes = tileBoxes(
         chooseTiles(this.config.normalizedSize, opts.tileSplits ?? 0),
         region,
       );
-      const targetCount = Math.ceil(
-        (opts.targetCount ?? 1_000_000) / boxes.length,
-      );
-      const parts: Array<GaussianCloud & { core: Box }> = [];
-      for (const [i, box] of boxes.entries()) {
-        opts.onTile?.(i, boxes.length);
-        r.clipMin.set(box.train.min);
-        r.clipMax.set(box.train.max);
-        r.resetAccumulation();
-        const cloud = await this.buildSplats({ ...opts, targetCount });
-        parts.push({ ...cloud, core: box.core });
+      // Channel slots to build one by one (null: all together, as displayed).
+      const channels: Array<number | null> = [];
+      if (opts.perChannel && r.numChannels > 1) {
+        for (let ch = 0; ch < r.numChannels; ch++)
+          if ((saved.colors[ch * 4 + 3] ?? 0) > 0) channels.push(ch);
       }
-      const first = parts[0]!;
-      if (parts.length === 1) return first;
-      const merged = mergeTileParams(parts, this.config.normalizedSize);
-      const cloud = cloudFromParams(merged.params, merged.count, {
-        worldScale: first.worldScale,
-        worldUnit: first.worldUnit,
-      });
+      if (channels.length === 0) channels.push(null);
+      const targetCount = Math.ceil(
+        (opts.targetCount ?? 1_000_000) / (boxes.length * channels.length),
+      );
+      // Caller cameras frame the whole region; a tile's cloud covers part of it.
+      const buildOpts: SplatBuildOptions =
+        boxes.length === 1
+          ? opts
+          : { ...opts, extraViews: undefined, evaluateAt: undefined };
+      const steps = boxes.length * channels.length;
+      let step = 0;
+      const built: GaussianCloud[] = [];
+      for (const ch of channels) {
+        if (ch !== null) {
+          // This channel alone, in white: colour is applied at display.
+          r.channelColors.fill(0);
+          r.channelColors.set([1, 1, 1, 1], ch * 4);
+        }
+        const parts: Array<GaussianCloud & { core: Box }> = [];
+        for (const box of boxes) {
+          opts.onTile?.(step++, steps);
+          r.clipMin.set(box.train.min);
+          r.clipMax.set(box.train.max);
+          r.resetAccumulation();
+          const cloud = await this.buildSplats({ ...buildOpts, targetCount });
+          parts.push({ ...cloud, core: box.core });
+        }
+        const first = parts[0]!;
+        let cloud: GaussianCloud = first;
+        if (parts.length > 1) {
+          const merged = mergeTileParams(parts, this.config.normalizedSize);
+          cloud = cloudFromParams(merged.params, merged.count, {
+            worldScale: first.worldScale,
+            worldUnit: first.worldUnit,
+          });
+        }
+        built.push(cloud);
+      }
+      const cloud =
+        channels[0] === null
+          ? built[0]!
+          : mergeClouds(
+              built,
+              channels as number[],
+              mode === "mip" ? "add" : "over",
+            );
       this.setSplats(cloud);
       return cloud;
     } finally {
+      r.channelColors.set(saved.colors);
       r.clipMin.set(saved.clipMin);
       r.clipMax.set(saved.clipMax);
       r.densityScale = saved.density;
       if (r.volumeRenderMode !== saved.mode) this.mode = saved.mode;
       this.forcedLod = saved.forcedLod;
+      this.streamingManager.pixelRatio = saved.pixelRatio;
       this.displayMode_ = saved.display;
       r.resetAccumulation();
       this.building = false;
@@ -972,19 +1026,23 @@ export class KilnViewer {
       this.setSplats(cloud);
       const train = opts.train !== false && cloud.count > 0;
       const nEval = cloud.count > 0 ? (opts.evaluateViews ?? 0) : 0;
+      const scoreAt = cloud.count > 0 ? (opts.evaluateAt ?? []) : [];
       this.setPaused(true);
       if (train) views = await captureViews(host, opts);
-      if (nEval > 0) {
-        evalViews = await captureViews(host, {
-          ...opts,
-          views: nEval,
-          viewSeed: 7919,
-          onProgress: (p) =>
-            opts.onProgress?.({
-              ...p,
-              label: `Held-out ${p.label.toLowerCase()}`,
-            }),
-        });
+      const evalOpts: SplatBuildOptions = {
+        ...opts,
+        views: nEval,
+        viewSeed: 7919,
+        onProgress: (p) =>
+          opts.onProgress?.({
+            ...p,
+            label: `Held-out ${p.label.toLowerCase()}`,
+          }),
+      };
+      if (scoreAt.length > 0) {
+        evalViews = await captureViewsAt(host, scoreAt, evalOpts);
+      } else if (nEval > 0) {
+        evalViews = await captureViews(host, evalOpts);
       }
       if (views) {
         cloud = await trainCloud(host, cloud, views, opts);
@@ -992,7 +1050,7 @@ export class KilnViewer {
       }
       // setSplats uploaded the cloud: evaluate that buffer.
       const params = this.splats.paramsBuffer;
-      const psnr =
+      const measured =
         evalViews && params
           ? await evaluateCloud(
               this.device,
@@ -1002,6 +1060,8 @@ export class KilnViewer {
               this.renderer.background,
             )
           : undefined;
+      // Reported only when it is a number (callers store it as one).
+      const psnr = Number.isFinite(measured) ? measured : undefined;
       opts.onProgress?.({
         stage: "done",
         fraction: 1,
@@ -1043,6 +1103,7 @@ export class KilnViewer {
       this.canvas.height = height;
       this.renderer.resize(width, height);
       this.renderer.prepareScale(1);
+      this.renderer.prepareScale(DRAFT_SCALE);
       this.dirty = true;
     }
   }
@@ -1054,8 +1115,10 @@ export class KilnViewer {
       return;
     }
 
+    const now = performance.now();
     if (this.camera.version !== this.lastCameraVersion) {
       this.lastCameraVersion = this.camera.version;
+      this.lastCameraChange = now;
       this.dirty = true;
     }
 
@@ -1068,17 +1131,40 @@ export class KilnViewer {
       this.dirty = true;
     }
 
+    // Draft frames — half resolution, short accumulation — while the camera
+    // moves or bricks stream in. A zoomed-in multichannel frame can cost
+    // hundreds of ms of GPU time at full resolution, and the stream keeps
+    // restarting accumulation.
+    const draft =
+      this.camera.isInteracting() ||
+      now - this.lastCameraChange < DRAFT_AFTER_MOVE_MS ||
+      this.streamingManager.isLoading;
+    const scale = draft ? DRAFT_SCALE : 1;
+    if (this.renderer.renderScale !== scale) {
+      this.renderer.activateScale(scale);
+      this.dirty = true;
+    }
+    this.renderer.maxAccumFrames = draft
+      ? DRAFT_ACCUM_FRAMES
+      : FINAL_ACCUM_FRAMES;
+    this.renderer.stepScale = draft ? DRAFT_STEP_SCALE : 1;
+
     // Determine if we need to render
     const volumeVisible = this.displayMode_ !== "splats";
     const needsRender =
-      this.dirty ||
-      this.camera.isInteracting() ||
-      (volumeVisible && !this.renderer.isConverged);
+      this.dirty || (volumeVisible && !this.renderer.isConverged);
 
-    if (needsRender) {
+    // At most one frame on the GPU: queued-up ray-march dispatches can't be
+    // pre-empted and stall the browser's own compositing.
+    if (needsRender && !this.gpuBusy) {
       this.dirty = false;
       this.onBeforeFrame?.();
       this.renderFrame();
+      this.gpuBusy = true;
+      const idle = () => {
+        this.gpuBusy = false;
+      };
+      this.device.queue.onSubmittedWorkDone().then(idle, idle);
     }
 
     this.rafHandle = requestAnimationFrame(() => this.frame());
@@ -1101,6 +1187,8 @@ export class KilnViewer {
         this.canvas.height,
         {
           background: bg,
+          channelColors: this.renderer.channelColors,
+          depthCue: this.splatDepthCue(),
         },
       );
       return;
@@ -1116,6 +1204,8 @@ export class KilnViewer {
         background: bg,
         splitX: Math.round(this.splitFraction_ * this.canvas.width),
         clear: false,
+        channelColors: this.renderer.channelColors,
+        depthCue: this.splatDepthCue(),
       },
     );
   }

@@ -49,7 +49,7 @@ Typical compression ratios:
 - Dense volumes (CT/MRI): 30-60% of original size
 - Sparse volumes (with empty regions): 10-30% of original size
 
-The compression is transparent to the rest of the system—bricks are decompressed before being written to the atlas texture.
+The compression is transparent to the rest of the system—bricks are decompressed (and converted to the atlas format, e.g. float16 for an `r16float` atlas) before being written to the atlas texture. Uncompressed datasets skip the worker pool; their bricks are converted on the main thread.
 
 ### OME-Zarr streaming
 

@@ -1,4 +1,4 @@
-/** Shared per-file state: sources, superblock sizes, object header reader. */
+/** Shared per-file state: metadata source, superblock sizes, object header reader. */
 
 import { Cursor } from "./cursor.js";
 import { MSG, type RawMessage } from "./messages.js";
@@ -11,8 +11,6 @@ export class Hdf5Context {
   constructor(
     /** Page-cached source for metadata. */
     readonly meta: RangeSource,
-    /** Uncached source for bulk chunk data. */
-    readonly raw: RangeSource,
     /** Base address that all file addresses are relative to. */
     readonly base: number,
     readonly sizeOfOffsets: number,

@@ -1,4 +1,4 @@
-import type { NetworkStats } from './data-provider.js';
+import type { NetworkStats } from "./data-provider.js";
 
 /**
  * Fixed-capacity rolling average over the last N samples.
@@ -18,8 +18,13 @@ export class RollingAvg {
     return this.samples.reduce((a, b) => a + b, 0) / this.samples.length;
   }
 
-  get count(): number { return this.samples.length; }
+  get count(): number {
+    return this.samples.length;
+  }
 }
+
+/** Throughput is averaged over this trailing window. */
+const WINDOW_MS = 10_000;
 
 /**
  * Tracks download volume and throughput for a data provider.
@@ -32,18 +37,32 @@ export class NetworkTracker {
   record(bytes: number, requests = 1): void {
     this.totalBytesDownloaded += bytes;
     this.requestCount += requests;
-    this.recentDownloads.push({ timestamp: performance.now(), bytes });
+    const now = performance.now();
+    this.recentDownloads.push({ timestamp: now, bytes });
+    // Prune here too (amortised: at most once per window), so the list stays
+    // bounded when nobody polls getStats().
+    if (this.recentDownloads[0]!.timestamp <= now - 2 * WINDOW_MS)
+      this.prune(now);
+  }
+
+  private prune(now: number): void {
+    const cutoff = now - WINDOW_MS;
+    this.recentDownloads = this.recentDownloads.filter(
+      (d) => d.timestamp > cutoff,
+    );
   }
 
   getStats(): NetworkStats {
     const now = performance.now();
-    const windowMs = 10_000;
-    const cutoff = now - windowMs;
-    this.recentDownloads = this.recentDownloads.filter(d => d.timestamp > cutoff);
-    const recentBytes = this.recentDownloads.reduce((sum, d) => sum + d.bytes, 0);
-    const elapsed = this.recentDownloads.length > 0
-      ? Math.max(1000, now - this.recentDownloads[0]!.timestamp)
-      : 0;
+    this.prune(now);
+    const recentBytes = this.recentDownloads.reduce(
+      (sum, d) => sum + d.bytes,
+      0,
+    );
+    const elapsed =
+      this.recentDownloads.length > 0
+        ? Math.max(1000, now - this.recentDownloads[0]!.timestamp)
+        : 0;
     return {
       totalBytesDownloaded: this.totalBytesDownloaded,
       recentBytesPerSecond: elapsed > 0 ? (recentBytes / elapsed) * 1000 : 0,

@@ -31,7 +31,7 @@ const QUALITY = {
 type Quality = keyof typeof QUALITY;
 
 function download(name: string, bytes: Uint8Array): void {
-  const blob = new Blob([bytes.slice().buffer], {
+  const blob = new Blob([bytes as Uint8Array<ArrayBuffer>], {
     type: "application/octet-stream",
   });
   const url = URL.createObjectURL(blob);

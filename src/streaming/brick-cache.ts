@@ -3,7 +3,7 @@
  * Re-uploads evicted bricks without network round-trip. Bounded by bytes.
  */
 
-import type { BrickData } from '../data/data-provider.js';
+import type { BrickData } from "../data/data-provider.js";
 
 /** Default budget: 256 MB */
 const DEFAULT_MAX_BYTES = 256 * 1024 * 1024;
@@ -36,7 +36,10 @@ export class BrickCache {
     }
 
     // Evict oldest entries until under budget
-    while (this.totalBytes + data.byteLength > this.maxBytes && this.cache.size > 0) {
+    while (
+      this.totalBytes + data.byteLength > this.maxBytes &&
+      this.cache.size > 0
+    ) {
       const oldest = this.cache.keys().next().value!;
       const oldData = this.cache.get(oldest)!;
       this.totalBytes -= oldData.byteLength;
@@ -45,6 +48,13 @@ export class BrickCache {
 
     this.cache.set(key, data);
     this.totalBytes += data.byteLength;
+  }
+
+  delete(key: string): void {
+    const existing = this.cache.get(key);
+    if (!existing) return;
+    this.totalBytes -= existing.byteLength;
+    this.cache.delete(key);
   }
 
   clear(): void {

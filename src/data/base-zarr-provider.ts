@@ -3,48 +3,30 @@
  * and brick stats. Subclassed by ZarrDataProvider (HTTP) and LocalZarrDataProvider (FS).
  */
 
-import type { Array as ZarrArray } from 'zarrita';
-import type { DataType } from 'zarrita';
-import { LOGICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE } from '../core/config.js';
+import type { DataType, Array as ZarrArray } from "zarrita";
+import { LOGICAL_BRICK_SIZE, PHYSICAL_BRICK_SIZE } from "../core/config.js";
 import type {
-  DataProvider,
-  VolumeMetadata,
-  LodLevel,
+  BitDepth,
   BrickLoadResult,
   BrickStats,
-  BitDepth,
+  DataProvider,
+  LodLevel,
   NetworkStats,
-} from './data-provider.js';
-import { UnsupportedDatasetError } from './data-provider.js';
-import { NetworkTracker } from './network-tracker.js';
-import { extractMultiscales, normalizeAxes, validateZarrSupport } from './zarr-validator.js';
+  VolumeMetadata,
+} from "./data-provider.js";
 
-/** OME-NGFF multiscales metadata (from group attributes) */
-export interface OmeMultiscales {
-  // may be string[] (v0.4) or {name,type}[] (v0.5) or absent — use normalizeAxes()
-  axes?: unknown;
-  datasets: { path: string; coordinateTransformations?: { type: string; scale?: number[] }[] }[];
-  coordinateTransformations?: { type: string; scale?: number[] }[]; // v0.4 group-level fallback
-  name?: string;
-  version?: string;
-}
+import { UnsupportedDatasetError } from "./data-provider.js";
+import { NetworkTracker } from "./network-tracker.js";
+import type { LodParams } from "./zarr-brick.js";
+import {
+  extractMultiscales,
+  normalizeAxes,
+  type OmeMultiscales,
+  packedChannelsReason,
+  validateZarrSupport,
+} from "./zarr-validator.js";
 
-/** Per-LOD scale factors and chunk parameters */
-export interface LodParams {
-  scaleX: number;
-  scaleY: number;
-  scaleZ: number;
-  actualDimX: number;
-  actualDimY: number;
-  actualDimZ: number;
-  csx: number;
-  csy: number;
-  csz: number;
-  /** Number of non-spatial prefix dims before [z, y, x] (e.g. 1 for [c, z, y, x]). */
-  shapePrefixLength: number;
-  /** Index of the channel axis within the full shape array (-1 if no channel axis). */
-  channelAxisIdx: number;
-}
+export type { LodParams } from "./zarr-brick.js";
 
 /** Detect the compression codec from zarr v2 (.zarray) or v3 (zarr.json) metadata. */
 export async function detectCompression(
@@ -61,14 +43,14 @@ export async function detectCompression(
   if (v2) {
     const c = v2.compressor;
     if (!c) return undefined;
-    return c.id === 'blosc' ? `blosc/${c.cname ?? 'lz4'}` : String(c.id);
+    return c.id === "blosc" ? `blosc/${c.cname ?? "lz4"}` : String(c.id);
   }
 
   // Zarr v3: zarr.json has a "codecs" array
   const v3 = await tryParse(`/${arrayPath}/zarr.json`);
   if (v3?.codecs) {
-    const comp = (v3.codecs as { name: string }[]).find(c =>
-      ['blosc', 'zstd', 'gzip', 'zlib', 'bz2', 'lz4'].includes(c.name)
+    const comp = (v3.codecs as { name: string }[]).find((c) =>
+      ["blosc", "zstd", "gzip", "zlib", "bz2", "lz4"].includes(c.name),
     );
     return comp?.name;
   }
@@ -90,7 +72,14 @@ export abstract class BaseZarrProvider implements DataProvider {
 
   // Abstract methods that subclasses must implement
   abstract initialize(): Promise<VolumeMetadata>;
-  abstract loadBrick(lod: number, bx: number, by: number, bz: number, channelIndex?: number, signal?: AbortSignal): Promise<BrickLoadResult | null>;
+  abstract loadBrick(
+    lod: number,
+    bx: number,
+    by: number,
+    bz: number,
+    channelIndex?: number,
+    signal?: AbortSignal,
+  ): Promise<BrickLoadResult | null>;
   abstract dispose(): void;
 
   /**
@@ -98,7 +87,7 @@ export abstract class BaseZarrProvider implements DataProvider {
    */
   getMetadata(): VolumeMetadata {
     if (!this.metadata) {
-      throw new Error('Metadata not loaded. Call initialize() first.');
+      throw new Error("Metadata not loaded. Call initialize() first.");
     }
     return this.metadata;
   }
@@ -108,7 +97,7 @@ export abstract class BaseZarrProvider implements DataProvider {
    */
   getBrickGrid(lod: number): [number, number, number] {
     const meta = this.getMetadata();
-    const level = meta.levels.find(l => l.lod === lod);
+    const level = meta.levels.find((l) => l.lod === lod);
     if (!level) {
       throw new Error(`LOD level ${lod} not found`);
     }
@@ -118,25 +107,20 @@ export abstract class BaseZarrProvider implements DataProvider {
   /**
    * Check if a brick is empty (max value below threshold)
    */
-  async isBrickEmpty(lod: number, bx: number, by: number, bz: number, maxThreshold?: number): Promise<boolean> {
-    const stats = await this.getBrickStats(lod, bx, by, bz);
-    if (!stats) return false;
-    const threshold = maxThreshold ?? 1;
-    return stats.max < threshold;
-  }
-
-  /**
-   * Get cached brick statistics
-   */
-  async getBrickStats(lod: number, bx: number, by: number, bz: number): Promise<BrickStats | null> {
+  async isBrickEmpty(
+    lod: number,
+    bx: number,
+    by: number,
+    bz: number,
+    maxThreshold?: number,
+  ): Promise<boolean> {
     const key = `${lod}:${bx}/${by}/${bz}`;
     const stats = this.brickStatsCache.get(key);
-    if (stats) {
-      // Move to end (most recently used) — Maps preserve insertion order.
-      this.brickStatsCache.delete(key);
-      this.brickStatsCache.set(key, stats);
-    }
-    return stats ?? null;
+    if (!stats) return false;
+    // Move to end (most recently used) — Maps preserve insertion order.
+    this.brickStatsCache.delete(key);
+    this.brickStatsCache.set(key, stats);
+    return stats.max < (maxThreshold ?? 1);
   }
 
   /**
@@ -156,7 +140,13 @@ export abstract class BaseZarrProvider implements DataProvider {
   /**
    * Cache brick statistics
    */
-  protected cacheBrickStats(lod: number, bx: number, by: number, bz: number, stats: BrickStats): void {
+  protected cacheBrickStats(
+    lod: number,
+    bx: number,
+    by: number,
+    bz: number,
+    stats: BrickStats,
+  ): void {
     const key = `${lod}:${bx}/${by}/${bz}`;
     const existing = this.brickStatsCache.get(key);
     if (existing) {
@@ -192,39 +182,59 @@ export abstract class BaseZarrProvider implements DataProvider {
     name: string,
   ): { metadata: VolumeMetadata; lodParams: LodParams[] } {
     // Parse OME multiscales from group attributes
-    const omeAttr = attrs['ome'] as {
-      multiscales?: OmeMultiscales[];
-      omero?: { channels?: { window?: { start: number; end: number; min: number; max: number } }[] };
-    } | undefined;
+    const omeAttr = attrs["ome"] as
+      | {
+          multiscales?: OmeMultiscales[];
+          omero?: {
+            channels?: {
+              window?: { start: number; end: number; min: number; max: number };
+            }[];
+          };
+        }
+      | undefined;
 
-    const ms = extractMultiscales(attrs) as OmeMultiscales | null;
+    const ms = extractMultiscales(attrs);
     if (!ms) {
-      throw new UnsupportedDatasetError(['No OME-NGFF multiscales metadata found']);
+      throw new UnsupportedDatasetError([
+        "No OME-NGFF multiscales metadata found",
+      ]);
     }
 
     const numScales = ms.datasets.length;
 
     // Parse axes — supports both v0.4 string arrays and v0.5 typed objects
     const axisNames = normalizeAxes(ms.axes);
-    const channelAxisIdx = axisNames.findIndex(a => a.type === 'channel');
-    const numChannels = channelAxisIdx >= 0
-      ? Math.max(1, arrays[0]!.shape[channelAxisIdx] ?? 1)
-      : 1;
+    const channelAxisIdx = axisNames.findIndex((a) => a.type === "channel");
+    const numChannels =
+      channelAxisIdx >= 0
+        ? Math.max(1, arrays[0]!.shape[channelAxisIdx] ?? 1)
+        : 1;
 
     // Safety-net validation (catches direct ?dataset= URL loads that bypassed dialog pre-check)
     const dtype = arrays[0]!.dtype;
-    const validationReasons = validateZarrSupport(ms, arrays[0]!.shape, String(dtype));
-    if (validationReasons.length > 0) throw new UnsupportedDatasetError(validationReasons);
+    const validationReasons = validateZarrSupport(
+      ms,
+      arrays[0]!.shape,
+      String(dtype),
+      arrays[0]!.chunks,
+    );
+    for (const a of arrays.slice(1)) {
+      const packed = packedChannelsReason(channelAxisIdx, a.shape, a.chunks);
+      if (packed && !validationReasons.includes(packed))
+        validationReasons.push(packed);
+    }
+    if (validationReasons.length > 0)
+      throw new UnsupportedDatasetError(validationReasons);
 
     // Determine bit depth from dtype
     const dtypeStr = String(dtype);
     let bitDepth: BitDepth;
     let isFloat = false;
-    if (dtypeStr === 'uint8' || dtypeStr === 'int8') {
+    if (dtypeStr === "uint8" || dtypeStr === "int8") {
       bitDepth = 8;
-    } else if (dtypeStr === 'uint16' || dtypeStr === 'int16') {
+    } else if (dtypeStr === "uint16" || dtypeStr === "int16") {
       bitDepth = 16;
-    } else if (dtypeStr === 'float32' || dtypeStr === 'float64') {
+    } else if (dtypeStr === "float32" || dtypeStr === "float64") {
       // Float data is normalised to [0, 65535] in the worker → 16-bit pipeline
       bitDepth = 16;
       isFloat = true;
@@ -235,9 +245,10 @@ export abstract class BaseZarrProvider implements DataProvider {
     // Compute voxel spacing from coordinateTransformations if available.
     // v0.5: per-dataset transforms; v0.4: may be at group level instead.
     let voxelSpacing: [number, number, number] | undefined;
-    const transforms = ms.datasets[0]?.coordinateTransformations ?? ms.coordinateTransformations;
+    const transforms =
+      ms.datasets[0]?.coordinateTransformations ?? ms.coordinateTransformations;
     if (transforms) {
-      const scaleTransform = transforms.find(t => t.type === 'scale');
+      const scaleTransform = transforms.find((t) => t.type === "scale");
       if (scaleTransform?.scale) {
         const s = scaleTransform.scale;
         // Zarr stores as [z, y, x], convert to [x, y, z]
@@ -254,9 +265,6 @@ export abstract class BaseZarrProvider implements DataProvider {
     ];
 
     const lodParams: LodParams[] = [];
-    // Chunk size along the channel axis per LOD — diagnostic-only (see P1
-    // below), not part of LodParams since workers don't need it.
-    const cChunkSizes: number[] = [];
     const levels: LodLevel[] = arrays.map((arr, i) => {
       const shape = arr.shape;
       const actualDimX = shape[shape.length - 1]!;
@@ -269,9 +277,6 @@ export abstract class BaseZarrProvider implements DataProvider {
 
       const chunkShape = arr.chunks;
       const shapePrefixLength = shape.length - 3;
-      cChunkSizes.push(
-        channelAxisIdx >= 0 && channelAxisIdx < shapePrefixLength ? (chunkShape[channelAxisIdx] ?? 1) : 1,
-      );
       lodParams.push({
         scaleX: actualDimX / virtualDimX,
         scaleY: actualDimY / virtualDimY,
@@ -294,7 +299,11 @@ export abstract class BaseZarrProvider implements DataProvider {
 
       return {
         lod: i,
-        dimensions: [virtualDimX, virtualDimY, virtualDimZ] as [number, number, number],
+        dimensions: [virtualDimX, virtualDimY, virtualDimZ] as [
+          number,
+          number,
+          number,
+        ],
         brickGrid,
         brickCount: brickGrid[0] * brickGrid[1] * brickGrid[2],
       };
@@ -307,7 +316,9 @@ export abstract class BaseZarrProvider implements DataProvider {
     const omeroAttr = omeAttr?.omero;
     if (Array.isArray(omeroAttr?.channels) && omeroAttr.channels.length > 0) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      channelWindows = omeroAttr.channels.map((ch: any) => ch?.window as WindowEntry | undefined);
+      channelWindows = omeroAttr.channels.map(
+        (ch: any) => ch?.window as WindowEntry | undefined,
+      );
       windowMeta = channelWindows[0];
     }
 
@@ -334,43 +345,28 @@ export abstract class BaseZarrProvider implements DataProvider {
       dataRange,
     };
 
-    // --- P1 diagnostic (zero behavior change) ---------------------------------
-    // Confirms the fetch-fanout hypothesis from the audit before any patch
-    // touches real behavior: for each LOD, estimate how many Zarr chunks one
-    // brick footprint can touch (worst case, independent of brick position),
-    // per channel. See docs/audits/kiln-render - fetch_patterns.md.
-    lodParams.forEach((p, lod) => {
-      const span = (dim: number, cs: number, scale: number) =>
-        Math.max(1, Math.min(Math.ceil(dim / cs), Math.floor(((PHYSICAL_BRICK_SIZE - 1) * scale) / cs) + 1));
-      const spanX = span(p.actualDimX, p.csx, p.scaleX);
-      const spanY = span(p.actualDimY, p.csy, p.scaleY);
-      const spanZ = span(p.actualDimZ, p.csz, p.scaleZ);
-      const fanout = spanX * spanY * spanZ;
-      console.log(
-        `[Kiln] LOD ${lod}: chunk shape ${p.csx}×${p.csy}×${p.csz}, fanout ${spanX}×${spanY}×${spanZ} ` +
-        `= ${fanout} chunks/brick/channel (×${numChannels}ch = ${fanout * numChannels} chunk fetches/brick)`,
+    // Each brick reads every chunk its footprint overlaps: small chunks make
+    // that many requests per brick.
+    const p0 = lodParams[0]!;
+    const span = (dim: number, cs: number, scale: number) =>
+      Math.max(
+        1,
+        Math.min(
+          Math.ceil(dim / cs),
+          Math.floor(((PHYSICAL_BRICK_SIZE - 1) * scale) / cs) + 1,
+        ),
       );
-      if (lod === 0 && fanout * numChannels > 16) {
-        console.warn(
-          `[Kiln] LOD 0 fanout×channels = ${fanout * numChannels} — each brick may require this many ` +
-          `chunk fetches. If load times are a problem, consider re-chunking the source dataset to ` +
-          `≥64 per axis (or Zarr v3 sharding).`,
-        );
-      }
-      // B3 (latent correctness bug): chunk-coordinate math assumes channel
-      // chunk size 1 (prefix[channelAxisIdx] = channelIndex). If a chunk packs
-      // more than one channel, this reads the wrong voxels for channels
-      // beyond the first in each chunk — silently, with no error thrown.
-      const cChunkSize = cChunkSizes[lod] ?? 1;
-      if (cChunkSize > 1) {
-        console.error(
-          `[Kiln] LOD ${lod}: channel chunk size is ${cChunkSize} (>1) — this dataset packs multiple ` +
-          `channels per chunk. Kiln's chunk-coordinate calculation assumes channel chunk size 1 and ` +
-          `will read the WRONG voxels for channels beyond the first in each chunk. Do not trust ` +
-          `rendered output for non-first channels on this dataset (known limitation, audit bug B3).`,
-        );
-      }
-    });
+    const fanout =
+      span(p0.actualDimX, p0.csx, p0.scaleX) *
+      span(p0.actualDimY, p0.csy, p0.scaleY) *
+      span(p0.actualDimZ, p0.csz, p0.scaleZ) *
+      numChannels;
+    if (fanout > 16) {
+      console.warn(
+        `[Kiln] Up to ${fanout} chunk reads per full-resolution brick (chunks ${p0.csx}×${p0.csy}×${p0.csz}` +
+          `${numChannels > 1 ? `, ${numChannels} channels` : ""}); chunks of ≥64 per axis (or Zarr v3 sharding) load faster.`,
+      );
+    }
 
     return { metadata, lodParams };
   }

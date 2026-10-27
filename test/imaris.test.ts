@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  type AxisSampling,
   axisSampling,
-  coalesceRanges,
+  clampGhost,
+  faceBit,
   overlappingChunks,
+  planBorders,
   planVirtualPyramid,
+  type Vec3,
 } from "../src/data/imaris/ims-layout.js";
 import { isHdf5Magic, looksLikeImsUrl } from "../src/data/imaris/probe.js";
 import { preValidateLocalIms } from "../src/data/imaris-validator.js";
@@ -96,7 +100,7 @@ describe("IMS virtual pyramid", () => {
     expect(t.hi).toBe(129);
   });
 
-  it("lists overlapping chunks and coalesces nearby byte ranges", () => {
+  it("lists overlapping chunks", () => {
     expect(
       overlappingChunks([63, 0, 0], [129, 66, 17], [128, 128, 16]),
     ).toEqual([
@@ -105,17 +109,73 @@ describe("IMS virtual pyramid", () => {
       [0, 0, 1],
       [1, 0, 1],
     ]);
-    const groups = coalesceRanges(
-      [
-        { address: 1000, size: 100 },
-        { address: 0, size: 500 },
-        { address: 10_000_000, size: 10 },
-      ],
-      1024,
+  });
+});
+
+describe("IMS ghost borders", () => {
+  const chunk: Vec3 = [128, 128, 16];
+  // LSP22408 level 0 brick (2, 1, 0): x interior [128, 192) + ghost 127 and
+  // 192, y [64, 128) + 63 and 128, z [0, 64) + 64.
+  const axes = (): [AxisSampling, AxisSampling, AxisSampling] => [
+    axisSampling(2, 1024, 1024, 1),
+    axisSampling(1, 1024, 1024, 1),
+    axisSampling(0, 100, 100, 1),
+  ];
+  const chunksOf = (a: [AxisSampling, AxisSampling, AxisSampling]) =>
+    overlappingChunks(
+      [a[0].lo, a[1].lo, a[2].lo],
+      [a[0].hi, a[1].hi, a[2].hi],
+      chunk,
     );
-    expect(groups).toEqual([
-      { start: 0, end: 1100, members: [1, 0] },
-      { start: 10_000_000, end: 10_000_010, members: [2] },
+
+  it("keeps every face whose border chunks are cached", () => {
+    const plan = planBorders(axes(), chunk, () => true);
+    expect(plan).toEqual({ clamped: 0, filled: [], waiting: [] });
+    expect(chunksOf(axes())).toHaveLength(2 * 2 * 5);
+  });
+
+  it("clamps faces whose border-only chunks are missing", () => {
+    const interior = (cx: number, cy: number, cz: number) =>
+      cx === 1 && cy === 0 && cz <= 3;
+    const plan = planBorders(axes(), chunk, interior);
+    // x low (chunk 0), y high (chunk 1), z high (chunk 4); x high and y low
+    // ghosts lie in interior chunks.
+    expect(plan.clamped).toBe(faceBit(0, 0) | faceBit(1, 1) | faceBit(2, 1));
+    // Edges between clamped faces aren't read at all.
+    expect(plan.filled).toEqual([]);
+    expect(plan.waiting).toEqual([
+      [0, 1, 2, 3].map((z) => [0, 0, z]),
+      [0, 1, 2, 3].map((z) => [1, 1, z]),
+      [[1, 0, 4]],
     ]);
+
+    const [sx, sy, sz] = axes();
+    const clamped: [AxisSampling, AxisSampling, AxisSampling] = [
+      clampGhost(sx, 0),
+      clampGhost(sy, 1),
+      clampGhost(sz, 1),
+    ];
+    expect(chunksOf(clamped)).toEqual([0, 1, 2, 3].map((z) => [1, 0, z]));
+    // ghost samples repeat their interior neighbours
+    expect([clamped[0].ranges[0], clamped[0].ranges[1]]).toEqual([128, 129]);
+    expect([clamped[1].ranges[130], clamped[1].ranges[131]]).toEqual([
+      127, 128,
+    ]);
+    expect(clamped[2].hi).toBe(64);
+  });
+
+  it("keeps faces when only an edge chunk between them is missing", () => {
+    // Everything cached except the x-low / z-high edge chunk, which often
+    // belongs to a diagonal neighbour that is never loaded.
+    const plan = planBorders(
+      axes(),
+      chunk,
+      (cx, cy, cz) => !(cx === 0 && cy === 0 && cz === 4),
+    );
+    expect(plan).toEqual({
+      clamped: 0,
+      filled: [[0, 0, 4]],
+      waiting: [[[0, 0, 4]]],
+    });
   });
 });

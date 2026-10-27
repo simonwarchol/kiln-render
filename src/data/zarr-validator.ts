@@ -3,15 +3,53 @@
  * Shared by dialog pre-validation and provider-level safety-net.
  */
 
-import { open, root } from "zarrita";
+import { type Group, open, type Readable, root } from "zarrita";
 import { FileSystemStore } from "./filesystem-store.js";
 import { looksLikeImsUrl } from "./imaris/probe.js";
 import { TolerantFetchStore } from "./tolerant-fetch-store.js";
 
-interface MultiscalesEntry {
-  axes?: unknown; // may be string[] (v0.4) or {name,type}[] (v0.5) or absent
-  datasets: { path: string }[];
+type CoordinateTransformations = { type: string; scale?: number[] }[];
+
+/** OME-NGFF multiscales metadata (from group attributes) */
+export interface OmeMultiscales {
+  /** string[] (v0.4), {name, type}[] (v0.5) or absent — use normalizeAxes() */
+  axes?: unknown;
+  datasets: {
+    path: string;
+    coordinateTransformations?: CoordinateTransformations;
+  }[];
+  /** v0.4 group-level fallback */
+  coordinateTransformations?: CoordinateTransformations;
+  name?: string;
   version?: string;
+}
+
+/**
+ * The multiscales group of a store: the root, or bioformats2raw's "0"
+ * sub-group. `prefix` is that group's path relative to the root ("" or "0/").
+ * @internal — zarrita types; stripped from the emitted .d.ts (stripInternal)
+ *   so `zarrita` doesn't leak into published types.
+ */
+export async function openMultiscales<S extends Readable>(
+  rootGroup: Group<S>,
+): Promise<{
+  group: Group<S>;
+  attrs: Record<string, unknown>;
+  ms: OmeMultiscales;
+  prefix: string;
+} | null> {
+  const attrs = rootGroup.attrs as Record<string, unknown>;
+  const ms = extractMultiscales(attrs);
+  if (ms) return { group: rootGroup, attrs, ms, prefix: "" };
+  try {
+    const group = await open(rootGroup.resolve("0"), { kind: "group" });
+    const subAttrs = group.attrs as Record<string, unknown>;
+    const subMs = extractMultiscales(subAttrs);
+    if (subMs) return { group, attrs: subAttrs, ms: subMs, prefix: "0/" };
+  } catch {
+    // no sub-group
+  }
+  return null;
 }
 
 /** Root metadata keys that identify a Zarr store (v2 group/array or v3 node). */
@@ -136,13 +174,13 @@ export function normalizeAxes(raw: unknown): NormalizedAxis[] {
  */
 export function extractMultiscales(
   attrs: Record<string, unknown>,
-): MultiscalesEntry | null {
+): OmeMultiscales | null {
   const omeAttr = attrs["ome"] as
-    | { multiscales?: MultiscalesEntry[] }
+    | { multiscales?: OmeMultiscales[] }
     | undefined;
   return (
     omeAttr?.multiscales?.[0] ??
-    (attrs["multiscales"] as MultiscalesEntry[] | undefined)?.[0] ??
+    (attrs["multiscales"] as OmeMultiscales[] | undefined)?.[0] ??
     null
   );
 }
@@ -150,11 +188,13 @@ export function extractMultiscales(
 /**
  * Validate whether a dataset is supported.
  * Returns a list of human-readable reasons; empty array means fully supported.
+ * `chunks` (the array's chunk shape) enables the chunk layout checks.
  */
 export function validateZarrSupport(
-  ms: MultiscalesEntry,
+  ms: OmeMultiscales,
   firstArrayShape: number[],
   dtype: string,
+  chunks?: number[],
 ): string[] {
   const reasons: string[] = [];
   const axes = normalizeAxes(ms.axes);
@@ -175,6 +215,9 @@ export function validateZarrSupport(
       `[Kiln] Multi-channel dataset has ${firstArrayShape[channelIdx]} channels — only first 6 will be rendered`,
     );
   }
+  const packed =
+    chunks && packedChannelsReason(channelIdx, firstArrayShape, chunks);
+  if (packed) reasons.push(packed);
 
   if (!["uint8", "uint16", "float32", "float64"].includes(dtype)) {
     reasons.push(
@@ -189,6 +232,22 @@ export function validateZarrSupport(
   return reasons;
 }
 
+/**
+ * Bricks read one channel per chunk: an array whose chunks span several
+ * channels (channel axis `channelIdx`) would show the wrong data.
+ */
+export function packedChannelsReason(
+  channelIdx: number,
+  shape: number[],
+  chunks: number[],
+): string | null {
+  if (channelIdx < 0 || (shape[channelIdx] ?? 1) <= 1) return null;
+  const n = chunks[channelIdx] ?? 1;
+  return n > 1
+    ? `Chunks hold ${n} channels each; only one channel per chunk is supported (re-chunk with a channel chunk size of 1)`
+    : null;
+}
+
 /** Result of probing an OME-Zarr store for support + channel count. */
 export interface ZarrProbeResult {
   /** Human-readable rejection reasons; empty means supported. */
@@ -198,49 +257,33 @@ export interface ZarrProbeResult {
 }
 
 /** Channel count from multiscales axes + array shape (defaults to 1). */
-export function countChannels(ms: MultiscalesEntry, shape: number[]): number {
+export function countChannels(ms: OmeMultiscales, shape: number[]): number {
   const axes = normalizeAxes(ms.axes);
   const channelIdx = axes.findIndex((a) => a.type === "channel");
   if (channelIdx < 0) return 1;
   return Math.max(1, shape[channelIdx] ?? 1);
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function probeZarrGroup(rootGroup: any): Promise<ZarrProbeResult> {
-  const attrs = rootGroup.attrs as Record<string, unknown>;
-
-  // Try root attrs first; fall back to bioformats2raw sub-group "0"
-  let ms = extractMultiscales(attrs);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let group: any = rootGroup;
-  if (!ms) {
-    try {
-      const subGroup = await open(rootGroup.resolve("0"), { kind: "group" });
-      ms = extractMultiscales(subGroup.attrs as Record<string, unknown>);
-      if (ms) group = subGroup;
-    } catch {
-      // sub-group doesn't exist
-    }
-  }
-
-  if (!ms) {
+async function probeZarrGroup<S extends Readable>(
+  rootGroup: Group<S>,
+): Promise<ZarrProbeResult> {
+  const found = await openMultiscales(rootGroup);
+  if (!found) {
     return {
       reasons: ["No OME-NGFF multiscales metadata found"],
       numChannels: 1,
     };
   }
-
+  const { group, ms } = found;
   const firstPath = ms.datasets[0]?.path;
   if (!firstPath) {
     return { reasons: ["Dataset has no array entries"], numChannels: 1 };
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const arr = (await open(group.resolve(firstPath), { kind: "array" })) as any;
-  const shape = arr.shape as number[];
+  const arr = await open(group.resolve(firstPath), { kind: "array" });
   return {
-    reasons: validateZarrSupport(ms, shape, String(arr.dtype)),
-    numChannels: countChannels(ms, shape),
+    reasons: validateZarrSupport(ms, arr.shape, String(arr.dtype), arr.chunks),
+    numChannels: countChannels(ms, arr.shape),
   };
 }
 

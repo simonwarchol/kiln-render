@@ -9,23 +9,21 @@ import {
   blitShader,
   buildComputeShader,
   buildSlicePlanesShader,
+  RENDER_MODE,
   wireframeShader,
 } from "../shaders/index.js";
 import { COMPUTE_UNIFORMS, SLICE_UNIFORMS } from "../shaders/uniform-layout.js";
 import { createAxis, createBox } from "../utils/geometry.js";
 import type { Camera } from "./camera.js";
-import type { DatasetConfig } from "./config.js";
+import { clipToWorld, type DatasetConfig } from "./config.js";
+import { depthCueFor } from "./depth-cue.js";
 import type { TransferFunction } from "./transfer-function.js";
 import type { VolumeResources } from "./volume-resources.js";
 
 // Volume render mode (shader-side)
-export type VolumeRenderMode =
-  | "dvr"
-  | "mip"
-  | "iso"
-  | "lod"
-  | "slice"
-  | "slice-lod";
+export type VolumeRenderMode = "dvr" | "mip" | "iso" | "slice";
+
+type ComputeMode = keyof typeof RENDER_MODE;
 
 /** pre-allocated compute/accumulation resources for one render scale */
 interface ScaleSet {
@@ -50,19 +48,12 @@ export class Renderer {
   /** Volume atlas textures, indirection table, and slot allocator */
   readonly resources: VolumeResources;
 
-  // Delegate getters for backwards compatibility
   get numChannels(): number {
     return this.resources.numChannels;
   }
   get canvas() {
     return this.resources.canvas;
   }
-  get canvases() {
-    return this.resources.canvases;
-  }
-
-  // Debug: toggle indirection on/off
-  useIndirection = true;
 
   // Show wireframe box
   showWireframe = false;
@@ -109,14 +100,35 @@ export class Renderer {
   showSliceY = true;
   showSliceZ = true;
 
-  // Compute output is always full canvas resolution.
+  // Compute output scale relative to the canvas (the viewer drops to a draft
+  // scale while the camera moves or bricks stream in).
   renderScale = 1;
+
+  /**
+   * Frames averaged before the image counts as converged (TAA). The viewer
+   * lowers it for draft frames: a zoomed multichannel frame can cost hundreds
+   * of ms of GPU time.
+   */
+  maxAccumFrames = 16;
 
   /** Premultiplied background composited behind the volume (alpha 0 = transparent). */
   readonly background = new Float32Array([0.05, 0.05, 0.05, 1]);
 
   /** DVR stops marching once accumulated alpha exceeds this. */
   earlyExitAlpha = 0.95;
+
+  /**
+   * Ray step multiplier: 1 for full quality. Draft frames use a larger step
+   * — the frame cost is mostly 3D texture reads, so halving the ray count
+   * (render scale) helps less than halving the samples per ray.
+   */
+  stepScale = 1;
+
+  /**
+   * Depth cue strength, 0 (off) to 1: colour fades with distance from the
+   * camera across the clip box (see core/depth-cue.ts).
+   */
+  depthCue = 0;
 
   // Overlay pipelines (rasterized wireframe, axis, slice)
   private wireframePipeline: GPURenderPipeline;
@@ -125,8 +137,15 @@ export class Renderer {
   private sliceBindGroup: GPUBindGroup;
   private sliceUniformBuffer: GPUBuffer;
 
-  // Compute-based pipeline
-  private computePipeline: GPUComputePipeline;
+  // Compute-based pipeline: one per render mode, specialised (pipeline
+  // overrides) for the mode and channel count. Built lazily; the ones not in
+  // use compile in the background.
+  private readonly computeLayout: GPUBindGroupLayout;
+  private readonly computeModule: GPUShaderModule;
+  private readonly computePipelines = new Map<
+    ComputeMode,
+    GPUComputePipeline
+  >();
   private blitPipeline: GPURenderPipeline;
   private computeUniformBuffer: GPUBuffer;
 
@@ -430,14 +449,57 @@ export class Renderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    // Compute pipeline
-    const computeModule = device.createShaderModule({
+    this.computeModule = device.createShaderModule({
       code: buildComputeShader(resources.atlasSize),
     });
-    this.computePipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module: computeModule, entryPoint: "main" },
+    const stage = GPUShaderStage.COMPUTE;
+    const volume = (binding: number): GPUBindGroupLayoutEntry => ({
+      binding,
+      visibility: stage,
+      texture: { sampleType: "float", viewDimension: "3d" },
     });
+    this.computeLayout = device.createBindGroupLayout({
+      label: "raymarch",
+      entries: [
+        { binding: 0, visibility: stage, buffer: { type: "uniform" } },
+        { binding: 1, visibility: stage, sampler: { type: "filtering" } },
+        volume(2),
+        { binding: 3, visibility: stage, sampler: { type: "filtering" } },
+        { binding: 4, visibility: stage, texture: { sampleType: "float" } },
+        {
+          binding: 6,
+          visibility: stage,
+          texture: { sampleType: "uint", viewDimension: "3d" },
+        },
+        {
+          binding: 7,
+          visibility: stage,
+          storageTexture: { access: "write-only", format: "rgba16float" },
+        },
+        volume(8),
+        volume(9),
+        volume(10),
+        volume(11),
+        volume(12),
+        {
+          binding: 13,
+          visibility: stage,
+          buffer: { type: "read-only-storage" },
+        },
+      ],
+    });
+    this.computePipeline("dvr");
+    for (const mode of ["mip", "iso"] as const) {
+      device
+        .createComputePipelineAsync(this.computePipelineDescriptor(mode))
+        .then((pipeline) => {
+          if (!this.computePipelines.has(mode))
+            this.computePipelines.set(mode, pipeline);
+        })
+        .catch(() => {
+          /* built synchronously on first use instead */
+        });
+    }
 
     // Blit pipeline (fullscreen quad to display compute output)
     const blitModule = device.createShaderModule({ code: blitShader });
@@ -487,16 +549,46 @@ export class Renderer {
     this.onDirty?.();
   }
 
-  /** Whether the image is stable (no further rendering will change the output) */
   private get isSliceMode(): boolean {
-    return (
-      this.volumeRenderMode === "slice" || this.volumeRenderMode === "slice-lod"
-    );
+    return this.volumeRenderMode === "slice";
   }
 
+  private computePipelineDescriptor(
+    mode: ComputeMode,
+  ): GPUComputePipelineDescriptor {
+    return {
+      label: `raymarch:${mode}`,
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.computeLayout],
+      }),
+      compute: {
+        module: this.computeModule,
+        entryPoint: "main",
+        constants: {
+          RENDER_MODE: RENDER_MODE[mode],
+          NUM_CHANNELS: this.numChannels,
+        },
+      },
+    };
+  }
+
+  private computePipeline(mode: ComputeMode): GPUComputePipeline {
+    let pipeline = this.computePipelines.get(mode);
+    if (!pipeline) {
+      pipeline = this.device.createComputePipeline(
+        this.computePipelineDescriptor(mode),
+      );
+      this.computePipelines.set(mode, pipeline);
+    }
+    return pipeline;
+  }
+
+  /** Whether the image is stable (no further rendering will change the output) */
   get isConverged(): boolean {
     return (
-      this.isSliceMode || !this.enableTAA || this.active.accumFrameCount >= 64
+      this.isSliceMode ||
+      !this.enableTAA ||
+      this.active.accumFrameCount >= this.maxAccumFrames
     );
   }
 
@@ -670,7 +762,7 @@ export class Renderer {
     if (!this.tfTexture) return;
 
     set.computeBindGroup = this.device.createBindGroup({
-      layout: this.computePipeline.getBindGroupLayout(0),
+      layout: this.computeLayout,
       entries: [
         { binding: 0, resource: { buffer: this.computeUniformBuffer } },
         { binding: 1, resource: this.volumeSampler },
@@ -687,6 +779,7 @@ export class Renderer {
         { binding: 10, resource: this.resources.atlasView(3) },
         { binding: 11, resource: this.resources.atlasView(4) },
         { binding: 12, resource: this.resources.atlasView(5) },
+        { binding: 13, resource: { buffer: this.resources.slotMax } },
       ],
     });
 
@@ -756,11 +849,6 @@ export class Renderer {
     dv.setUint32(o.sliceYEnabled, this.showSliceY ? 1 : 0, true);
     dv.setUint32(o.sliceZEnabled, this.showSliceZ ? 1 : 0, true);
     dv.setUint32(o.numChannels, this.numChannels, true);
-    dv.setUint32(
-      o.lodDebug,
-      this.volumeRenderMode === "slice-lod" ? 1 : 0,
-      true,
-    );
     d.set(this.channelColors, o.channelColors / 4);
     d.set(this.channelWindowCenter, o.channelWindowCenter / 4);
     d.set(this.channelWindowWidth, o.channelWindowWidth / 4);
@@ -780,19 +868,6 @@ export class Renderer {
     this.renderCompute(colorView, camera, this.vpScratch);
 
     this.frameIndex++;
-  }
-
-  private getRenderModeInt(): number {
-    switch (this.volumeRenderMode) {
-      case "mip":
-        return 1;
-      case "iso":
-        return 2;
-      case "lod":
-        return 3;
-      default:
-        return 0; // dvr
-    }
   }
 
   /**
@@ -845,9 +920,7 @@ export class Renderer {
     const dv = this.computeUniformView;
     d.set(this.invVPScratch, o.inverseViewProj / 4);
     d.set(camera.position, o.cameraPos / 4);
-    d[o.useIndirection / 4] = this.useIndirection ? 1.0 : 0.0;
     d.set(this.config.dimensions, o.datasetSize / 4);
-    dv.setInt32(o.renderMode, this.getRenderModeInt(), true);
     d.set(this.config.normalizedSize, o.normalizedSize / 4);
     d[o.isoValue / 4] = this.isoValue;
     d[o.screenSize / 4] = this.active.width;
@@ -861,12 +934,20 @@ export class Renderer {
     d.set(this.clipMin, o.clipMin / 4);
     d[o.densityScale / 4] = this.densityScale;
     d.set(this.clipMax, o.clipMax / 4);
-    dv.setUint32(o.numChannels, this.numChannels, true);
     d.set(this.channelColors, o.channelColors / 4);
     d.set(this.channelWindowCenter, o.channelWindowCenter / 4);
     d.set(this.channelWindowWidth, o.channelWindowWidth / 4);
     d.set(this.background, o.background / 4);
     d[o.earlyExitAlpha / 4] = this.earlyExitAlpha;
+    d[o.stepScale / 4] = this.stepScale;
+    const box = clipToWorld(
+      this.config.normalizedSize,
+      this.clipMin,
+      this.clipMax,
+    );
+    const cue = depthCueFor(camera.position, box.lo, box.hi, this.depthCue);
+    d[o.depthCueNear / 4] = cue.near;
+    d[o.depthCueScale / 4] = cue.scale;
     this.device.queue.writeBuffer(
       this.computeUniformBuffer,
       0,
@@ -878,9 +959,12 @@ export class Renderer {
     const workgroupsY = Math.ceil(this.active.height / 8);
 
     if (!this.isSliceMode) {
-      // Normal volume compute path
+      // Normal volume compute path (brick maxima first: the marcher skips by them)
+      this.resources.encodeSlotMax(encoder);
       const computePass = encoder.beginComputePass();
-      computePass.setPipeline(this.computePipeline);
+      computePass.setPipeline(
+        this.computePipeline(this.volumeRenderMode as ComputeMode),
+      );
       computePass.setBindGroup(0, this.active.computeBindGroup);
       computePass.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
       computePass.end();
@@ -907,10 +991,10 @@ export class Renderer {
         accumPass.end();
       }
 
-      // Advance accumulation state (cap at 64 — diminishing returns beyond that)
+      // Advance accumulation state (capped: diminishing returns beyond that)
       if (this.enableTAA) {
         this.active.accumIndex = (1 - this.active.accumIndex) as 0 | 1;
-        if (this.active.accumFrameCount < 64) {
+        if (this.active.accumFrameCount < this.maxAccumFrames) {
           this.active.accumFrameCount++;
         }
       }

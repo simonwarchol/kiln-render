@@ -302,7 +302,7 @@ function radixKernels(device: GPUDevice): RadixKernels {
 }
 
 /** Passes (always even) needed to sort keys with `bits` significant bits. */
-export function radixPassCount(bits: number, digitBits: number): number {
+function radixPassCount(bits: number, digitBits: number): number {
   const p = Math.ceil(Math.max(1, Math.min(32, bits)) / digitBits);
   return p % 2 === 0 ? p : p + 1;
 }
@@ -379,11 +379,6 @@ export class GpuRadixSort {
     }
     device.queue.writeBuffer(this.passParams, 0, pp);
     this.scan = new GpuScan(device, maxBlocks * radix);
-  }
-
-  /** Bits per digit of the variant in use (8 with subgroups, else 4). */
-  get digitBits(): number {
-    return this.kernels.variant.bits;
   }
 
   private id(buf: GPUBuffer): number {

@@ -67,12 +67,6 @@ fn sampleAtlasChAffine(ch: u32, voxelPos: vec3f, atlasOffset: vec3f, atlasScale:
     return sampleAtlasChTexture(ch, atlasPos);
 }
 
-// Direct atlas sampling without indirection (for debugging)
-fn sampleDirect(voxelPos: vec3f, datasetSize: vec3f) -> f32 {
-    let atlasPos = voxelPos / ATLAS_SIZE;
-    return textureSampleLevel(volumeTexture, volumeSampler, atlasPos, 0.0).r;
-}
-
 // Sample with full indirection lookup
 fn sampleWithIndirection(voxelPos: vec3f) -> f32 {
     let brickIndex = floor(voxelPos / LOGICAL_BRICK_SIZE);

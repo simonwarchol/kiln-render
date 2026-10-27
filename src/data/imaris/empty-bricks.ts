@@ -21,18 +21,7 @@ export function imsBrickIsEmpty(args: {
     by: number,
     bz: number,
   ) => ImsBrickStatsLike | null;
-  /** Per-channel HistogramMax from DataSetInfo; skip the whole volume if all are below threshold. */
-  channelHistogramMax?: number[];
 }): boolean {
-  const hist = args.channelHistogramMax;
-  if (
-    hist &&
-    hist.length > 0 &&
-    hist.every((m) => Number.isFinite(m) && m < args.threshold)
-  ) {
-    return true;
-  }
-
   const self = args.getStats(args.lod, args.bx, args.by, args.bz);
   if (self) return self.max < args.threshold;
 

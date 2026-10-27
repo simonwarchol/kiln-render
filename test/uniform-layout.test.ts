@@ -23,8 +23,8 @@ describe("COMPUTE_UNIFORMS layout", () => {
     expect(COMPUTE_UNIFORMS.offsets).toMatchObject({
       inverseViewProj: 0,
       cameraPos: 64,
-      useIndirection: 76, // scalar packed into the vec3 tail
       datasetSize: 80,
+      isoValue: 108, // scalar packed into normalizedSize's vec3 tail
       clipMin: 144,
       densityScale: 156, // scalar packed after clipMin's vec3
       channelColors: 176,
@@ -32,6 +32,9 @@ describe("COMPUTE_UNIFORMS layout", () => {
       channelWindowWidth: 304,
       background: 336,
       earlyExitAlpha: 352,
+      stepScale: 356, // fits the struct's tail padding
+      depthCueNear: 360,
+      depthCueScale: 364,
     });
   });
 
@@ -67,8 +70,8 @@ describe("WGSL alignment invariants", () => {
   // land on 16-byte boundaries.
   it("packs scalars into the vec3 tail", () => {
     expect(
-      COMPUTE_UNIFORMS.offsets.useIndirection -
-        COMPUTE_UNIFORMS.offsets.cameraPos,
+      COMPUTE_UNIFORMS.offsets.isoValue -
+        COMPUTE_UNIFORMS.offsets.normalizedSize,
     ).toBe(12);
     expect(
       COMPUTE_UNIFORMS.offsets.densityScale - COMPUTE_UNIFORMS.offsets.clipMin,

@@ -10,11 +10,6 @@ import {
 
 export { looksLikeImsUrl } from "./imaris/probe.js";
 
-export interface ImsProbeResult {
-  reasons: string[];
-  numChannels: number;
-}
-
 /**
  * Probe a remote URL for an Imaris HDF5 file.
  * Throws on network errors so callers do not silently fall back to sharded.
@@ -36,11 +31,6 @@ export async function preValidateRemoteIms(url: string): Promise<string[]> {
     ];
   }
   return [];
-}
-
-export async function probeRemoteIms(url: string): Promise<ImsProbeResult> {
-  const reasons = await preValidateRemoteIms(url);
-  return { reasons, numChannels: 1 };
 }
 
 /** Cheap pre-check on a local File — full dtype/SizeZ validation runs in the worker. */
