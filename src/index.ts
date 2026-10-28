@@ -57,7 +57,6 @@ export {
   mergeClouds,
   readPly,
   splitByChannel,
-  withChannel,
   writePly,
 } from "./splat/cloud.js";
 export type {

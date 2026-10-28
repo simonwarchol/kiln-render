@@ -349,18 +349,8 @@ export class Camera {
     this.updatePosition();
   }
 
-  /** Reset pan to center on origin */
-  resetPan(): void {
-    this.target = [0, 0, 0];
-    this.updatePosition();
-  }
-
   getUpAxis(): UpAxis {
     return this.upAxis;
-  }
-
-  getUpVector(): [number, number, number] {
-    return [...this.upVector];
   }
 
   /** Get orbital state: [rotationX, rotationY, distance, targetX, targetY, targetZ] */

@@ -77,15 +77,6 @@ export function mergeClouds(
   return merged;
 }
 
-/** Copy of `cloud` with every Gaussian in channel `slot`. */
-export function withChannel(
-  cloud: GaussianCloud,
-  slot: number,
-  composite: "over" | "add",
-): GaussianCloud {
-  return mergeClouds([cloud], [slot], composite);
-}
-
 /** The per-channel sub-clouds of a channel cloud, by channel slot. */
 export function splitByChannel(
   cloud: GaussianCloud,

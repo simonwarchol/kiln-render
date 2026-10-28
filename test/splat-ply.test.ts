@@ -5,7 +5,6 @@ import {
   readPly,
   setGaussian,
   splitByChannel,
-  withChannel,
   writePly,
 } from "../src/splat/cloud";
 import { P_CHANNEL, PARAM_STRIDE } from "../src/splat/cpu-reference";
@@ -68,10 +67,7 @@ describe("splat PLY round trip", () => {
     const b = createCloud(3);
     for (let i = 0; i < 2; i++) a.params[i * PARAM_STRIDE] = i;
     for (let i = 0; i < 3; i++) b.params[i * PARAM_STRIDE] = 10 + i;
-    const merged = mergeClouds([
-      withChannel(a, 0, "add"),
-      withChannel(b, 4, "add"),
-    ]);
+    const merged = mergeClouds([a, b], [0, 4], "add");
     expect(merged.count).toBe(5);
     expect(merged.channelComposite).toBe("add");
     const back = readPly(writePly(merged));
