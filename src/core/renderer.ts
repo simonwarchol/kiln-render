@@ -14,6 +14,7 @@ import {
 } from "../shaders/index.js";
 import { COMPUTE_UNIFORMS, SLICE_UNIFORMS } from "../shaders/uniform-layout.js";
 import { createAxis, createBox } from "../utils/geometry.js";
+import { perfCount, perfOn } from "../utils/perf-log.js";
 import type { Camera } from "./camera.js";
 import { clipToWorld, type DatasetConfig } from "./config.js";
 import { depthCueFor } from "./depth-cue.js";
@@ -583,6 +584,11 @@ export class Renderer {
     return pipeline;
   }
 
+  /** Frames accumulated into the current image (for perf logging). */
+  get accumulatedFrames(): number {
+    return this.active.accumFrameCount;
+  }
+
   /** Whether the image is stable (no further rendering will change the output) */
   get isConverged(): boolean {
     return (
@@ -599,6 +605,17 @@ export class Renderer {
    */
   setChannelColor(ch: number, r: number, g: number, b: number, a = 1.0): void {
     const base = Math.min(Math.max(0, ch), 5) * 4;
+    if (perfOn) {
+      const c = this.channelColors;
+      const same =
+        c[base] === r &&
+        c[base + 1] === g &&
+        c[base + 2] === b &&
+        c[base + 3] === a;
+      perfCount(
+        same ? "channel colour sets, unchanged" : "channel colour sets",
+      );
+    }
     this.channelColors[base] = r;
     this.channelColors[base + 1] = g;
     this.channelColors[base + 2] = b;
@@ -609,6 +626,14 @@ export class Renderer {
   /** Set the window center and width for a channel (0–5). Resets accumulation. */
   setChannelWindow(ch: number, center: number, width: number): void {
     const i = Math.min(Math.max(0, ch), 5);
+    if (perfOn) {
+      const same =
+        this.channelWindowCenter[i] === center &&
+        this.channelWindowWidth[i] === width;
+      perfCount(
+        same ? "channel window sets, unchanged" : "channel window sets",
+      );
+    }
     this.channelWindowCenter[i] = center;
     this.channelWindowWidth[i] = width;
     this.resetAccumulation();

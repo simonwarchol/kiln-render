@@ -48,6 +48,25 @@ import {
   tileBoxes,
 } from "./splat/tiles.js";
 import { StreamingManager } from "./streaming/streaming-manager.js";
+import {
+  ms,
+  perfCount,
+  perfEvent,
+  perfOn,
+  perfSample,
+} from "./utils/perf-log.js";
+
+/** A frame on the GPU, as perf logging tracks it. */
+interface PerfFrame {
+  start: number;
+  /** When the camera started moving, for its first frame. */
+  move: number | null;
+  label: string;
+  /** Full-resolution volume frame (accumulates towards convergence). */
+  final: boolean;
+  /** Frames already accumulated into the image this frame adds to. */
+  accumulated: number;
+}
 
 /** What the canvas shows: the volume, the splats, or both side by side. */
 export type DisplayMode = "volume" | "splats" | "split";
@@ -330,6 +349,12 @@ export class KilnViewer {
   private gpuBusy = false;
   private lastCameraChange = 0;
   private pixelRatio_ = 1;
+  /** Perf logging: a camera move from rest awaiting its first frame. */
+  private perfMove: number | null = null;
+  /** Perf logging: final frames since the image last restarted. */
+  private perfRun: { start: number; frames: number; gpu: number } | null = null;
+  /** Perf logging: the last splat frame's inputs. */
+  private perfSplatInputs = "";
 
   private constructor(
     device: GPUDevice,
@@ -1099,6 +1124,9 @@ export class KilnViewer {
 
     const now = performance.now();
     if (this.camera.version !== this.lastCameraVersion) {
+      if (perfOn && now - this.lastCameraChange >= DRAFT_AFTER_MOVE_MS) {
+        this.perfMove ??= now;
+      }
       this.lastCameraVersion = this.camera.version;
       this.lastCameraChange = now;
       this.dirty = true;
@@ -1141,15 +1169,84 @@ export class KilnViewer {
     if (needsRender && !this.gpuBusy) {
       this.dirty = false;
       this.onBeforeFrame?.();
+      const perf = perfOn ? this.perfFrameStart(draft) : null;
       this.renderFrame();
       this.gpuBusy = true;
       const idle = () => {
         this.gpuBusy = false;
+        if (perf) this.perfFrameDone(perf);
       };
       this.device.queue.onSubmittedWorkDone().then(idle, idle);
     }
 
     this.rafHandle = requestAnimationFrame(() => this.frame());
+  }
+
+  /** Perf logging: what a frame about to render is. */
+  private perfFrameStart(draft: boolean): PerfFrame {
+    const r = this.renderer;
+    const move = this.perfMove;
+    this.perfMove = null;
+    const splats = this.displayMode_ === "splats" && this.splatCount > 0;
+    if (splats) {
+      const inputs = [
+        this.camera.version,
+        this.canvas.width,
+        this.canvas.height,
+        this.splatLayer?.version,
+        r.depthCue,
+        ...r.channelColors,
+      ].join();
+      perfCount(
+        inputs === this.perfSplatInputs
+          ? "splat frames, inputs unchanged"
+          : "splat frames",
+      );
+      this.perfSplatInputs = inputs;
+    }
+    let shown = 0;
+    for (let ch = 0; ch < r.numChannels; ch++) {
+      if ((r.channelColors[ch * 4 + 3] ?? 0) > 0) shown++;
+    }
+    return {
+      start: performance.now(),
+      move,
+      label: splats
+        ? "splats"
+        : `${draft ? "draft" : "final"} ${r.volumeRenderMode} ×${r.renderScale} ${shown}ch`,
+      final: !splats && !draft,
+      accumulated: r.accumulatedFrames,
+    };
+  }
+
+  /**
+   * Perf logging: a frame finished on the GPU (submit to done, which also
+   * covers the browser's own GPU work queued meanwhile).
+   */
+  private perfFrameDone(f: PerfFrame): void {
+    const now = performance.now();
+    const gpu = now - f.start;
+    perfSample(`${f.label} frame GPU`, gpu);
+    if (f.move !== null) {
+      perfSample("camera move → first frame done", now - f.move);
+    }
+    // Final frames from a restart (accumulated 0) until converged.
+    if (this.perfRun && (!f.final || f.accumulated === 0)) {
+      perfCount("final images restarted before converging");
+      perfSample("GPU spent on restarted final images", this.perfRun.gpu);
+      this.perfRun = null;
+    }
+    if (!f.final) return;
+    const run = this.perfRun ?? { start: f.start, frames: 0, gpu: 0 };
+    this.perfRun = run;
+    run.frames++;
+    run.gpu += gpu;
+    if (this.renderer.isConverged) {
+      perfEvent(
+        `converged: ${run.frames} final frames, ${ms(now - run.start)} wall, ${ms(run.gpu)} GPU (${f.label}, ${this.canvas.width}×${this.canvas.height})`,
+      );
+      this.perfRun = null;
+    }
   }
 
   private renderFrame(): void {

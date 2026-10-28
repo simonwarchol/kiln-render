@@ -21,6 +21,7 @@ import type {
 } from "../data/data-provider.js";
 import { RollingAvg } from "../data/network-tracker.js";
 import { getFloat16ToFloat32Lut } from "../utils/float16.js";
+import { ms, perfCount, perfEvent, perfOn } from "../utils/perf-log.js";
 import type { AtlasSlot } from "./atlas-allocator.js";
 import { BrickCache } from "./brick-cache.js";
 
@@ -101,6 +102,15 @@ export interface StreamingStats {
   avgBrickLatencyMs: number;
 }
 
+/** What a channel backfill did (perf logging only). */
+interface BackfillStats {
+  start: number;
+  resident: number;
+  loads: number;
+  cacheHits: number;
+  skipped: number;
+}
+
 export class StreamingManager {
   private resources: VolumeResources;
   private onResetAccumulation: () => void;
@@ -165,6 +175,8 @@ export class StreamingManager {
   /** Latest reload per `ch:key`; an older one finishing late doesn't write. */
   private latestReload = new Map<string, number>();
   private reloadSeq = 0;
+  /** Backfills in progress (perf logging only). */
+  private perfBackfills = 0;
 
   // Callback for when base LOD is loaded with brick data
   private onBaseLodLoaded:
@@ -343,10 +355,20 @@ export class StreamingManager {
 
   /** Fetch a newly-visible channel into every currently resident brick. */
   private async backfillChannel(ch: number): Promise<void> {
+    const stats: BackfillStats | undefined = perfOn
+      ? {
+          start: performance.now(),
+          resident: this.loadedBricks.size,
+          loads: 0,
+          cacheHits: 0,
+          skipped: 0,
+        }
+      : undefined;
+    if (stats) this.perfBackfills++;
     const jobs: Promise<void>[] = [];
     let started = 0;
     for (const [key, info] of [...this.loadedBricks]) {
-      jobs.push(this.reloadBrickChannel(ch, key, info));
+      jobs.push(this.reloadBrickChannel(ch, key, info, stats));
       // Cache hits upload synchronously: yield between small batches rather
       // than writing every resident brick (hundreds of MB) in one task.
       if (++started % BACKFILL_BATCH === 0) {
@@ -355,6 +377,12 @@ export class StreamingManager {
       }
     }
     await Promise.all(jobs);
+    if (stats) {
+      this.perfBackfills--;
+      perfEvent(
+        `backfill slot ${ch}: ${stats.resident} resident bricks → ${stats.loads} loaded from the provider, ${stats.cacheHits} from the CPU cache, ${stats.skipped} skipped, in ${ms(performance.now() - stats.start)}`,
+      );
+    }
   }
 
   /**
@@ -393,8 +421,12 @@ export class StreamingManager {
     ch: number,
     key: string,
     info: LoadedBrickInfo,
+    stats?: BackfillStats,
   ): Promise<void> {
-    if (!this.channelEnabled[ch]) return;
+    if (!this.channelEnabled[ch]) {
+      if (stats) stats.skipped++;
+      return;
+    }
     const cacheKey = `ch${ch}:${key}`;
     const seq = ++this.reloadSeq;
     this.latestReload.set(cacheKey, seq);
@@ -419,11 +451,18 @@ export class StreamingManager {
               : null,
           );
         } catch {
+          if (stats) stats.skipped++;
           return;
         }
-        if (!result || !current()) return;
+        if (!result || !current()) {
+          if (stats) stats.skipped++;
+          return;
+        }
         this.brickCache.put(cacheKey, result.data);
         data = result.data;
+        if (stats) stats.loads++;
+      } else if (stats) {
+        stats.cacheHits++;
       }
       if (!current()) return;
       this.resources.writeBrick(info.slot, ch, data);
@@ -1653,6 +1692,9 @@ export class StreamingManager {
     if (this.resetAccumulationTimer !== null) return;
     this.resetAccumulationTimer = setTimeout(() => {
       this.resetAccumulationTimer = null;
+      if (perfOn && this.perfBackfills > 0 && !this.isLoading) {
+        perfCount("restarts from a backfill, rendered as final (not loading)");
+      }
       this.onResetAccumulation();
     }, RESET_COALESCE_MS) as unknown as number;
   }
