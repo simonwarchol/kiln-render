@@ -35,6 +35,10 @@ export function httpRangeSource(
       if (length <= 0) return EMPTY;
       const res = await doFetch(url, {
         headers: { Range: `bytes=${offset}-${offset + length - 1}` },
+        // Chrome's HTTP cache serves concurrent range requests to one URL
+        // one at a time (60 parallel reads: 8.9 s cached vs 1.7 s not).
+        // Chunks are kept on disk by the chunk fetcher (OPFS) instead.
+        cache: "no-store",
         signal,
       });
       if (res.status === 416) {
