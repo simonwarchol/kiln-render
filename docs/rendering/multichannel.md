@@ -69,7 +69,10 @@ Transfer functions are **not used** in multichannel mode. Colour is determined e
 ### Reading channel count
 
 ```typescript
-const viewer = await KilnViewer.create(canvas, 'https://example.com/multichannel.ome.zarr');
+const viewer = await KilnViewer.create(
+  canvas,
+  await openDataset('https://example.com/multichannel.ome.zarr'),
+);
 const numChannels = viewer.renderer.numChannels; // 1–6
 ```
 

@@ -19,6 +19,7 @@ import {
   KilnViewer,
   LocalZarrDataProvider,
   looksLikeImsUrl,
+  openDataset,
   queryReadPermission,
   UnsupportedDatasetError,
   type VolumeRenderMode,
@@ -323,14 +324,16 @@ async function main() {
   // scanFloatRange/scanChannelRanges can block for seconds on large base LODs).
   // The UI stats interval takes over once the viewer exists.
   document.getElementById("spinner")?.classList.add("active");
-  const viewer = await KilnViewer.create(canvas, dataset, options);
+  const provider =
+    typeof dataset === "string" ? await openDataset(dataset) : dataset;
+  const viewer = await KilnViewer.create(canvas, provider, options);
   document.getElementById("spinner")?.classList.remove("active");
 
   // Handy for debugging from the console.
   (window as unknown as { kiln: KilnViewer }).kiln = viewer;
 
   const isMultichannel = viewer.renderer.numChannels > 1;
-  const imsProvider = dataset instanceof ImarisDataProvider ? dataset : null;
+  const imsProvider = provider instanceof ImarisDataProvider ? provider : null;
   if (imsProvider && isMultichannel && urlParams.density === undefined) {
     viewer.renderer.densityScale = IMS_MULTICHANNEL_DENSITY;
     viewer.renderer.resetAccumulation();

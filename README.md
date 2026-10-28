@@ -30,7 +30,7 @@ Ships as an ES module with bundled dependencies and TypeScript types (including 
 ```
 
 ```js
-import { KilnViewer } from 'kiln-render';
+import { KilnViewer, openDataset } from 'kiln-render';
 
 const canvas = document.querySelector('canvas');
 const status = document.querySelector('#status');
@@ -38,7 +38,9 @@ const status = document.querySelector('#status');
 try {
   const viewer = await KilnViewer.create(
     canvas,
-    'https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/beechnut.ome.zarr',
+    await openDataset(
+      'https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/beechnut.ome.zarr',
+    ),
   );
   status.textContent = `rendering — mode: ${viewer.mode}`;
   window.viewer = viewer;
@@ -48,7 +50,7 @@ try {
 }
 ```
 
-`KilnViewer.create()` initialises WebGPU, sets up streaming, and starts the render loop; it rejects with a descriptive error if WebGPU is unavailable (hence the `try/catch`). See the [Quick start](docs/guide/quick-start.md) for `ViewerOptions`, viewer properties, state serialisation, and cleanup.
+`openDataset()` picks the data provider for a URL (OME-Zarr, Imaris `.ims`, or Kiln sharded binary); `KilnViewer.create()` initialises WebGPU, sets up streaming, and starts the render loop; it rejects with a descriptive error if WebGPU is unavailable (hence the `try/catch`). See the [Quick start](docs/guide/quick-start.md) for `ViewerOptions`, viewer properties, state serialisation, and cleanup.
 
 ## Splats from code
 

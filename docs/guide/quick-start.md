@@ -15,7 +15,7 @@ Kiln ships as an ES module with bundled dependencies and TypeScript types — no
 ## Basic usage
 
 ```js
-import { KilnViewer } from 'kiln-render';
+import { KilnViewer, openDataset } from 'kiln-render';
 
 const canvas = document.querySelector('canvas');
 const status = document.querySelector('#status');
@@ -23,7 +23,9 @@ const status = document.querySelector('#status');
 try {
   const viewer = await KilnViewer.create(
     canvas,
-    'https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/beechnut.ome.zarr',
+    await openDataset(
+      'https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/beechnut.ome.zarr',
+    ),
   );
   status.textContent = `rendering — mode: ${viewer.mode}`;
   window.viewer = viewer;
@@ -33,14 +35,14 @@ try {
 }
 ```
 
-`KilnViewer.create()` handles WebGPU initialisation, data provider setup, and starts the render loop. It accepts a URL string (OME-Zarr, Imaris `.ims`, or Kiln sharded binary) or a pre-constructed `DataProvider` instance.
+`openDataset()` makes the data provider for a URL (OME-Zarr, Imaris `.ims`, or Kiln sharded binary); `KilnViewer.create()` takes that or any other `DataProvider` instance, handles WebGPU initialisation, and starts the render loop. Apps that construct their own provider never load the Zarr and sharded code.
 
 ## ViewerOptions
 
 Pass an optional third argument to set the initial viewer state:
 
 ```typescript
-const viewer = await KilnViewer.create(canvas, url, {
+const viewer = await KilnViewer.create(canvas, await openDataset(url), {
   mode: 'dvr',          // 'dvr' | 'mip' | 'iso' | 'slice'
   windowCenter: 0.35,   // 0–1 (16-bit window centre)
   windowWidth: 0.55,    // 0–1 (16-bit window width)

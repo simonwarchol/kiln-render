@@ -27,11 +27,11 @@ Imaris pyramids are anisotropic (Z is only halved once it is long enough), while
 ## Usage
 
 ```typescript
-import { KilnViewer } from 'kiln-render';
+import { KilnViewer, openDataset } from 'kiln-render';
 
 const viewer = await KilnViewer.create(
   canvas,
-  'https://my-bucket.s3.amazonaws.com/scan.ims',
+  await openDataset('https://my-bucket.s3.amazonaws.com/scan.ims'),
 );
 ```
 

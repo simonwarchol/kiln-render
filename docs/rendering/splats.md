@@ -36,7 +36,7 @@ The **Gaussian splats** panel (top right):
 ## API
 
 ```ts
-const viewer = await KilnViewer.create(canvas, url);
+const viewer = await KilnViewer.create(canvas, await openDataset(url));
 
 // Fit + train with live progress
 const cloud = await viewer.generateSplats({

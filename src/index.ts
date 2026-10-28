@@ -41,6 +41,7 @@ export {
 } from "./data/local-loader.js";
 // Built-in providers
 export { LocalZarrDataProvider } from "./data/local-zarr-provider.js";
+export { openDataset } from "./data/open-dataset.js";
 export type { ZarrProbeResult } from "./data/zarr-validator.js";
 // Validation utilities
 export {

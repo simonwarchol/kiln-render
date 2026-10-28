@@ -26,12 +26,15 @@ Kiln is listed in the [OME-NGFF tools registry](https://ngff.openmicroscopy.org/
 
 ## Usage
 
-Pass the `.ome.zarr` URL directly to `KilnViewer.create()`:
+Open the `.ome.zarr` URL with `openDataset()` and pass the provider to `KilnViewer.create()`:
 
 ```typescript
-import { KilnViewer } from 'kiln-render';
+import { KilnViewer, openDataset } from 'kiln-render';
 
-const viewer = await KilnViewer.create(canvas, 'https://example.com/data/scan.ome.zarr');
+const viewer = await KilnViewer.create(
+  canvas,
+  await openDataset('https://example.com/data/scan.ome.zarr'),
+);
 ```
 
 Kiln auto-detects Zarr by probing root metadata (`zarr.json` for v3, `.zgroup`/`.zarray` for v2) rather than the URL path. Brick assembly (fetching Zarr chunks, decompressing, and re-chunking into 66³ bricks with ghost borders) runs in a Web Worker pool off the main thread.
@@ -43,7 +46,9 @@ The [OME-Zarr Open SciVis Datasets](https://registry.opendata.aws/ome-zarr-open-
 ```typescript
 const viewer = await KilnViewer.create(
   canvas,
-  'https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/beechnut.ome.zarr',
+  await openDataset(
+    'https://ome-zarr-scivis.s3.us-east-1.amazonaws.com/v0.5/96x2/beechnut.ome.zarr',
+  ),
 );
 ```
 

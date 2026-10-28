@@ -19,9 +19,32 @@ const minifyWorker = (): Plugin => ({
   },
 });
 
+/**
+ * zarrita builds its codec registry when it loads. Once bundled into the
+ * library, consumers' bundlers can't tell that call is pure, so it, and the
+ * blosc/zstd/lz4 chunks it imports lazily (~1.4 MB), reached apps that never
+ * open Zarr. Annotated, they drop it.
+ */
+const pureZarritaRegistry = (): Plugin => ({
+  name: "kiln-pure-zarrita-registry",
+  transform(code, id) {
+    if (!/[\\/]zarrita[\\/].*[\\/]codecs\.js$/.test(id)) return null;
+    const call = "= create_default_registry();";
+    if (!code.includes(call)) {
+      this.warn("zarrita's codec registry moved: its codecs ship to every app");
+      return null;
+    }
+    return {
+      code: code.replace(call, "= /* @__PURE__ */ create_default_registry();"),
+      map: null,
+    };
+  },
+});
+
 export default defineConfig({
   // Don't copy public/ assets into the library output
   publicDir: false,
+  plugins: [pureZarritaRegistry()],
   build: {
     lib: {
       entry: fileURLToPath(new URL("./src/index.ts", import.meta.url)),

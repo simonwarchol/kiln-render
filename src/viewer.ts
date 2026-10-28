@@ -23,8 +23,6 @@ import type {
   DataProvider,
   VolumeMetadata,
 } from "./data/data-provider.js";
-import { ImarisDataProvider } from "./data/imaris-provider.js";
-import { isRemoteIms, looksLikeImsUrl } from "./data/imaris-validator.js";
 import {
   cloudFromParams,
   type GaussianCloud,
@@ -378,10 +376,13 @@ export class KilnViewer {
     this.rafHandle = requestAnimationFrame(() => this.frame());
   }
 
-  /** Create a fully initialised KilnViewer from a URL or DataProvider. */
+  /**
+   * Create a fully initialised KilnViewer for a data provider (from a URL:
+   * `openDataset(url)`).
+   */
   static async create(
     canvas: HTMLCanvasElement,
-    dataset: string | DataProvider,
+    dataProvider: DataProvider,
     options: ViewerOptions = {},
   ): Promise<KilnViewer> {
     // WebGPU init
@@ -396,25 +397,6 @@ export class KilnViewer {
     const context = canvas.getContext("webgpu");
     if (!context) throw new Error("Failed to get WebGPU canvas context");
     // Configured by the constructor, once nothing can be awaited any more.
-
-    // Data provider
-    let dataProvider: DataProvider;
-    if (typeof dataset !== "string") {
-      dataProvider = dataset;
-    } else if (looksLikeImsUrl(dataset) && (await isRemoteIms(dataset))) {
-      dataProvider = new ImarisDataProvider(dataset);
-    } else {
-      // Zarr / sharded support (and zarrita) loads only when a URL needs it.
-      const [{ isRemoteZarr }, { ZarrDataProvider }, { ShardedDataProvider }] =
-        await Promise.all([
-          import("./data/zarr-validator.js"),
-          import("./data/zarr-provider.js"),
-          import("./data/sharded-provider.js"),
-        ]);
-      dataProvider = (await isRemoteZarr(dataset))
-        ? new ZarrDataProvider(dataset)
-        : new ShardedDataProvider(dataset);
-    }
 
     // Metadata. 16-bit data lives in r16float atlases (a core, filterable
     // format); built-in providers convert into it.
