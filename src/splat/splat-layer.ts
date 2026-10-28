@@ -141,8 +141,9 @@ export class SplatLayer {
   /**
    * Rasterise and composite onto `target`. With `splitX > 0`, only pixels at
    * or right of splitX are drawn (the volume stays visible on the left).
-   * `channelColors` (rgba per channel, a = shown) tint per-channel clouds;
-   * `depthCue` fades them with distance (core/depth-cue.ts).
+   * `channelColors` (rgba per channel, a = opacity, 0 = hidden) tint
+   * per-channel clouds as the volume renderer applies them; `depthCue` fades
+   * them with distance (core/depth-cue.ts).
    */
   render(
     target: GPUTextureView,
@@ -162,14 +163,7 @@ export class SplatLayer {
     r.depthCue = opts.depthCue ?? NO_DEPTH_CUE;
     if (opts.channelColors) {
       const t = r.channelTint;
-      for (let i = 0; i < t.length; i += 4) {
-        const a = opts.channelColors[i + 3] ?? 0;
-        // Volume rendering weights a channel's colour by its alpha.
-        t[i] = (opts.channelColors[i] ?? 0) * a;
-        t[i + 1] = (opts.channelColors[i + 1] ?? 0) * a;
-        t[i + 2] = (opts.channelColors[i + 2] ?? 0) * a;
-        t[i + 3] = a;
-      }
+      for (let i = 0; i < t.length; i++) t[i] = opts.channelColors[i] ?? 0;
     }
     const encoder = this.device.createCommandEncoder({ label: "splat:frame" });
     if (this.count > 0) {

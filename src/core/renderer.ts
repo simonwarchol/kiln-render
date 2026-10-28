@@ -194,7 +194,7 @@ export class Renderer {
 
   private readonly config: DatasetConfig;
 
-  // Per-channel display colors: RGBA (rgb = hue, a = intensity weight).
+  // Per-channel display colors: RGBA (rgb = hue, a = opacity, see setChannelColor).
   // Defaults for ch0–5: RGB primaries then secondaries.
   readonly channelColors = new Float32Array([
     1,
@@ -592,7 +592,11 @@ export class Renderer {
     );
   }
 
-  /** Set the display color and intensity weight for a channel (0–5). Resets accumulation. */
+  /**
+   * Set the display color and opacity for a channel (0–5): volume rendering
+   * scales the channel's density by `a`, MIP its colour; 0 hides it. Resets
+   * accumulation.
+   */
   setChannelColor(ch: number, r: number, g: number, b: number, a = 1.0): void {
     const base = Math.min(Math.max(0, ch), 5) * 4;
     this.channelColors[base] = r;

@@ -278,12 +278,12 @@ export class VolumeFitter {
           let dens = 0;
           if (multi) {
             for (let k = 0; k < nv; k++) {
-              const d = luts[k]![data[k]![idx]!]!;
+              // Opacity (alpha) scales the density, as in dvr.wgsl.
+              const d = luts[k]![data[k]![idx]!]! * ca[k]!;
               if (d <= 0) continue;
-              const a = ca[k]!;
-              r += d * cr[k]! * a;
-              g += d * cg[k]! * a;
-              b += d * cb[k]! * a;
+              r += d * cr[k]!;
+              g += d * cg[k]!;
+              b += d * cb[k]!;
               if (d > dens) dens = d;
             }
             if (dens <= 0.01) continue;

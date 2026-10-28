@@ -10,11 +10,12 @@ fn rayMarchDVR(
     let windowCenter = uniforms.windowCenter;
     let windowWidth = uniforms.windowWidth;
 
-    // precompute per-channel windowing constants and premultiplied colours,
-    // plus a bitmask of the visible channels (alpha > 0)
+    // precompute per-channel windowing constants, colours and opacities
+    // (colour alpha), plus a bitmask of the visible channels (alpha > 0)
     var chLower: array<f32, 6>;
     var chInvWidth: array<f32, 6>;
     var chColor: array<vec3f, 6>;
+    var chOpacity: array<f32, 6>;
     var visible = 0u;
     if (NUM_CHANNELS > 1u) {
         for (var ch = 0u; ch < NUM_CHANNELS; ch++) {
@@ -22,7 +23,8 @@ fn rayMarchDVR(
             chLower[ch] = chWindowCenter(ch) - ww * 0.5;
             chInvWidth[ch] = 1.0 / ww;
             let c = uniforms.channelColors[ch];
-            chColor[ch] = c.rgb * c.a;
+            chColor[ch] = c.rgb;
+            chOpacity[ch] = c.a;
             if (c.a > 0.0) { visible |= 1u << ch; }
         }
     }
@@ -56,7 +58,7 @@ fn rayMarchDVR(
                     let d = clamp((brickMax(brick.slot, ch, floatInvRange) - chLower[ch]) * chInvWidth[ch], 0.0, 1.0);
                     if (d > 0.0) {
                         mask |= 1u << ch;
-                        peak = max(peak, d);
+                        peak = max(peak, d * chOpacity[ch]);
                     }
                 }
             } else {
@@ -88,7 +90,9 @@ fn rayMarchDVR(
             let fade = depthFade(tSample);
 
             if (NUM_CHANNELS > 1u) {
-                // Multi-channel: per-channel windowing + additive composite
+                // Multi-channel: per-channel windowing + additive composite.
+                // A channel's opacity scales its density: what it absorbs and
+                // its share of the emitted colour.
                 var weightedColor = vec3f(0.0);
                 var maxDensity = 0.0;
                 for (var ch = 0u; ch < NUM_CHANNELS; ch++) {
@@ -97,7 +101,7 @@ fn rayMarchDVR(
                     // Normalise raw float range to [0,1] BEFORE per-channel
                     // windowing (identity for uint data).
                     let norm = clamp((raw - uniforms.floatMin) * floatInvRange, 0.0, 1.0);
-                    let density = clamp((norm - chLower[ch]) * chInvWidth[ch], 0.0, 1.0);
+                    let density = clamp((norm - chLower[ch]) * chInvWidth[ch], 0.0, 1.0) * chOpacity[ch];
                     weightedColor += density * chColor[ch];
                     maxDensity = max(maxDensity, density);
                 }

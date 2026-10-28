@@ -62,7 +62,10 @@ struct Camera {
    * combines them.
    */
   channelMode: u32,
-  /** Per-channel colour (rgb) and visibility (a) */
+  /**
+   * Per-channel colour (rgb) and opacity (a, 0 = hidden), as the volume
+   * renderer's channel colours: mode 1 scales absorption by it, mode 2 colour.
+   */
   channelTint: array<vec4f, ${MAX_SPLAT_CHANNELS}>,
   /** Depth cue (core/depth-cue.ts): colour × exp(−scale · max(0, d − near)) */
   depthCueNear: f32,
@@ -188,8 +191,15 @@ fn project(
   if (camera.channelMode != 0u) {
     ch = min(u32(max(params[g * PARAM_STRIDE + ${P_CHANNEL}u], 0.0)), ${MAX_SPLAT_CHANNELS - 1}u);
     let tint = camera.channelTint[ch];
-    p.color *= tint.rgb;
-    p.visible = p.visible && tint.a > 0.0;
+    if (camera.channelMode == 1u) {
+      // Opacity scales the channel's extinction, as in volume rendering:
+      // each Gaussian keeps its colour and lets through T^a of the light.
+      p.color *= tint.rgb;
+      p.opacity = 1.0 - pow(1.0 - p.opacity, tint.a);
+    } else {
+      p.color *= tint.rgb * tint.a;
+    }
+    p.visible = p.visible && tint.a > 0.0 && p.opacity >= ALPHA_MIN;
   }
   let o = g * ${PROJ_VEC4S}u;
   // Zero half-extents mark a culled Gaussian.
