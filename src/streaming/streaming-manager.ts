@@ -669,18 +669,27 @@ export class StreamingManager {
           return;
         }
 
-        // Load channels in parallel — gated by channel-job semaphore
+        // Load shown channels in parallel — gated by channel-job semaphore.
+        // Hidden ones are skipped; the backfill fills them in when shown.
         const tFetch = performance.now();
+        const requested = Array.from(
+          { length: numChannels },
+          (_, ch) => this.channelEnabled[ch] === true,
+        );
         const channelResults = await Promise.all(
-          Array.from({ length: numChannels }, (_, ch) =>
-            this.withChannelJob(() =>
-              this.dataProvider.loadBrick(maxLod, bx, by, bz, ch),
-            ),
+          requested.map((want, ch) =>
+            want
+              ? this.withChannelJob(() =>
+                  this.dataProvider.loadBrick(maxLod, bx, by, bz, ch),
+                )
+              : null,
           ),
         );
         sumFetchMs += performance.now() - tFetch;
 
-        if (!channelResults[0]) return; // ch0 mandatory; skip brick entirely if it failed
+        // Skip the brick (retried below) if no requested channel loaded. With
+        // every channel hidden it is still made resident, for the backfill.
+        if (requested.some(Boolean) && !channelResults.some(Boolean)) return;
 
         // Accumulate per-channel stats for range derivation
         for (let ch = 0; ch < numChannels; ch++) {
@@ -746,16 +755,25 @@ export class StreamingManager {
         });
         this.resources.allocator.pin(result.slotIndex);
 
-        this.loadedBricks.set(key, {
+        const info: LoadedBrickInfo = {
           slot: result.slot,
           slotIndex: result.slotIndex,
           lod: maxLod,
           bx,
           by,
           bz,
-        });
+        };
+        this.loadedBricks.set(key, info);
         this.pinnedBricks.add(key);
-        allBrickData.push(channelResults[0].data);
+        // Shown since it was skipped: its backfill ran before this brick was
+        // resident.
+        for (let ch = 0; ch < numChannels; ch++) {
+          if (!requested[ch] && this.channelEnabled[ch]) {
+            void this.reloadBrickChannel(ch, key, info);
+          }
+        }
+        const firstLoaded = channelResults.find(Boolean);
+        if (firstLoaded) allBrickData.push(firstLoaded.data);
         brickCount++;
 
         if (firstBrickMs === null) {
@@ -782,7 +800,7 @@ export class StreamingManager {
       }),
     );
 
-    // Retry any bricks that failed (ch0 network error)
+    // Retry bricks none of whose shown channels loaded (network errors)
     const failed = bricks.filter(
       (b) => !this.loadedBricks.has(b.key) && !this.emptyBricks.has(b.key),
     );
