@@ -78,6 +78,12 @@ const LOCAL_CHUNK_BUDGET = 64 * 1024 * 1024;
 /** Metadata page cache: generous while chunk indexes load, small after. */
 const META_PAGES = 8192; // × 16 KB
 const META_PAGES_AFTER_INDEX = 256;
+/**
+ * Metadata reads (mostly chunk-index nodes, scattered 16 KB pages) running
+ * at once while chunks are being fetched: browsers allow ~6 connections per
+ * host, and a level's index can be hundreds of reads per channel.
+ */
+const META_READS_WHILE_FETCHING = 2;
 /** Clamped brick channels watched for their missing chunks (oldest dropped). */
 const MAX_CLAMPED = 65_536;
 /** Stale-brick reports are batched over this long. */
@@ -197,6 +203,11 @@ export class ImarisDataProvider implements DataProvider {
   private sourceLevels: SourceLevel[] = [];
   private readonly brickStatsCache = new Map<string, BrickStats>();
   private readonly datasetIndex = new Map<string, Promise<DatasetIndex>>();
+  /** Chunk indexes being read (the metadata page cache is large meanwhile). */
+  private indexReads = 0;
+  /** Metadata reads in flight, and those waiting for chunk reads to ease. */
+  private metaReads = 0;
+  private readonly metaWaiting: Array<() => void> = [];
   private format: "f16" | "u8" = "f16";
   private workers: Worker[] = [];
   private fetcher: ChunkFetcher | null = null;
@@ -270,10 +281,39 @@ export class ImarisDataProvider implements DataProvider {
     };
   }
 
+  /**
+   * `src` for metadata reads, which yield to chunk reads: while the chunk
+   * fetcher is busy, at most META_READS_WHILE_FETCHING run at once.
+   */
+  private yieldingToChunks(src: RangeSource): RangeSource {
+    return {
+      read: async (offset, length, signal) => {
+        while (
+          this.fetcher?.busy &&
+          this.metaReads >= META_READS_WHILE_FETCHING
+        ) {
+          await new Promise<void>((go) => this.metaWaiting.push(go));
+        }
+        this.metaReads++;
+        try {
+          return await src.read(offset, length, signal);
+        } finally {
+          this.metaReads--;
+          this.metaWaiting.shift()?.();
+        }
+      },
+    };
+  }
+
+  /** Chunk reads are done for now: waiting metadata reads may all start. */
+  private chunksIdle(): void {
+    for (const go of this.metaWaiting.splice(0)) go();
+  }
+
   async initialize(): Promise<VolumeMetadata> {
     if (this.metadata) return this.metadata;
     const raw = this.rangeSource();
-    const meta = cachedRangeSource(raw, {
+    const meta = cachedRangeSource(this.yieldingToChunks(raw), {
       pageSize: 16 * 1024,
       maxPages: META_PAGES,
     });
@@ -481,8 +521,8 @@ export class ImarisDataProvider implements DataProvider {
 
     // The coarsest level's chunk index now: the base layer needs it first,
     // and an unreadable index fails here rather than on every brick.
-    // Workers, the chunk fetcher and the other indexes wait for the first
-    // brick (start()), so a metadata-only open stays cheap.
+    // Workers and the chunk fetcher wait for the first brick (start()), and
+    // other levels' indexes for their first brick, so opening stays cheap.
     const coarse = this.pyramid[this.pyramid.length - 1]!.source;
     await Promise.all(
       this.activeChannels.map((c) => this.openDataset(coarse, c)),
@@ -490,7 +530,7 @@ export class ImarisDataProvider implements DataProvider {
     return this.metadata;
   }
 
-  /** Workers, chunk fetcher and index prefetch, on the first brick load. */
+  /** Workers and the chunk fetcher, on the first brick load. */
   private start(): void {
     if (this.fetcher || !this.raw) return;
     // Decoding keeps up with a remote link on a few workers; more only add
@@ -513,6 +553,7 @@ export class ImarisDataProvider implements DataProvider {
           : undefined,
       onFetched: (bytes, requests) => this.tracker.record(bytes, requests),
       onCached: (address) => this.chunkCached(address),
+      onIdle: () => this.chunksIdle(),
     });
     const chunkBudget = Math.min(WORKER_CHUNK_BUDGET, DECODED_CHUNK_BUDGET / n);
     for (let i = 0; i < n; i++) {
@@ -525,27 +566,6 @@ export class ImarisDataProvider implements DataProvider {
       this.load.push(0);
       this.ownerMirror.push(new ByteLru(chunkBudget * 0.9, (b) => b));
     }
-    this.prefetchIndexes(this.activeChannels);
-  }
-
-  /**
-   * Open chunk indexes for `channels` at every level in the background,
-   * coarse to fine, so a first zoom doesn't wait on B-tree reads queued
-   * behind chunk downloads. Then shrink the metadata page cache: once the
-   * indexes are built, its pages are not read again.
-   */
-  private prefetchIndexes(channels: readonly number[]): void {
-    const file = this.file;
-    const levels = [...new Set(this.pyramid.map((l) => l.source))].reverse();
-    void (async () => {
-      for (const level of levels) {
-        if (this.file !== file) return; // disposed
-        await Promise.all(
-          channels.map((c) => this.openDataset(level, c).catch(() => null)),
-        );
-      }
-      if (this.file === file) this.meta?.setMaxPages(META_PAGES_AFTER_INDEX);
-    })();
   }
 
   private onWorkerMessage(msg: ImsBrickResponse | ImsExtractResponse): void {
@@ -637,6 +657,9 @@ export class ImarisDataProvider implements DataProvider {
     const key = `${level}:${channel}`;
     let p = this.datasetIndex.get(key);
     if (!p) {
+      // Index pages are read once: the page cache is large only while
+      // indexes load.
+      if (this.indexReads++ === 0) this.meta?.setMaxPages(META_PAGES);
       p = (async () => {
         const file = this.file!;
         const ds = await file.get(
@@ -678,7 +701,11 @@ export class ImarisDataProvider implements DataProvider {
           }
         }
         return idx;
-      })();
+      })().finally(() => {
+        if (--this.indexReads === 0) {
+          this.meta?.setMaxPages(META_PAGES_AFTER_INDEX);
+        }
+      });
       p.catch(() => this.datasetIndex.delete(key));
       this.datasetIndex.set(key, p);
     }

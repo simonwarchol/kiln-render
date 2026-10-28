@@ -44,6 +44,8 @@ export interface ChunkFetcherOptions {
   onFetched?: (bytes: number, requests: number) => void;
   /** Called when a chunk's bytes arrive (from the network or OPFS). */
   onCached?: (address: number) => void;
+  /** Called when the last network read ends with nothing left to read. */
+  onIdle?: () => void;
 }
 
 interface Entry {
@@ -89,6 +91,7 @@ export class ChunkFetcher {
   private readonly maxRequest: number;
   private readonly onFetched?: (bytes: number, requests: number) => void;
   private readonly onCached?: (address: number) => void;
+  private readonly onIdle?: () => void;
 
   /** `source` should retry transient failures (the provider's does). */
   constructor(
@@ -104,6 +107,7 @@ export class ChunkFetcher {
     this.maxRequest = opts.maxRequestBytes ?? 2 * 1024 * 1024;
     this.onFetched = opts.onFetched;
     this.onCached = opts.onCached;
+    this.onIdle = opts.onIdle;
     this.store =
       opts.persistKey && OpfsChunkStore.supported()
         ? new OpfsChunkStore(opts.persistKey)
@@ -182,6 +186,11 @@ export class ChunkFetcher {
     return this.lru.has(address) || !!this.store?.has(address, size);
   }
 
+  /** Network reads are running or waiting to start. */
+  get busy(): boolean {
+    return this.active > 0 || this.pending.length > 0;
+  }
+
   private enqueue(e: Entry): void {
     if (this.disposed) {
       e.reject(abortError());
@@ -201,7 +210,10 @@ export class ChunkFetcher {
   private pump(): void {
     while (this.active < this.maxConcurrent) {
       const group = this.nextGroup();
-      if (!group) return;
+      if (!group) {
+        if (this.active === 0) this.onIdle?.();
+        return;
+      }
       this.active++;
       void this.read(group).finally(() => {
         this.active--;
