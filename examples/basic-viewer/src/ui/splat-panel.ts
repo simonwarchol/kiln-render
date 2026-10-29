@@ -230,13 +230,18 @@ export class SplatPanel {
         evaluateViews: q.evaluate,
         signal: this.abort.signal,
         onProgress: (p) => {
-          const stageBase = { fit: 0, capture: 0.25, train: 0.45, done: 1 }[
-            p.stage
-          ];
+          const stageBase = {
+            fit: 0,
+            capture: 0.25,
+            train: 0.45,
+            evaluate: 0.95,
+            done: 1,
+          }[p.stage];
           const stageSpan = {
-            fit: q.train ? 0.25 : 1,
+            fit: q.train ? 0.25 : 0.95,
             capture: 0.2,
-            train: 0.55,
+            train: 0.5,
+            evaluate: 0.05,
             done: 0,
           }[p.stage];
           this.bar.style.width = `${Math.round((stageBase + stageSpan * p.fraction) * 100)}%`;

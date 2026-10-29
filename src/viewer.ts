@@ -36,6 +36,7 @@ import {
   captureViewsAt,
   evaluateCloud,
   fitVolume,
+  framingClipBox,
   type SplatBuildHost,
   type SplatBuildOptions,
   trainCloud,
@@ -965,11 +966,6 @@ export class KilnViewer {
       const targetCount = Math.ceil(
         (opts.targetCount ?? 1_000_000) / (boxes.length * channels.length),
       );
-      // Caller cameras frame the whole region; a tile's cloud covers part of it.
-      const buildOpts: SplatBuildOptions =
-        boxes.length === 1
-          ? opts
-          : { ...opts, extraViews: undefined, evaluateAt: undefined };
       const steps = boxes.length * channels.length;
       let step = 0;
       const built: GaussianCloud[] = [];
@@ -985,7 +981,17 @@ export class KilnViewer {
           r.clipMin.set(box.train.min);
           r.clipMax.set(box.train.max);
           r.resetAccumulation();
-          const cloud = await this.buildSplats({ ...buildOpts, targetCount });
+          // Caller cameras frame the whole region: a tile trains on those
+          // that show it.
+          const extraViews =
+            boxes.length > 1 && opts.extraViews
+              ? framingClipBox(this.buildHost(), opts.extraViews)
+              : opts.extraViews;
+          const cloud = await this.buildSplats({
+            ...opts,
+            extraViews,
+            targetCount,
+          });
           parts.push({ ...cloud, core: box.core });
         }
         const first = parts[0]!;
@@ -997,6 +1003,11 @@ export class KilnViewer {
             worldUnit: first.worldUnit,
           });
         }
+        // Scored whole (tiles merged), from views of the whole region.
+        r.clipMin.set(region.min);
+        r.clipMax.set(region.max);
+        r.resetAccumulation();
+        await this.scoreSplats(cloud, opts);
         built.push(cloud);
       }
       const cloud =
@@ -1023,65 +1034,93 @@ export class KilnViewer {
     }
   }
 
-  /** Fit (+ train, + evaluate) the region inside the current clip box. */
+  /** Fit (+ train) the region inside the current clip box. */
   private async buildSplats(opts: SplatBuildOptions): Promise<GaussianCloud> {
     const host = this.buildHost();
     let views: CapturedViews | null = null;
-    let evalViews: CapturedViews | null = null;
     try {
       let cloud = await fitVolume(host, opts);
       this.setSplats(cloud);
-      const train = opts.train !== false && cloud.count > 0;
-      const nEval = cloud.count > 0 ? (opts.evaluateViews ?? 0) : 0;
-      const scoreAt = cloud.count > 0 ? (opts.evaluateAt ?? []) : [];
+      if (opts.train === false || cloud.count === 0) return cloud;
       this.setPaused(true);
-      if (train) views = await captureViews(host, opts);
-      const evalOpts: SplatBuildOptions = {
-        ...opts,
-        views: nEval,
-        viewSeed: 7919,
-        onProgress: (p) =>
-          opts.onProgress?.({
-            ...p,
-            label: `Held-out ${p.label.toLowerCase()}`,
-          }),
-      };
-      if (scoreAt.length > 0) {
-        evalViews = await captureViewsAt(host, scoreAt, evalOpts);
-      } else if (nEval > 0) {
-        evalViews = await captureViews(host, evalOpts);
-      }
-      if (views) {
-        cloud = await trainCloud(host, cloud, views, opts);
-        this.setSplats(cloud);
-      }
-      // setSplats uploaded the cloud: evaluate that buffer.
-      const params = this.splats.paramsBuffer;
-      const measured =
-        evalViews && params
+      views = await captureViews(host, opts);
+      cloud = await trainCloud(host, cloud, views, opts);
+      this.setSplats(cloud);
+      return cloud;
+    } finally {
+      views?.texture.destroy();
+      this.setPaused(false);
+      this.dirty = true;
+    }
+  }
+
+  /**
+   * Score `cloud` against the volume inside the current clip box: on
+   * generated held-out views (`evaluateViews`, as `psnr`) and at the
+   * `evaluateAt` cameras (as `psnrAt`). Reports both with the "done" stage.
+   */
+  private async scoreSplats(
+    cloud: GaussianCloud,
+    opts: SplatBuildOptions,
+  ): Promise<void> {
+    const host = this.buildHost();
+    const nEval = cloud.count > 0 ? (opts.evaluateViews ?? 0) : 0;
+    const at = cloud.count > 0 ? (opts.evaluateAt ?? []) : [];
+    const evalOpts: SplatBuildOptions = {
+      ...opts,
+      views: nEval,
+      viewSeed: 7919,
+      // Trained on: not held out.
+      extraViews: undefined,
+      onProgress: (p) =>
+        opts.onProgress?.({
+          ...p,
+          stage: "evaluate",
+          label: `Held-out ${p.label.toLowerCase()}`,
+        }),
+    };
+    this.setSplats(cloud);
+    // setSplats uploaded the cloud: evaluate that buffer.
+    const params = this.splats.paramsBuffer;
+    const score = async (views: CapturedViews) => {
+      try {
+        const psnr = params
           ? await evaluateCloud(
               this.device,
               params,
               cloud.count,
-              evalViews,
+              views,
               this.renderer.background,
             )
           : undefined;
-      // Reported only when it is a number (callers store it as one).
-      const psnr = Number.isFinite(measured) ? measured : undefined;
+        // Reported only when it is a number (callers store it as one).
+        return Number.isFinite(psnr) ? psnr : undefined;
+      } finally {
+        views.texture.destroy();
+      }
+    };
+    this.setPaused(true);
+    try {
+      const psnr =
+        nEval > 0 ? await score(await captureViews(host, evalOpts)) : undefined;
+      const psnrAt =
+        at.length > 0
+          ? await score(await captureViewsAt(host, at, evalOpts))
+          : undefined;
       opts.onProgress?.({
         stage: "done",
         fraction: 1,
         label:
           `${cloud.count.toLocaleString()} Gaussians` +
-          (psnr !== undefined ? ` · ${psnr.toFixed(1)} dB PSNR vs volume` : ""),
+          (psnr !== undefined ? ` · ${psnr.toFixed(1)} dB held out` : "") +
+          (psnrAt !== undefined
+            ? ` · ${psnrAt.toFixed(1)} dB at the given views`
+            : ""),
         gaussians: cloud.count,
         psnr,
+        psnrAt,
       });
-      return cloud;
     } finally {
-      views?.texture.destroy();
-      evalViews?.texture.destroy();
       this.setPaused(false);
       this.dirty = true;
     }

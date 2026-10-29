@@ -22,7 +22,7 @@ Kiln displays splats with its own tile rasterizer. It applies [Mip-Splatting](ht
 
 Quality is measured on held-out views (a randomly rotated copy of the training-view layout): `evaluateViews` reports the mean PSNR of the splats against the volume render, composited as displayed. On the 2.6 GB melanoma sample (6 channels, 1M splats, 512² views) the fit alone scores ≈ 26–28 dB and the *fast* preset ≈ 34 dB.
 
-When the views that will be shown are known — a story's waypoints — pass them as orbit states (what `camera.getOrbitState()` returns): `extraViews` are captured and trained on alongside the generated views, and `evaluateAt` scores the result at those cameras instead of generated held-out views. Tiled builds ignore both, since a tile's cloud covers only part of what those cameras frame.
+When the views that will be shown are known — a story's waypoints — pass them as orbit states (what `camera.getOrbitState()` returns): `extraViews` are captured and trained on alongside the generated views, and `evaluateAt` scores the result at those cameras (`psnrAt`) as well as on the generated held-out views (`psnr`). In a tiled build each tile trains on the `extraViews` that frame it (its bounds fill at least 5% of the view), rendered with only that tile's part of the volume; scores are taken once the tiles are merged, from views of the whole region.
 
 ## In the demo
 

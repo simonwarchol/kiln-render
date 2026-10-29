@@ -24,7 +24,7 @@ import type { StreamingManager } from "../streaming/streaming-manager.js";
 import { getFloat16ToFloat32Lut } from "../utils/float16.js";
 import { throwIfAborted, trainWithBrush } from "./brush-trainer.js";
 import { cloudFromParams, type GaussianCloud } from "./cloud.js";
-import { quatToRot, type SplatCamera } from "./cpu-reference.js";
+import { intrinsicsFor, quatToRot, type SplatCamera } from "./cpu-reference.js";
 import { createBuffer, READBACK, withMapped } from "./gpu/kernel.js";
 import { SplatRasterizer } from "./gpu/rasterizer.js";
 import { splatCameraFor } from "./splat-layer.js";
@@ -36,7 +36,7 @@ import type {
 } from "./volume-fit-worker.js";
 import FitWorkerInline from "./volume-fit-worker.ts?worker&inline";
 
-export type BuildStage = "fit" | "capture" | "train" | "done";
+export type BuildStage = "fit" | "capture" | "train" | "evaluate" | "done";
 
 export interface BuildProgress {
   stage: BuildStage;
@@ -45,8 +45,10 @@ export interface BuildProgress {
   label: string;
   gaussians?: number;
   loss?: number;
-  /** Mean PSNR (dB) of the splats vs. the volume on held-out views */
+  /** Mean PSNR (dB) of the splats vs. the volume on generated held-out views */
   psnr?: number;
+  /** Mean PSNR (dB) of the splats vs. the volume at the `evaluateAt` cameras */
+  psnrAt?: number;
 }
 
 export interface SplatBuildOptions {
@@ -68,12 +70,13 @@ export interface SplatBuildOptions {
   evaluateViews?: number;
   /**
    * Extra training cameras — e.g. the views a story will show — rendered and
-   * trained on alongside the generated ones. Tiled builds ignore them.
+   * trained on alongside the generated ones. In a tiled build each tile
+   * trains on those that frame it (see `framingClipBox`).
    */
   extraViews?: OrbitState[];
   /**
-   * Cameras to score the result at instead of generated held-out views
-   * (`evaluateViews`). Tiled builds ignore them.
+   * Cameras to score the result at, besides the generated held-out views
+   * (`evaluateViews`); reported as `psnrAt`.
    */
   evaluateAt?: OrbitState[];
   /** Fit pyramid level (default: finest that fits the memory budget) */
@@ -540,6 +543,68 @@ function planViews(
     const { rotX, rotY } = orbitForDirection(dir, camera.getUpAxis());
     return [rotX, rotY, dist, target[0], target[1], target[2]];
   });
+}
+
+/** Least share of a view the clip box must fill for `framingClipBox`. */
+const MIN_FRAME_SHARE = 0.05;
+
+/**
+ * The cameras among `orbits` that see the renderer's clip box at a useful
+ * size (its projected bounds fill at least 5% of a square view). A tile of a
+ * tiled build fills only part of a view that frames the whole region, and
+ * none of some.
+ */
+export function framingClipBox(
+  host: SplatBuildHost,
+  orbits: readonly OrbitState[],
+): OrbitState[] {
+  const { renderer, camera } = host;
+  const { lo, hi } = clipToWorld(
+    host.config.normalizedSize,
+    renderer.clipMin,
+    renderer.clipMax,
+  );
+  const saved = camera.getOrbitState();
+  try {
+    return orbits.filter((orbit) => {
+      camera.setOrbitState(orbit);
+      const v = camera.getViewMatrix();
+      // Unit square image: the bounds' area is their share of the view.
+      const k = intrinsicsFor(v, 1, 1);
+      let behind = 0;
+      let u0 = Infinity;
+      let u1 = -Infinity;
+      let v0 = Infinity;
+      let v1 = -Infinity;
+      for (let i = 0; i < 8; i++) {
+        const x = (i & 1 ? hi : lo)[0];
+        const y = (i & 2 ? hi : lo)[1];
+        const z = (i & 4 ? hi : lo)[2];
+        const cx = v[0]! * x + v[4]! * y + v[8]! * z + v[12]!;
+        const cy = v[1]! * x + v[5]! * y + v[9]! * z + v[13]!;
+        const cz = v[2]! * x + v[6]! * y + v[10]! * z + v[14]!;
+        // The camera looks down −z.
+        if (cz > -1e-3) {
+          behind++;
+          continue;
+        }
+        const pu = (k.fx * cx) / -cz + k.cx;
+        const pv = (k.fy * cy) / -cz + k.cy;
+        u0 = Math.min(u0, pu);
+        u1 = Math.max(u1, pu);
+        v0 = Math.min(v0, pv);
+        v1 = Math.max(v1, pv);
+      }
+      if (behind === 8) return false;
+      // The box reaches past the camera: around it, or right beside it.
+      if (behind > 0) return true;
+      const w = Math.max(0, Math.min(1, u1) - Math.max(0, u0));
+      const h = Math.max(0, Math.min(1, v1) - Math.max(0, v0));
+      return w * h >= MIN_FRAME_SHARE;
+    });
+  } finally {
+    camera.setOrbitState(saved);
+  }
 }
 
 /**
