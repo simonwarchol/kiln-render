@@ -321,6 +321,19 @@ export class Hdf5Dataset extends Hdf5Object {
     }
   }
 
+  /**
+   * File address of the chunk index (null when there is none): identifies
+   * the chunk layout a saved copy of the index was made from.
+   */
+  get chunkIndexAddress(): number | null {
+    const layout = this.layout;
+    if (layout.kind !== "chunked" || layout.index.type === "unsupported") {
+      return null;
+    }
+    const a = layout.index.address;
+    return a === null ? null : this.ctx.base + a;
+  }
+
   /** Bytes in one decoded chunk. */
   private get chunkBytes(): number {
     return product(this.chunkShape ?? []) * this.dtype.size;

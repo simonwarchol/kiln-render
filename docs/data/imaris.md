@@ -71,6 +71,16 @@ In the demo viewer: **Load Dataset → Remote URL**, **Local Imaris File**, or `
 
 Same CORS + Range rules as other Kiln formats. See [Hosting for streaming](/data/hosting). The object must be publicly readable (or a pre-signed URL that still allows `Range`).
 
+## Saved chunk index
+
+Before Kiln can fetch a level's chunks it reads that level's HDF5 chunk index: a B-tree of small reads scattered through the file (around 140 per channel at full resolution in a 150 GB file). A saved index replaces them with one read per level and channel. Write one with
+
+```bash
+npx tsx scripts/build-ims-index.ts https://my-bucket.s3.amazonaws.com/scan.ims
+```
+
+and host the output, `scan.ims.index`, next to the file: `ImarisDataProvider` looks for `<url>.index` there. To keep it elsewhere, pass its URL as `chunkIndex` (or build it in the browser with `provider.buildChunkIndex()`). A saved table is used only while the dataset's chunk index is still where it was when the index was written, so a stale file falls back to the B-trees.
+
 ## Out of scope
 
 - Imaris Classic / Imaris3 (non-HDF5)

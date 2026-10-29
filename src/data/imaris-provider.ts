@@ -42,6 +42,12 @@ import {
   type RangeSource,
 } from "./hdf5/index.js";
 import { ChunkFetcher } from "./imaris/chunk-fetcher.js";
+import {
+  buildImsChunkIndex,
+  ChunkIndexFile,
+  type ChunkTable,
+  readChunkTable,
+} from "./imaris/chunk-index-file.js";
 import { imsBrickIsEmpty } from "./imaris/empty-bricks.js";
 import type {
   ImsAssembleRequest,
@@ -120,6 +126,12 @@ export interface ImarisProviderOptions {
   workers?: number;
   /** Keep fetched chunks in the Origin Private File System across sessions (default true). */
   persistentCache?: boolean;
+  /**
+   * URL of a saved chunk index (see `buildChunkIndex`); its tables replace
+   * reading the file's chunk B-trees. Default: "<url>.index" next to the
+   * file. `false`: none.
+   */
+  chunkIndex?: string | false;
 }
 
 function createWorker(): Worker {
@@ -171,18 +183,8 @@ function ownerOf(address: number, n: number): number {
  * (cz * grid[1] + cy) * grid[0] + cx): ~12 bytes per chunk instead of a ref
  * object per chunk.
  */
-interface DatasetIndex {
+interface DatasetIndex extends ChunkTable {
   dataset: Hdf5Dataset;
-  /** chunk shape [x, y, z] */
-  chunkShape: Vec3;
-  /** chunk grid [x, y, z] */
-  grid: Vec3;
-  /** File address per chunk; -1 when unallocated (reads as zeros) */
-  address: Float64Array;
-  /** Stored (compressed) bytes per chunk */
-  size: Uint32Array;
-  /** The rare non-zero filter masks */
-  filterMask: Map<number, number>;
 }
 
 const chunkIndex = (idx: DatasetIndex, cx: number, cy: number, cz: number) =>
@@ -248,11 +250,15 @@ export class ImarisDataProvider implements DataProvider {
   private stale: ClampedBrick[] = [];
   private staleTimer: ReturnType<typeof setTimeout> | null = null;
   private staleListener: BrickStaleListener | null = null;
+  /** The saved chunk index, once looked for (null: none). */
+  private savedIndex: Promise<ChunkIndexFile | null> = Promise.resolve(null);
 
   /** Every channel in the file (names, colours, ranges). */
   allChannels: ImsChannelInfo[] = [];
   /** Source channel index for each active slot. */
   activeChannels: number[] = [];
+  /** URL of the saved chunk index in use (null: none found). */
+  private chunkIndexUrl: string | null = null;
 
   constructor(
     private readonly source: string | File,
@@ -359,6 +365,46 @@ export class ImarisDataProvider implements DataProvider {
     }
   }
 
+  /**
+   * The saved chunk index (option `chunkIndex`, else "<url>.index"), read
+   * alongside the file's header. Not retried: a missing one costs a request.
+   */
+  private async openSavedIndex(): Promise<ChunkIndexFile | null> {
+    let url = this.options.chunkIndex;
+    if (url === undefined && typeof this.source === "string") {
+      const u = new URL(this.source, location.href);
+      u.pathname += ".index";
+      url = u.href;
+    }
+    if (!url) return null;
+    const index = await ChunkIndexFile.open(httpRangeSource(url));
+    if (index) this.chunkIndexUrl = url;
+    return index;
+  }
+
+  /** URL of the saved chunk index in use, once looked for (null: none). */
+  async chunkIndexInUse(): Promise<string | null> {
+    await this.savedIndex;
+    return this.chunkIndexUrl;
+  }
+
+  /**
+   * A saved chunk index for `channels` (default: all) at every level, to
+   * host next to the file as "<file>.ims.index" or pass as `chunkIndex`:
+   * viewers then skip reading the file's chunk B-trees.
+   */
+  async buildChunkIndex(
+    channels?: readonly number[],
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<Uint8Array> {
+    if (!this.file) throw new Error("ImarisDataProvider: not initialized");
+    return buildImsChunkIndex(this.file, {
+      timepoint: this.timepoint,
+      channels,
+      onProgress,
+    });
+  }
+
   async initialize(): Promise<VolumeMetadata> {
     if (this.metadata) return this.metadata;
     const raw = this.rangeSource();
@@ -368,6 +414,7 @@ export class ImarisDataProvider implements DataProvider {
     });
     this.raw = raw;
     this.meta = meta;
+    this.savedIndex = this.openSavedIndex();
     // Imaris writes its group/attribute metadata at the head of the file:
     // one up-front read turns ~30 serial round trips into one.
     await meta.read(0, 1024 * 1024).catch(() => undefined);
@@ -724,38 +771,14 @@ export class ImarisDataProvider implements DataProvider {
             `IMS dataset missing for level ${level} channel ${channel}`,
           );
         }
-        const cs = ds.chunkShape ?? ds.shape;
-        const chunkShape: Vec3 = [cs[2]!, cs[1]!, cs[0]!];
-        const grid: Vec3 = [
-          Math.ceil(ds.shape[2]! / chunkShape[0]),
-          Math.ceil(ds.shape[1]! / chunkShape[1]),
-          Math.ceil(ds.shape[0]! / chunkShape[2]),
-        ];
-        const n = grid[0] * grid[1] * grid[2];
-        const idx: DatasetIndex = {
-          dataset: ds,
-          chunkShape,
-          grid,
-          address: new Float64Array(n).fill(-1),
-          size: new Uint32Array(n),
-          filterMask: new Map(),
-        };
-        if (ds.chunkShape) {
-          for (const ref of await ds.chunks()) {
-            const i = chunkIndex(
-              idx,
-              Math.floor(ref.offset[2]! / chunkShape[0]),
-              Math.floor(ref.offset[1]! / chunkShape[1]),
-              Math.floor(ref.offset[0]! / chunkShape[2]),
-            );
-            if (i >= n) continue;
-            idx.address[i] = ref.address;
-            idx.size[i] = ref.size;
-            if (ref.filterMask !== 0) idx.filterMask.set(i, ref.filterMask);
-          }
-        }
+        // The saved table, if it matches the dataset; else its B-tree.
+        const saved = await this.savedIndex;
+        const table =
+          (await saved
+            ?.table(level, channel, this.timepoint, ds)
+            .catch(() => null)) ?? (await readChunkTable(ds));
         this.indexReady.add(key);
-        return idx;
+        return { dataset: ds, ...table };
       })().finally(() => {
         if (--this.indexReads === 0) {
           this.meta?.setMaxPages(META_PAGES_AFTER_INDEX);
