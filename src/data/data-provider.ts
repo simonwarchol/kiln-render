@@ -188,6 +188,12 @@ export interface DataProvider {
   setBrickStaleListener?(listener: BrickStaleListener | null): void;
 
   /**
+   * Point channel slot `slot` at another of the dataset's channels without
+   * reopening; false if it can't. Optional (Imaris).
+   */
+  setChannelSource?(slot: number, channel: number): boolean;
+
+  /**
    * Check if a brick is empty (below threshold) in every one of `channels`
    * (slots; default: the provider's choice). Not empty when unknown.
    */

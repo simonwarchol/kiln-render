@@ -57,6 +57,15 @@ export class BrickCache {
     this.cache.delete(key);
   }
 
+  /** Drop every entry whose key starts with `prefix`. */
+  deletePrefix(prefix: string): void {
+    for (const [key, data] of this.cache) {
+      if (!key.startsWith(prefix)) continue;
+      this.totalBytes -= data.byteLength;
+      this.cache.delete(key);
+    }
+  }
+
   clear(): void {
     this.cache.clear();
     this.totalBytes = 0;

@@ -883,6 +883,20 @@ export class KilnViewer {
     this.dirty = true;
   }
 
+  /**
+   * Show another of the dataset's channels in channel slot `slot`, keeping
+   * the viewer and the other slots' bricks: the slot's old data stops
+   * drawing and the new channel streams in (while the slot is shown). Its
+   * colour and window are the caller's to set. False when the data provider
+   * can't repoint slots (only Imaris can) or either index is out of range.
+   */
+  setChannelSource(slot: number, channel: number): boolean {
+    if (!this.dataProvider.setChannelSource?.(slot, channel)) return false;
+    this.streamingManager.replaceChannel(slot);
+    this.dirty = true;
+    return true;
+  }
+
   /** Show a Gaussian cloud (from `generateSplats`, `readPly`, …). */
   setSplats(cloud: GaussianCloud | null): void {
     this.splats.setCloud(cloud);

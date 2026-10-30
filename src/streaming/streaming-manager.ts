@@ -227,9 +227,13 @@ export class StreamingManager {
 
   /** Channels reported stale while their brick's load was in flight. */
   private staleOnArrival = new WeakMap<AbortSignal, Set<number>>();
+  /** Channels whose slot was repointed while their brick's load was in flight. */
+  private replacedOnArrival = new WeakMap<AbortSignal, Set<number>>();
   /** Latest reload per `ch:key`; an older one finishing late doesn't write. */
   private latestReload = new Map<string, number>();
   private reloadSeq = 0;
+  /** Channel reloads (backfills) in progress. */
+  private reloadsInFlight = 0;
   /** Backfills in progress (perf logging only). */
   private perfBackfills = 0;
 
@@ -297,6 +301,9 @@ export class StreamingManager {
   /** Per-channel fetch mask. Hidden channels are not requested on LOD changes. */
   private channelEnabled: boolean[];
 
+  /** Per channel: aborted (and replaced) when it's hidden, cancelling its loads. */
+  private hideAborts: AbortController[];
+
   // Camera FOV in radians (must match camera.getProjectionMatrix)
   private readonly cameraFovRad = Math.PI / 4; // 45 degrees
 
@@ -361,6 +368,10 @@ export class StreamingManager {
     // Scale concurrent requests and cache budget for multichannel
     const numChannels = resources.numChannels;
     this.channelEnabled = Array.from({ length: numChannels }, () => true);
+    this.hideAborts = Array.from(
+      { length: numChannels },
+      () => new AbortController(),
+    );
     this.maxConcurrentRequests = numChannels > 1 ? 12 : 8;
     // Multi-channel: limit channel jobs below brick concurrency so N-way
     // Promise.all per brick cannot flood Imaris(≤4)/Zarr(≤8) worker pools.
@@ -400,7 +411,10 @@ export class StreamingManager {
     this.onRangesDerived = callback;
   }
 
-  /** Skip fetching this channel on subsequent brick/LOD loads. Re-enabling backfills resident bricks. */
+  /**
+   * Skip fetching this channel on subsequent brick/LOD loads, and cancel its
+   * loads in flight. Re-enabling backfills resident bricks.
+   */
   setChannelEnabled(ch: number, enabled: boolean): void {
     if (ch < 0 || ch >= this.channelEnabled.length) return;
     if (this.channelEnabled[ch] === enabled) return;
@@ -408,7 +422,45 @@ export class StreamingManager {
     if (enabled) {
       this.forgetEmptyWithout(ch);
       void this.backfillChannel(ch);
+    } else {
+      // Its loads in flight would only be thrown away.
+      this.hideAborts[ch]!.abort();
+      this.hideAborts[ch] = new AbortController();
     }
+  }
+
+  /** A signal that aborts when channel `ch` is hidden (or `signal` aborts). */
+  private channelSignal(ch: number, signal?: AbortSignal): AbortSignal {
+    const hidden = this.hideAborts[ch]!.signal;
+    return signal ? AbortSignal.any([signal, hidden]) : hidden;
+  }
+
+  /**
+   * Load one channel of a brick through the channel-job queue; null when the
+   * channel is hidden meanwhile (or `signal` aborts).
+   */
+  private loadChannel(
+    lod: number,
+    bx: number,
+    by: number,
+    bz: number,
+    ch: number,
+    signal?: AbortSignal,
+    priority?: number,
+  ): Promise<BrickLoadResult | null> {
+    const chSignal = this.channelSignal(ch, signal);
+    return this.withChannelJob(
+      () =>
+        this.dataProvider.loadBrick(lod, bx, by, bz, ch, chSignal, priority),
+      chSignal,
+      priority,
+    ).catch((err) => {
+      if (chSignal.aborted) {
+        if (perfOn && !signal?.aborted) perfCount("channel loads cancelled");
+        return null;
+      }
+      throw err;
+    });
   }
 
   /** Channel slots shown now. */
@@ -443,6 +495,18 @@ export class StreamingManager {
    */
   private forgetEmptyWithout(ch: number): void {
     const bit = 1 << ch;
+    this.forgetEmpty((channels) => !(channels & bit), `showing slot ${ch}`);
+  }
+
+  /**
+   * Forget the data-based empty verdicts `matches` picks (by the channel
+   * slots they covered): their bricks are requested again, showing their
+   * nearest loaded parent meanwhile.
+   */
+  private forgetEmpty(
+    matches: (channels: number) => boolean,
+    why: string,
+  ): void {
     const forgotten: Array<{
       lod: number;
       bx: number;
@@ -450,7 +514,7 @@ export class StreamingManager {
       bz: number;
     }> = [];
     for (const [key, verdict] of this.emptyFor) {
-      if (verdict.channels & bit) continue;
+      if (!matches(verdict.channels)) continue;
       this.emptyFor.delete(key);
       this.emptyBricks.delete(key);
       forgotten.push(verdict);
@@ -474,9 +538,48 @@ export class StreamingManager {
     this.scheduleAccumulationReset();
     if (perfOn) {
       perfEvent(
-        `showing slot ${ch}: ${forgotten.length} bricks judged empty without it will load again`,
+        `${why}: ${forgotten.length} bricks judged empty will load again`,
       );
     }
+  }
+
+  /**
+   * Channel slot `ch` now reads another of the dataset's channels (the
+   * provider was repointed): cancel its loads, forget what its old data
+   * said, stop drawing its old texels, and load it into the resident bricks
+   * (once shown). The other slots keep everything.
+   */
+  replaceChannel(ch: number): void {
+    if (ch < 0 || ch >= this.channelEnabled.length) return;
+    this.hideAborts[ch]!.abort();
+    this.hideAborts[ch] = new AbortController();
+    const prefix = `ch${ch}:`;
+    this.brickCache.deletePrefix(prefix);
+    // Reloads of the old channel that already returned no longer write.
+    for (const key of [...this.latestReload.keys()]) {
+      if (key.startsWith(prefix)) this.latestReload.delete(key);
+    }
+    // Bricks in flight bring old data for it: dropped when they land.
+    for (const controller of this.inFlightRequests.values()) {
+      let chs = this.replacedOnArrival.get(controller.signal);
+      if (!chs) {
+        chs = new Set();
+        this.replacedOnArrival.set(controller.signal, chs);
+      }
+      chs.add(ch);
+    }
+    for (const info of this.loadedBricks.values()) {
+      this.resources.clearChannel(info.slot, ch);
+    }
+    // Any brick judged empty may hold data in the new channel.
+    this.forgetEmpty(() => true, `slot ${ch} replaced`);
+    if (this.channelEnabled[ch]) void this.backfillChannel(ch);
+    this.scheduleAccumulationReset();
+  }
+
+  /** Channel data is being reloaded into resident bricks (backfills). */
+  get reloading(): boolean {
+    return this.reloadsInFlight > 0;
   }
 
   /** Fetch a newly-visible channel into every currently resident brick. */
@@ -560,21 +663,27 @@ export class StreamingManager {
       this.latestReload.get(cacheKey) === seq &&
       this.loadedBricks.get(key) === info &&
       this.channelEnabled[ch];
+    this.reloadsInFlight++;
     try {
       let data = this.brickCache.get(cacheKey);
       if (!data) {
         let result: BrickLoadResult | null;
+        // Hiding the channel again cancels it.
+        const chSignal = this.channelSignal(ch);
         try {
-          result = await this.withChannelJob(async () =>
-            current()
-              ? this.dataProvider.loadBrick(
-                  info.lod,
-                  info.bx,
-                  info.by,
-                  info.bz,
-                  ch,
-                )
-              : null,
+          result = await this.withChannelJob(
+            async () =>
+              current()
+                ? this.dataProvider.loadBrick(
+                    info.lod,
+                    info.bx,
+                    info.by,
+                    info.bz,
+                    ch,
+                    chSignal,
+                  )
+                : null,
+            chSignal,
           );
         } catch {
           if (stats) stats.skipped++;
@@ -594,6 +703,7 @@ export class StreamingManager {
       this.resources.writeBrick(info.slot, ch, data);
       this.scheduleAccumulationReset();
     } finally {
+      this.reloadsInFlight--;
       if (this.latestReload.get(cacheKey) === seq)
         this.latestReload.delete(cacheKey);
     }
@@ -797,7 +907,8 @@ export class StreamingManager {
         }
 
         // Load shown channels in parallel — gated by channel-job semaphore.
-        // Hidden ones are skipped; the backfill fills them in when shown.
+        // Hidden ones are skipped (or cancelled when hidden meanwhile); the
+        // backfill fills them in when shown.
         const tFetch = performance.now();
         const requested = Array.from(
           { length: numChannels },
@@ -805,11 +916,7 @@ export class StreamingManager {
         );
         const channelResults = await Promise.all(
           requested.map((want, ch) =>
-            want
-              ? this.withChannelJob(() =>
-                  this.dataProvider.loadBrick(maxLod, bx, by, bz, ch),
-                )
-              : null,
+            want ? this.loadChannel(maxLod, bx, by, bz, ch) : null,
           ),
         );
         sumFetchMs += performance.now() - tFetch;
@@ -892,10 +999,10 @@ export class StreamingManager {
         };
         this.loadedBricks.set(key, info);
         this.pinnedBricks.add(key);
-        // Shown since it was skipped: its backfill ran before this brick was
-        // resident.
+        // Shown without data (skipped, or cancelled by hiding it, before being
+        // shown again): its backfill ran before this brick was resident.
         for (let ch = 0; ch < numChannels; ch++) {
-          if (!requested[ch] && this.channelEnabled[ch]) {
+          if (!channelResults[ch] && this.channelEnabled[ch]) {
             void this.reloadBrickChannel(ch, key, info);
           }
         }
@@ -1633,17 +1740,13 @@ export class StreamingManager {
           return { data: cached, min: 0, max: 1, avg: 0 } as BrickLoadResult;
         }
         try {
-          return await this.withChannelJob(
-            () =>
-              this.dataProvider.loadBrick(
-                lod,
-                bx,
-                by,
-                bz,
-                ch,
-                signal,
-                request.distance,
-              ),
+          // Cancelled (null) if the channel is hidden meanwhile.
+          return await this.loadChannel(
+            lod,
+            bx,
+            by,
+            bz,
+            ch,
             signal,
             request.distance,
           );
@@ -1659,6 +1762,10 @@ export class StreamingManager {
       }),
     );
     if (signal.aborted) return;
+    // A slot repointed meanwhile brought the old channel's data: as if it
+    // hadn't loaded (it reloads once the brick is committed).
+    const replaced = this.replacedOnArrival.get(signal);
+    if (replaced) for (const ch of replaced) channelResults[ch] = null;
 
     // At least one enabled channel must succeed; hidden channels are skipped.
     let haveVisibleData = false;
@@ -1828,6 +1935,13 @@ export class StreamingManager {
     this.bricksCommitted++;
     if (stale)
       for (const ch of stale) void this.reloadBrickChannel(ch, key, info);
+    // Shown without data (hidden at dispatch, or cancelled by hiding it,
+    // then shown again): its backfill ran before this brick was resident.
+    for (let ch = 0; ch < numChannels; ch++) {
+      if (this.channelEnabled[ch] && !channelResults[ch] && !stale?.has(ch)) {
+        void this.reloadBrickChannel(ch, key, info);
+      }
+    }
 
     // Record end-to-end latency (dispatch → committed)
     const dispatchTime = this.dispatchTimestamps.get(key);

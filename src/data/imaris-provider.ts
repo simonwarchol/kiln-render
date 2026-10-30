@@ -180,6 +180,18 @@ function attrNumbers(v: Hdf5AttrValue | undefined): number[] | undefined {
   return parts.length > 0 && parts.every(Number.isFinite) ? parts : undefined;
 }
 
+/**
+ * A channel's display window in raw data units over its normalisation range;
+ * the viewer maps it to the normalised [0, 1] atlas values.
+ */
+function channelWindow(ch: ImsChannelInfo) {
+  const [lo, hi] = ch.range;
+  const [a, b] = ch.displayRange ?? ch.range;
+  const start = Math.min(hi, Math.max(lo, a));
+  const end = Math.min(hi, Math.max(start + (hi - lo) * 1e-3, b));
+  return { start, end, min: lo, max: hi };
+}
+
 /** Chunk → owning worker (each chunk is decoded and cached by one worker). */
 function ownerOf(address: number, n: number): number {
   let h = Math.floor(address / 4096) ^ (address % 4096);
@@ -595,15 +607,7 @@ export class ImarisDataProvider implements DataProvider {
 
     this.pyramid = planVirtualPyramid(sources);
     const active = this.activeChannels.map((c) => this.allChannels[c]!);
-    // Windows in raw data units over the normalisation range; the viewer maps
-    // them to the normalised [0, 1] atlas values.
-    const windowFor = (ch: ImsChannelInfo) => {
-      const [lo, hi] = ch.range;
-      const [a, b] = ch.displayRange ?? ch.range;
-      const start = Math.min(hi, Math.max(lo, a));
-      const end = Math.min(hi, Math.max(start + (hi - lo) * 1e-3, b));
-      return { start, end, min: lo, max: hi };
-    };
+    const windowFor = channelWindow;
 
     this.metadata = {
       name,
@@ -1060,6 +1064,31 @@ export class ImarisDataProvider implements DataProvider {
       for (const r of recs)
         this.staleListener?.(r.lod, r.bx, r.by, r.bz, r.channelIndex);
     }, STALE_NOTIFY_MS);
+  }
+
+  /**
+   * Point channel slot `slot` at file channel `channel` in place of
+   * reopening (after `initialize`). The slot's bricks must be reloaded:
+   * `KilnViewer.setChannelSource` does both. False when either is out of
+   * range.
+   */
+  setChannelSource(slot: number, channel: number): boolean {
+    const meta = this.metadata;
+    const info = this.allChannels[channel];
+    if (!meta || !info || slot < 0 || slot >= this.activeChannels.length) {
+      return false;
+    }
+    if (this.activeChannels[slot] === channel) return true;
+    this.activeChannels[slot] = channel;
+    // What was learned about the old channel's bricks no longer holds.
+    for (const perChannel of this.brickStatsCache.values()) {
+      perChannel[slot] = undefined;
+    }
+    if (meta.channelWindows) meta.channelWindows[slot] = channelWindow(info);
+    if (meta.channelNames) meta.channelNames[slot] = info.name;
+    if (meta.channelColors) meta.channelColors[slot] = info.color;
+    if (slot === 0) meta.window = channelWindow(info);
+    return true;
   }
 
   /**

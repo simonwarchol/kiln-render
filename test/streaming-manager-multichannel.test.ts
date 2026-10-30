@@ -24,6 +24,9 @@ import { mockProvider, mockResources } from "./helpers/streaming-mocks.js";
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Channel loads carry a signal that hiding the channel aborts. */
+const CANCELLABLE = expect.any(AbortSignal);
+
 function makeMetadata(numChannels: number): VolumeMetadata {
   return {
     name: "test",
@@ -83,7 +86,15 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
     });
 
     expect(provider.loadBrick).toHaveBeenCalledTimes(1);
-    expect(provider.loadBrick).toHaveBeenCalledWith(0, 0, 0, 0, 0);
+    expect(provider.loadBrick).toHaveBeenCalledWith(
+      0,
+      0,
+      0,
+      0,
+      0,
+      CANCELLABLE,
+      undefined,
+    );
   });
 
   it("calls loadBrick twice for a 2-channel dataset, once per channel", async () => {
@@ -103,8 +114,24 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
     });
 
     expect(provider.loadBrick).toHaveBeenCalledTimes(2);
-    expect(provider.loadBrick).toHaveBeenCalledWith(0, 0, 0, 0, 0); // ch 0
-    expect(provider.loadBrick).toHaveBeenCalledWith(0, 0, 0, 0, 1); // ch 1
+    expect(provider.loadBrick).toHaveBeenCalledWith(
+      0,
+      0,
+      0,
+      0,
+      0,
+      CANCELLABLE,
+      undefined,
+    ); // ch 0
+    expect(provider.loadBrick).toHaveBeenCalledWith(
+      0,
+      0,
+      0,
+      0,
+      1,
+      CANCELLABLE,
+      undefined,
+    ); // ch 1
   });
 
   it("calls loadBrick for all 4 channels of a 4-channel dataset", async () => {
@@ -125,7 +152,15 @@ describe("StreamingManager — multi-channel base LOD loading", () => {
 
     expect(provider.loadBrick).toHaveBeenCalledTimes(4);
     for (let ch = 0; ch < 4; ch++) {
-      expect(provider.loadBrick).toHaveBeenCalledWith(0, 0, 0, 0, ch);
+      expect(provider.loadBrick).toHaveBeenCalledWith(
+        0,
+        0,
+        0,
+        0,
+        ch,
+        CANCELLABLE,
+        undefined,
+      );
     }
   });
 
