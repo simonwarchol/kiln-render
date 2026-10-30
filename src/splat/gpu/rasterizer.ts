@@ -12,6 +12,7 @@
  */
 
 import { type DepthCue, NO_DEPTH_CUE } from "../../core/depth-cue.js";
+import { perfOn, perfValue } from "../../utils/perf-log.js";
 import type { SplatCamera } from "../cpu-reference.js";
 import {
   bindGroup,
@@ -36,6 +37,7 @@ import {
   TILES_WGSL,
 } from "./raster-wgsl.js";
 import { GpuScan } from "./scan.js";
+import type { GpuStageTimer } from "./stage-timer.js";
 
 interface RasterKernels {
   project: Kernel;
@@ -196,6 +198,8 @@ export class SplatRasterizer {
   depthCue: DepthCue = NO_DEPTH_CUE;
 
   private lastCapacityCheck = 0;
+  /** Perf logging: readback of the sorted depth keys. */
+  private perfKeys: GPUBuffer | null = null;
 
   constructor(device: GPUDevice) {
     this.device = device;
@@ -395,8 +399,15 @@ export class SplatRasterizer {
     return this.groups;
   }
 
-  /** Encode the full forward pass. Output lands in `image`. */
-  encodeForward(encoder: GPUCommandEncoder, cam: SplatCamera): void {
+  /**
+   * Encode the full forward pass. Output lands in `image`. With `timer`
+   * (perf logging), each stage is a pass of its own, timed.
+   */
+  encodeForward(
+    encoder: GPUCommandEncoder,
+    cam: SplatCamera,
+    timer?: GpuStageTimer,
+  ): void {
     if (!this.params || this.width === 0) return;
     this.writeCamera(cam);
     const g = this.bindGroups();
@@ -408,36 +419,66 @@ export class SplatRasterizer {
       return;
     }
     // One pass: dispatches in a pass see each other's writes.
-    const pass = encoder.beginComputePass({ label: "splat:forward" });
-    dispatch1d(pass, k.project, g.project, Math.ceil(n / 256));
-    this.depthSort.encode(
-      pass,
-      this.depthKeys,
-      this.depthIdx,
-      { buffer: this.countBuf, index: 0 },
-      32,
+    let shared = null as GPUComputePassEncoder | null;
+    const stage = (
+      name: string,
+      run: (pass: GPUComputePassEncoder) => void,
+    ) => {
+      if (!timer) {
+        shared ??= encoder.beginComputePass({ label: "splat:forward" });
+        run(shared);
+        return;
+      }
+      const pass = encoder.beginComputePass({
+        label: `splat:${name}`,
+        timestampWrites: timer.stage(name),
+      });
+      run(pass);
+      pass.end();
+    };
+    stage("project", (pass) =>
+      dispatch1d(pass, k.project, g.project, Math.ceil(n / 256)),
     );
-    dispatch1d(pass, k.countTiles, g.countTiles, Math.ceil((n + 1) / 256));
-    this.scan.encode(pass, this.offsets, { buffer: this.countBuf, index: 1 });
-    dispatch1d(pass, k.emit, g.emit, Math.ceil(n / 256));
-    this.isectSort.encode(
-      pass,
-      this.isectKeys,
-      this.isectVals,
-      { buffer: this.offsets, index: n },
-      bitsFor(this.tilesX * this.tilesY),
+    stage("depth sort", (pass) =>
+      this.depthSort.encode(
+        pass,
+        this.depthKeys,
+        this.depthIdx,
+        { buffer: this.countBuf, index: 0 },
+        32,
+      ),
     );
-    pass.setPipeline(k.rangesSetup.pipeline);
-    pass.setBindGroup(0, g.rangesSetup);
-    pass.dispatchWorkgroups(1);
-    pass.setPipeline(k.ranges.pipeline);
-    pass.setBindGroup(0, g.ranges);
-    pass.dispatchWorkgroupsIndirect(this.rangesIndirect, 0);
-    const additive = this.channelMode === 2;
-    pass.setPipeline((additive ? k.rasterizeAdd : k.rasterize).pipeline);
-    pass.setBindGroup(0, additive ? g.rasterizeAdd : g.rasterize);
-    pass.dispatchWorkgroups(this.tilesX, this.tilesY, 1);
-    pass.end();
+    stage("tile counts", (pass) => {
+      dispatch1d(pass, k.countTiles, g.countTiles, Math.ceil((n + 1) / 256));
+      this.scan.encode(pass, this.offsets, { buffer: this.countBuf, index: 1 });
+    });
+    stage("emit", (pass) =>
+      dispatch1d(pass, k.emit, g.emit, Math.ceil(n / 256)),
+    );
+    stage("tile sort", (pass) =>
+      this.isectSort.encode(
+        pass,
+        this.isectKeys,
+        this.isectVals,
+        { buffer: this.offsets, index: n },
+        bitsFor(this.tilesX * this.tilesY),
+      ),
+    );
+    stage("tile ranges", (pass) => {
+      pass.setPipeline(k.rangesSetup.pipeline);
+      pass.setBindGroup(0, g.rangesSetup);
+      pass.dispatchWorkgroups(1);
+      pass.setPipeline(k.ranges.pipeline);
+      pass.setBindGroup(0, g.ranges);
+      pass.dispatchWorkgroupsIndirect(this.rangesIndirect, 0);
+    });
+    stage("rasterize", (pass) => {
+      const additive = this.channelMode === 2;
+      pass.setPipeline((additive ? k.rasterizeAdd : k.rasterize).pipeline);
+      pass.setBindGroup(0, additive ? g.rasterizeAdd : g.rasterize);
+      pass.dispatchWorkgroups(this.tilesX, this.tilesY, 1);
+    });
+    shared?.end();
   }
 
   /** Copy the last forward pass's intersection total (u32) into `dst`. */
@@ -465,9 +506,45 @@ export class SplatRasterizer {
     this.device.queue.submit([enc.finish()]);
     withMapped(buf, (d) => new Uint32Array(d, 0, 1)[0]!)
       .then((m) => {
+        if (perfOn) perfValue("splat tile intersections", m);
         if (m > this.isectCapacity * 0.85) {
           this.ensureIsectCapacity(Math.ceil(m * 1.5));
         }
+      })
+      .catch(() => {});
+    if (perfOn) this.perfVisible();
+  }
+
+  /**
+   * Perf logging: how many Gaussians the last frame kept (culled ones sort
+   * last, with key 0xffffffff), out of how many.
+   */
+  private perfVisible(): void {
+    const n = this.count;
+    let buf = this.perfKeys;
+    if (buf && buf.mapState !== "unmapped") return;
+    if (!buf || buf.size < n * 4) {
+      buf?.destroy();
+      buf = createBuffer(this.device, "perf:depth-keys", n * 4, READBACK);
+      this.perfKeys = buf;
+    }
+    const enc = this.device.createCommandEncoder();
+    enc.copyBufferToBuffer(this.depthKeys, 0, buf, 0, n * 4);
+    this.device.queue.submit([enc.finish()]);
+    withMapped(buf, (d) => {
+      const keys = new Uint32Array(d, 0, n);
+      let lo = 0;
+      let hi = n;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (keys[mid]! === 0xffffffff) hi = mid;
+        else lo = mid + 1;
+      }
+      return lo;
+    })
+      .then((visible) => {
+        perfValue("splat Gaussians", n);
+        perfValue("splat Gaussians visible", visible);
       })
       .catch(() => {});
   }
@@ -500,6 +577,7 @@ export class SplatRasterizer {
       this.rangesIndirect,
       this.dummy,
       this.totalReadback,
+      this.perfKeys,
     ])
       b?.destroy();
     this.depthSort?.destroy();

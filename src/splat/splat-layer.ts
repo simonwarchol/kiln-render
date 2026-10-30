@@ -5,6 +5,7 @@
 
 import type { Camera } from "../core/camera.js";
 import { type DepthCue, NO_DEPTH_CUE } from "../core/depth-cue.js";
+import { ms, perfEvent, perfOn } from "../utils/perf-log.js";
 import type { GaussianCloud } from "./cloud.js";
 import {
   intrinsicsFor,
@@ -13,6 +14,7 @@ import {
 } from "./cpu-reference.js";
 import { createBuffer, STORAGE_RW } from "./gpu/kernel.js";
 import { SplatRasterizer } from "./gpu/rasterizer.js";
+import { GpuStageTimer } from "./gpu/stage-timer.js";
 
 const COMPOSITE_WGSL = /* wgsl */ `
 struct Params {
@@ -64,6 +66,8 @@ export class SplatLayer {
   private boundImage: GPUBuffer | null = null;
   private count = 0;
   private readonly uniformData = new ArrayBuffer(32);
+  /** Perf logging: GPU time per stage of each displayed frame. */
+  private readonly timer: GpuStageTimer | null;
   /** Cloud currently displayed (null when none). */
   cloud: GaussianCloud | null = null;
   /** Bumped whenever the Gaussians change, so the viewer re-renders. */
@@ -91,6 +95,10 @@ export class SplatLayer {
       32,
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     );
+    this.timer =
+      perfOn && GpuStageTimer.supported(device)
+        ? new GpuStageTimer(device, "splat GPU:")
+        : null;
   }
 
   /** GPU parameters of the cloud set with {@link setCloud} (null otherwise). */
@@ -113,6 +121,7 @@ export class SplatLayer {
       return;
     }
     const bytes = cloud.count * PARAM_STRIDE * 4;
+    const t0 = perfOn ? performance.now() : 0;
     this.ownParams = createBuffer(
       this.device,
       "splat:layer-params",
@@ -126,6 +135,11 @@ export class SplatLayer {
       cloud.params.byteOffset,
       bytes,
     );
+    if (perfOn) {
+      perfEvent(
+        `splat cloud set: ${cloud.count.toLocaleString()} Gaussians, ${(bytes / 2 ** 20).toFixed(0)} MB, upload ${ms(performance.now() - t0)} CPU`,
+      );
+    }
     this.count = cloud.count;
     this.rasterizer.mipFilter = cloud.antialiased ?? false;
     this.rasterizer.channelMode =
@@ -166,8 +180,13 @@ export class SplatLayer {
       for (let i = 0; i < t.length; i++) t[i] = opts.channelColors[i] ?? 0;
     }
     const encoder = this.device.createCommandEncoder({ label: "splat:frame" });
+    const timer = this.count > 0 && this.timer?.begin() ? this.timer : null;
     if (this.count > 0) {
-      r.encodeForward(encoder, splatCameraFor(camera, width, height));
+      r.encodeForward(
+        encoder,
+        splatCameraFor(camera, width, height),
+        timer ?? undefined,
+      );
     } else {
       encoder.clearBuffer(r.image);
     }
@@ -201,16 +220,20 @@ export class SplatLayer {
           storeOp: "store",
         },
       ],
+      // Not timed: on the canvas texture, the pass also waits for it.
     });
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.draw(3);
     pass.end();
+    timer?.end(encoder);
     this.device.queue.submit([encoder.finish()]);
+    timer?.read();
     if (this.count > 0) r.checkCapacity();
   }
 
   destroy(): void {
+    this.timer?.destroy();
     this.ownParams?.destroy();
     this.uniform.destroy();
     this.rasterizer.destroy();

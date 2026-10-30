@@ -67,6 +67,8 @@ interface PerfFrame {
   final: boolean;
   /** Frames already accumulated into the image this frame adds to. */
   accumulated: number;
+  /** Splat frame: when its cloud was set, if this is the cloud's first. */
+  cloudSet: number | null;
 }
 
 /** What the canvas shows: the volume, the splats, or both side by side. */
@@ -163,10 +165,12 @@ const ATLAS_GRID_CAP_KEY = "kiln-atlas-grid-cap";
 
 async function requestKilnDevice(adapter: GPUAdapter): Promise<GPUDevice> {
   const limits = adapter.limits;
-  // Optional: subgroups speed up the splat depth sort.
-  const features = (["subgroups"] as GPUFeatureName[]).filter((f) =>
-    adapter.features.has(f),
-  );
+  // Optional: subgroups speed up the splat depth sort; perf logging times
+  // splat stages with timestamp queries.
+  const wanted: GPUFeatureName[] = perfOn
+    ? ["subgroups", "timestamp-query"]
+    : ["subgroups"];
+  const features = wanted.filter((f) => adapter.features.has(f));
   return adapter.requestDevice({
     requiredFeatures: features,
     requiredLimits: {
@@ -354,8 +358,10 @@ export class KilnViewer {
   private perfMove: number | null = null;
   /** Perf logging: final frames since the image last restarted. */
   private perfRun: { start: number; frames: number; gpu: number } | null = null;
-  /** Perf logging: the last splat frame's inputs. */
-  private perfSplatInputs = "";
+  /** Perf logging: the last splat frame's inputs, by name. */
+  private perfSplatInputs = new Map<string, string>();
+  /** Perf logging: when a new cloud was set, until its first frame. */
+  private perfCloudSet: number | null = null;
 
   private constructor(
     device: GPUDevice,
@@ -881,6 +887,7 @@ export class KilnViewer {
   setSplats(cloud: GaussianCloud | null): void {
     this.splats.setCloud(cloud);
     this.dirty = true;
+    if (perfOn && cloud) this.perfCloudSet = performance.now();
   }
 
   /** Load a 3DGS .ply (binary little-endian) and show it. */
@@ -1173,6 +1180,9 @@ export class KilnViewer {
 
     // Always run streaming (may trigger onDirty via resetAccumulation)
     this.streamingManager.update(this.camera, this.canvas);
+    if (perfOn && this.displayMode_ === "splats") {
+      perfSample("streaming update CPU, splats shown", performance.now() - now);
+    }
 
     const splatVersion = this.splatLayer?.version ?? -1;
     if (splatVersion !== this.lastSplatVersion) {
@@ -1210,6 +1220,9 @@ export class KilnViewer {
       this.onBeforeFrame?.();
       const perf = perfOn ? this.perfFrameStart(draft) : null;
       this.renderFrame();
+      if (perf?.label.startsWith("splats")) {
+        perfSample("splat frame encode CPU", performance.now() - perf.start);
+      }
       this.gpuBusy = true;
       const idle = () => {
         this.gpuBusy = false;
@@ -1227,21 +1240,25 @@ export class KilnViewer {
     const move = this.perfMove;
     this.perfMove = null;
     const splats = this.displayMode_ === "splats" && this.splatCount > 0;
+    let cloudSet: number | null = null;
     if (splats) {
-      const inputs = [
-        this.camera.version,
-        this.canvas.width,
-        this.canvas.height,
-        this.splatLayer?.version,
-        r.depthCue,
-        ...r.channelColors,
-      ].join();
-      perfCount(
-        inputs === this.perfSplatInputs
-          ? "splat frames, inputs unchanged"
-          : "splat frames",
+      // Why this splat frame renders: the first input that changed.
+      const inputs: Array<[string, unknown]> = [
+        ["camera", this.camera.version],
+        ["canvas size", `${this.canvas.width}×${this.canvas.height}`],
+        ["cloud", this.splatLayer?.version],
+        ["channel colours", r.channelColors.join()],
+        ["depth cue", r.depthCue],
+      ];
+      const changed = inputs.find(
+        ([name, v]) => this.perfSplatInputs.get(name) !== String(v),
       );
-      this.perfSplatInputs = inputs;
+      perfCount(
+        `splat frames, new ${changed?.[0] ?? "nothing (volume redraw)"}`,
+      );
+      for (const [name, v] of inputs) this.perfSplatInputs.set(name, String(v));
+      cloudSet = this.perfCloudSet;
+      this.perfCloudSet = null;
     }
     let shown = 0;
     for (let ch = 0; ch < r.numChannels; ch++) {
@@ -1251,10 +1268,11 @@ export class KilnViewer {
       start: performance.now(),
       move,
       label: splats
-        ? "splats"
+        ? `splats ${this.canvas.width}×${this.canvas.height}`
         : `${draft ? "draft" : "final"} ${r.volumeRenderMode} ×${r.renderScale} ${shown}ch`,
       final: !splats && !draft,
       accumulated: r.accumulatedFrames,
+      cloudSet,
     };
   }
 
@@ -1268,6 +1286,11 @@ export class KilnViewer {
     perfSample(`${f.label} frame GPU`, gpu);
     if (f.move !== null) {
       perfSample("camera move → first frame done", now - f.move);
+    }
+    if (f.cloudSet !== null) {
+      perfEvent(
+        `first frame of a new splat cloud done ${ms(now - f.cloudSet)} after it was set (${ms(gpu)} GPU)`,
+      );
     }
     // Final frames from a restart (accumulated 0) until converged.
     if (this.perfRun && (!f.final || f.accumulated === 0)) {
