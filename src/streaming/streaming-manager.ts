@@ -48,14 +48,20 @@ export interface BrickRequest {
  * brick plus the closest unpinned candidates. Without this, missing-brick
  * queues sit at 1024 forever once the atlas is full of still-desired residents
  * (they get re-touched every recompute and are never evictable).
+ *
+ * With `coarsestLod`, an over-full set is first coarsened: the least urgent
+ * bricks give way to their parents (eight siblings → one), up to that level,
+ * so far and edge regions show one level coarser instead of being dropped
+ * to whatever coarse brick happens to be resident.
  */
 export function selectResidentSet(
   candidates: readonly BrickRequest[],
   pinnedKeys: ReadonlySet<string>,
   capacity: number,
+  coarsestLod?: number,
 ): BrickRequest[] {
   const pinned: BrickRequest[] = [];
-  const unpinned: BrickRequest[] = [];
+  let unpinned: BrickRequest[] = [];
   for (const brick of candidates) {
     if (pinnedKeys.has(brick.key)) pinned.push(brick);
     else unpinned.push(brick);
@@ -65,7 +71,47 @@ export function selectResidentSet(
   if (unpinned.length <= budget) {
     return pinned.length === 0 ? unpinned : pinned.concat(unpinned);
   }
+  if (coarsestLod !== undefined) {
+    // Each pass lifts the tail one level (lone bricks merge a level higher).
+    while (unpinned.length > budget) {
+      const next = coarsenTail(unpinned, pinnedKeys, budget, coarsestLod);
+      if (!next) break;
+      unpinned = next;
+    }
+  }
   return pinned.concat(unpinned.slice(0, budget));
+}
+
+/**
+ * One coarsening pass over a priority-sorted set: from the least urgent end,
+ * replace bricks by their parent until the set fits `budget`. A parent takes
+ * the priority of the first child it replaces; pinned parents are resident
+ * already. Null when no brick could be lifted.
+ */
+function coarsenTail(
+  sorted: readonly BrickRequest[],
+  pinnedKeys: ReadonlySet<string>,
+  budget: number,
+  coarsestLod: number,
+): BrickRequest[] | null {
+  const set = new Map(sorted.map((b) => [b.key, b]));
+  let lifted = false;
+  for (let i = sorted.length - 1; i >= 0 && set.size > budget; i--) {
+    const b = sorted[i]!;
+    if (b.lod >= coarsestLod || !set.has(b.key)) continue;
+    lifted = true;
+    set.delete(b.key);
+    const lod = b.lod + 1;
+    const bx = b.bx >> 1;
+    const by = b.by >> 1;
+    const bz = b.bz >> 1;
+    const key = `lod${lod}:${bz}/${by}/${bx}`;
+    if (!pinnedKeys.has(key) && !set.has(key)) {
+      set.set(key, { lod, bx, by, bz, distance: b.distance, key });
+    }
+  }
+  if (!lifted) return null;
+  return [...set.values()].sort((a, b) => a.distance - b.distance);
 }
 
 export interface LoadedBrickInfo {
@@ -1362,10 +1408,12 @@ export class StreamingManager {
 
     this.addCoarseFallbacks(desiredBricks);
 
+    // A forced level stays that level: over capacity, the farthest go.
     const residentBricks = selectResidentSet(
       desiredBricks,
       this.pinnedBricks,
       this.resources.allocator.totalSlots,
+      this.forcedLod === null ? this.maxLod : undefined,
     );
 
     // Update desired keys set (used for stale check)
