@@ -20,6 +20,7 @@ export { UnsupportedDatasetError } from "./data/data-provider.js";
 export { clearHandle } from "./data/handle-storage.js";
 export type {
   ImarisProviderOptions,
+  ImsChannelHistogram,
   ImsChannelInfo,
 } from "./data/imaris-provider.js";
 export { ImarisDataProvider } from "./data/imaris-provider.js";

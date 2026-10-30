@@ -114,6 +114,16 @@ export interface ImsChannelInfo {
   displayRange: [number, number] | null;
 }
 
+/** A channel's histogram as the file stores it (full resolution). */
+export interface ImsChannelHistogram {
+  /** Voxel counts per bin, bins evenly spaced over [min, max] */
+  counts: number[];
+  /** HistogramMin (raw units) */
+  min: number;
+  /** HistogramMax (raw units) */
+  max: number;
+}
+
 export interface ImarisProviderOptions {
   /** Source channel indices to load (≤ MAX_CHANNELS). Default: the first ones. */
   channels?: number[];
@@ -1050,6 +1060,43 @@ export class ImarisDataProvider implements DataProvider {
       for (const r of recs)
         this.staleListener?.(r.lod, r.bx, r.by, r.bz, r.channelIndex);
     }, STALE_NOTIFY_MS);
+  }
+
+  /**
+   * A channel's histogram as Imaris stored it (`Channel N/Histogram` at full
+   * resolution: 256 bins over HistogramMin–HistogramMax), or null when the
+   * file has none. `channel` is a file channel index (see `allChannels`);
+   * call after `initialize`.
+   */
+  async channelHistogram(channel: number): Promise<ImsChannelHistogram | null> {
+    const file = this.file;
+    const level = this.sourceLevels[0]?.index;
+    if (!file || level === undefined) return null;
+    const path = `/DataSet/ResolutionLevel ${level}/TimePoint ${this.timepoint}/Channel ${channel}`;
+    const group = await file.get(path);
+    if (!(group instanceof Hdf5Group)) return null;
+    const ds = await group.get("Histogram");
+    if (!(ds instanceof Hdf5Dataset) || ds.dtype.class !== "uint") return null;
+    const attrs = await group.attrs();
+    const min = attrNumber(attrs.HistogramMin);
+    const max = attrNumber(attrs.HistogramMax);
+    if (min === undefined || max === undefined || !(max > min)) return null;
+    const bytes = await ds.readBytes();
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const size = ds.dtype.size;
+    const counts: number[] = [];
+    for (let o = 0; o + size <= bytes.byteLength; o += size) {
+      counts.push(
+        size === 8
+          ? Number(view.getBigUint64(o, true))
+          : size === 4
+            ? view.getUint32(o, true)
+            : size === 2
+              ? view.getUint16(o, true)
+              : view.getUint8(o),
+      );
+    }
+    return { counts, min, max };
   }
 
   async isBrickEmpty(

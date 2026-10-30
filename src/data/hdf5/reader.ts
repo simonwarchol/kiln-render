@@ -334,6 +334,25 @@ export class Hdf5Dataset extends Hdf5Object {
     return a === null ? null : this.ctx.base + a;
   }
 
+  /**
+   * The whole dataset's raw bytes (row-major, as stored), for small
+   * datasets kept compact or contiguous, e.g. Imaris histograms. Read
+   * through the metadata cache.
+   */
+  async readBytes(): Promise<Uint8Array> {
+    const layout = this.layout;
+    const size = product(this.shape) * this.dtype.size;
+    if (layout.kind === "compact") return layout.data.subarray(0, size);
+    if (layout.kind === "contiguous") {
+      // Never written: the fill value.
+      if (layout.address === null) return new Uint8Array(size);
+      return this.ctx.read(layout.address, size);
+    }
+    throw new Error(
+      `HDF5: ${this.path} is ${layout.kind}; only compact or contiguous datasets read whole`,
+    );
+  }
+
   /** Bytes in one decoded chunk. */
   private get chunkBytes(): number {
     return product(this.chunkShape ?? []) * this.dtype.size;
