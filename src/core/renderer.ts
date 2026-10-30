@@ -601,39 +601,46 @@ export class Renderer {
   /**
    * Set the display color and opacity for a channel (0–5): volume rendering
    * scales the channel's density by `a`, MIP its colour; 0 hides it. Resets
-   * accumulation.
+   * accumulation when it changes anything.
    */
   setChannelColor(ch: number, r: number, g: number, b: number, a = 1.0): void {
     const base = Math.min(Math.max(0, ch), 5) * 4;
+    const c = this.channelColors;
+    // Compared as stored (float32).
+    const same =
+      c[base] === Math.fround(r) &&
+      c[base + 1] === Math.fround(g) &&
+      c[base + 2] === Math.fround(b) &&
+      c[base + 3] === Math.fround(a);
     if (perfOn) {
-      const c = this.channelColors;
-      const same =
-        c[base] === r &&
-        c[base + 1] === g &&
-        c[base + 2] === b &&
-        c[base + 3] === a;
       perfCount(
         same ? "channel colour sets, unchanged" : "channel colour sets",
       );
     }
-    this.channelColors[base] = r;
-    this.channelColors[base + 1] = g;
-    this.channelColors[base + 2] = b;
-    this.channelColors[base + 3] = a;
+    // Re-applying the same colour would restart convergence for nothing.
+    if (same) return;
+    c[base] = r;
+    c[base + 1] = g;
+    c[base + 2] = b;
+    c[base + 3] = a;
     this.resetAccumulation();
   }
 
-  /** Set the window center and width for a channel (0–5). Resets accumulation. */
+  /**
+   * Set the window center and width for a channel (0–5). Resets accumulation
+   * when it changes anything.
+   */
   setChannelWindow(ch: number, center: number, width: number): void {
     const i = Math.min(Math.max(0, ch), 5);
+    const same =
+      this.channelWindowCenter[i] === Math.fround(center) &&
+      this.channelWindowWidth[i] === Math.fround(width);
     if (perfOn) {
-      const same =
-        this.channelWindowCenter[i] === center &&
-        this.channelWindowWidth[i] === width;
       perfCount(
         same ? "channel window sets, unchanged" : "channel window sets",
       );
     }
+    if (same) return;
     this.channelWindowCenter[i] = center;
     this.channelWindowWidth[i] = width;
     this.resetAccumulation();
