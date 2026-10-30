@@ -146,6 +146,46 @@ export class IndirectionTable {
   }
 
   /**
+   * Undo `setEmpty` for a brick region: its empty cells show the fallback
+   * (parent) brick if given, otherwise revert to "not loaded".
+   */
+  clearEmpty(
+    virtualX: number,
+    virtualY: number,
+    virtualZ: number,
+    lod: number = 0,
+    fallbackAtlas?: [number, number, number],
+    fallbackLod?: number,
+  ) {
+    const scale = 1 << lod;
+    const baseX = virtualX * scale;
+    const baseY = virtualY * scale;
+    const baseZ = virtualZ * scale;
+    const fallback = fallbackAtlas && fallbackLod !== undefined;
+
+    for (let dz = 0; dz < scale; dz++) {
+      for (let dy = 0; dy < scale; dy++) {
+        for (let dx = 0; dx < scale; dx++) {
+          const x = baseX + dx;
+          const y = baseY + dy;
+          const z = baseZ + dz;
+
+          if (x >= this.gridX || y >= this.gridY || z >= this.gridZ) continue;
+
+          const idx = (x + y * this.gridX + z * this.gridX * this.gridY) * 4;
+          if (this.data[idx + 3] !== 255) continue;
+          this.data[idx + 0] = fallback ? fallbackAtlas[0] : 0;
+          this.data[idx + 1] = fallback ? fallbackAtlas[1] : 0;
+          this.data[idx + 2] = fallback ? fallbackAtlas[2] : 0;
+          this.data[idx + 3] = fallback ? fallbackLod + 1 : 0;
+        }
+      }
+    }
+
+    this.updateRegionGPU(baseX, baseY, baseZ, scale);
+  }
+
+  /**
    * Clear a brick region (mark as not loaded). For coarser LODs, only clears
    * cells still pointing to this LOD. Optional fallback restores parent brick.
    */

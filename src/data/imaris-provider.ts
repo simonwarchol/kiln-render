@@ -210,7 +210,11 @@ export class ImarisDataProvider implements DataProvider {
   private metadata: VolumeMetadata | null = null;
   private pyramid: VirtualLevel[] = [];
   private sourceLevels: SourceLevel[] = [];
-  private readonly brickStatsCache = new Map<string, BrickStats>();
+  /** Per brick, the stats of each channel slot loaded for it. */
+  private readonly brickStatsCache = new Map<
+    string,
+    Array<BrickStats | undefined>
+  >();
   private readonly datasetIndex = new Map<string, Promise<DatasetIndex>>();
   /** Chunk indexes being read (the metadata page cache is large meanwhile). */
   private indexReads = 0;
@@ -897,7 +901,7 @@ export class ImarisDataProvider implements DataProvider {
       }
       if (jobs.length === 0) {
         const empty = { min: 0, max: 0, avg: 0 };
-        this.cacheBrickStats(lod, bx, by, bz, empty);
+        this.cacheBrickStats(lod, bx, by, bz, channelIndex, empty);
         return {
           data:
             this.format === "u8"
@@ -931,7 +935,7 @@ export class ImarisDataProvider implements DataProvider {
       this.assemblyAvg.add(result.assemblyMs);
       this.queueAvg.add(performance.now() - tPieces - result.assemblyMs);
       const brickStats = { min: result.min, max: result.max, avg: result.avg };
-      this.cacheBrickStats(lod, bx, by, bz, brickStats);
+      this.cacheBrickStats(lod, bx, by, bz, channelIndex, brickStats);
       const data =
         this.format === "u8"
           ? new Uint8Array(result.data)
@@ -1054,17 +1058,23 @@ export class ImarisDataProvider implements DataProvider {
     by: number,
     bz: number,
     maxThreshold?: number,
+    channels?: readonly number[],
   ): Promise<boolean> {
-    return imsBrickIsEmpty({
-      lod,
-      bx,
-      by,
-      bz,
-      maxLod: this.metadata?.maxLod ?? lod,
-      threshold: maxThreshold ?? 1,
-      getStats: (l, x, y, z) =>
-        this.brickStatsCache.get(`${l}:${x}/${y}/${z}`) ?? null,
-    });
+    // Judged per channel: one channel's stats say nothing about another's.
+    const slots = channels ?? this.activeChannels.map((_, slot) => slot);
+    if (slots.length === 0) return false;
+    return slots.every((slot) =>
+      imsBrickIsEmpty({
+        lod,
+        bx,
+        by,
+        bz,
+        maxLod: this.metadata?.maxLod ?? lod,
+        threshold: maxThreshold ?? 1,
+        getStats: (l, x, y, z) =>
+          this.brickStatsCache.get(`${l}:${x}/${y}/${z}`)?.[slot] ?? null,
+      }),
+    );
   }
 
   getNetworkStats(): NetworkStats {
@@ -1108,20 +1118,13 @@ export class ImarisDataProvider implements DataProvider {
     bx: number,
     by: number,
     bz: number,
+    channel: number,
     stats: BrickStats,
   ): void {
     const key = `${lod}:${bx}/${by}/${bz}`;
-    const existing = this.brickStatsCache.get(key);
-    this.brickStatsCache.set(
-      key,
-      existing
-        ? {
-            min: Math.min(existing.min, stats.min),
-            max: Math.max(existing.max, stats.max),
-            avg: Math.max(existing.avg, stats.avg),
-          }
-        : stats,
-    );
+    const perChannel = this.brickStatsCache.get(key) ?? [];
+    perChannel[channel] = stats;
+    this.brickStatsCache.set(key, perChannel);
     while (this.brickStatsCache.size > MAX_STATS_ENTRIES) {
       const oldest = this.brickStatsCache.keys().next().value;
       if (oldest === undefined) break;

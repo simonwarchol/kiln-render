@@ -67,7 +67,8 @@ export abstract class BaseZarrProvider implements DataProvider {
   private static readonly MAX_STATS_ENTRIES = 100_000;
 
   protected metadata: VolumeMetadata | null = null;
-  protected brickStatsCache = new Map<string, BrickStats>();
+  /** Per brick, the stats of each channel slot loaded for it. */
+  protected brickStatsCache = new Map<string, Array<BrickStats | undefined>>();
   private networkTracker = new NetworkTracker();
 
   // Abstract methods that subclasses must implement
@@ -105,7 +106,8 @@ export abstract class BaseZarrProvider implements DataProvider {
   }
 
   /**
-   * Check if a brick is empty (max value below threshold)
+   * Check if a brick is empty (max value below threshold) in each of
+   * `channels` (default: the channels loaded for it so far)
    */
   async isBrickEmpty(
     lod: number,
@@ -113,14 +115,24 @@ export abstract class BaseZarrProvider implements DataProvider {
     by: number,
     bz: number,
     maxThreshold?: number,
+    channels?: readonly number[],
   ): Promise<boolean> {
     const key = `${lod}:${bx}/${by}/${bz}`;
-    const stats = this.brickStatsCache.get(key);
-    if (!stats) return false;
+    const perChannel = this.brickStatsCache.get(key);
+    if (!perChannel) return false;
     // Move to end (most recently used) — Maps preserve insertion order.
     this.brickStatsCache.delete(key);
-    this.brickStatsCache.set(key, stats);
-    return stats.max < (maxThreshold ?? 1);
+    this.brickStatsCache.set(key, perChannel);
+    const slots =
+      channels ?? perChannel.flatMap((s, slot) => (s ? [slot] : []));
+    // A channel not loaded for the brick may have data there.
+    return (
+      slots.length > 0 &&
+      slots.every((slot) => {
+        const stats = perChannel[slot];
+        return stats !== undefined && stats.max < (maxThreshold ?? 1);
+      })
+    );
   }
 
   /**
@@ -145,23 +157,15 @@ export abstract class BaseZarrProvider implements DataProvider {
     bx: number,
     by: number,
     bz: number,
+    channel: number,
     stats: BrickStats,
   ): void {
     const key = `${lod}:${bx}/${by}/${bz}`;
-    const existing = this.brickStatsCache.get(key);
-    if (existing) {
-      // Multiple channels update the same key — keep the max across all channels.
-      // isBrickEmpty should return true only if ALL channels are below the threshold,
-      // not just whichever channel happened to write last.
-      this.brickStatsCache.delete(key);
-      this.brickStatsCache.set(key, {
-        min: Math.min(existing.min, stats.min),
-        max: Math.max(existing.max, stats.max),
-        avg: (existing.avg + stats.avg) / 2,
-      });
-    } else {
-      this.brickStatsCache.set(key, stats);
-    }
+    // Kept per channel: isBrickEmpty asks about the channels shown.
+    const perChannel = this.brickStatsCache.get(key) ?? [];
+    perChannel[channel] = stats;
+    this.brickStatsCache.delete(key);
+    this.brickStatsCache.set(key, perChannel);
 
     // Evict oldest (least recently used/inserted) entries once over the cap.
     while (this.brickStatsCache.size > BaseZarrProvider.MAX_STATS_ENTRIES) {

@@ -122,7 +122,7 @@ export class LocalZarrDataProvider extends BaseZarrProvider {
     try {
       const result = await this.assemble(meta, lod, bx, by, bz, channelIndex);
       const { min, max, avg } = result;
-      this.cacheBrickStats(lod, bx, by, bz, { min, max, avg });
+      this.cacheBrickStats(lod, bx, by, bz, channelIndex, { min, max, avg });
       this.recordDownload(result.data.byteLength);
       return result;
     } catch (e) {

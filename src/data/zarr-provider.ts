@@ -141,7 +141,7 @@ export class ZarrDataProvider extends BaseZarrProvider {
       );
 
       // Cache stats for isBrickEmpty checks
-      this.cacheBrickStats(lod, bx, by, bz, {
+      this.cacheBrickStats(lod, bx, by, bz, channelIndex, {
         min: result.min,
         max: result.max,
         avg: result.avg,

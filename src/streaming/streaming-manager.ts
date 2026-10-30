@@ -127,6 +127,15 @@ export class StreamingManager {
   // Track empty bricks (so we don't re-check them)
   private emptyBricks = new Set<string>();
 
+  /**
+   * Empty verdicts judged from the data, by key, with the channel slots they
+   * covered (a bit each): showing a channel they didn't cover forgets them.
+   */
+  private emptyFor = new Map<
+    string,
+    { channels: number; lod: number; bx: number; by: number; bz: number }
+  >();
+
   // CPU-side cache of decompressed brick data (avoids re-download after GPU eviction)
   private brickCache: BrickCache;
 
@@ -350,7 +359,78 @@ export class StreamingManager {
     if (ch < 0 || ch >= this.channelEnabled.length) return;
     if (this.channelEnabled[ch] === enabled) return;
     this.channelEnabled[ch] = enabled;
-    if (enabled) void this.backfillChannel(ch);
+    if (enabled) {
+      this.forgetEmptyWithout(ch);
+      void this.backfillChannel(ch);
+    }
+  }
+
+  /** Channel slots shown now. */
+  private shownChannels(): number[] {
+    return this.channelEnabled.flatMap((on, ch) => (on ? [ch] : []));
+  }
+
+  /** Mark a brick empty, as judged from the data of `channels` (slots). */
+  private markEmpty(
+    key: string,
+    lod: number,
+    bx: number,
+    by: number,
+    bz: number,
+    channels: readonly number[],
+  ): void {
+    this.emptyBricks.add(key);
+    this.emptyFor.set(key, {
+      channels: channels.reduce((mask, ch) => mask | (1 << ch), 0),
+      lod,
+      bx,
+      by,
+      bz,
+    });
+    this.resources.indirection.setEmpty(bx, by, bz, lod);
+  }
+
+  /**
+   * Bricks judged empty while channel `ch` was hidden may hold data in it:
+   * forget those verdicts so they're requested again, showing their nearest
+   * loaded parent meanwhile.
+   */
+  private forgetEmptyWithout(ch: number): void {
+    const bit = 1 << ch;
+    const forgotten: Array<{
+      lod: number;
+      bx: number;
+      by: number;
+      bz: number;
+    }> = [];
+    for (const [key, verdict] of this.emptyFor) {
+      if (verdict.channels & bit) continue;
+      this.emptyFor.delete(key);
+      this.emptyBricks.delete(key);
+      forgotten.push(verdict);
+    }
+    if (forgotten.length === 0) return;
+    for (const { lod, bx, by, bz } of forgotten) {
+      // Still inside a region known empty in this channel too.
+      if (this.hasEmptyAncestor(bx, by, bz, lod)) continue;
+      const parent = this.findParentBrick(bx, by, bz, lod);
+      this.resources.indirection.clearEmpty(
+        bx,
+        by,
+        bz,
+        lod,
+        parent ? [parent.slot.x, parent.slot.y, parent.slot.z] : undefined,
+        parent?.lod,
+      );
+    }
+    // Recompute the desired set (it skips known-empty bricks) next update.
+    this.settledView.fill(Number.NaN);
+    this.scheduleAccumulationReset();
+    if (perfOn) {
+      perfEvent(
+        `showing slot ${ch}: ${forgotten.length} bricks judged empty without it will load again`,
+      );
+    }
   }
 
   /** Fetch a newly-visible channel into every currently resident brick. */
@@ -654,18 +734,19 @@ export class StreamingManager {
     const processBrick = async ({ bx, by, bz, key }: (typeof bricks)[0]) => {
       try {
         const tIsEmpty = performance.now();
+        const shown = this.shownChannels();
         const isEmpty = await this.dataProvider.isBrickEmpty(
           maxLod,
           bx,
           by,
           bz,
           this.config.emptyBrickThreshold,
+          shown,
         );
         sumIsEmptyMs += performance.now() - tIsEmpty;
 
         if (isEmpty) {
-          this.emptyBricks.add(key);
-          this.resources.indirection.setEmpty(bx, by, bz, maxLod);
+          this.markEmpty(key, maxLod, bx, by, bz, shown);
           return;
         }
 
@@ -1023,6 +1104,7 @@ export class StreamingManager {
     this.loadedBricks.clear();
     this.pinnedBricks.clear();
     this.emptyBricks.clear();
+    this.emptyFor.clear();
     this.brickCache.clear();
     this.desiredKeys.clear();
     this.loadQueue = [];
@@ -1467,19 +1549,20 @@ export class StreamingManager {
     // Check if aborted before starting
     if (signal.aborted) return;
 
-    // Check if empty
+    // Check if empty (in the channels shown)
+    const shown = this.shownChannels();
     const isEmpty = await this.dataProvider.isBrickEmpty(
       lod,
       bx,
       by,
       bz,
       this.config.emptyBrickThreshold,
+      shown,
     );
     if (signal.aborted) return;
 
     if (isEmpty) {
-      this.emptyBricks.add(key);
-      this.resources.indirection.setEmpty(bx, by, bz, lod);
+      this.markEmpty(key, lod, bx, by, bz, shown);
       // This may overwrite a coarse parent fallback that was already on screen —
       // the region needs to redraw as empty rather than staying on the stale frame.
       this.scheduleAccumulationReset();
@@ -1543,15 +1626,22 @@ export class StreamingManager {
     // (sentinel stats would false-positive; cached bricks are already proven non-empty).
     if (!fromCache.some((v) => v)) {
       const threshold = this.config.emptyBrickThreshold ?? 1;
+      const judged: number[] = [];
       let maxAcrossChannels = 0;
+      let unknown = false;
       for (let ch = 0; ch < numChannels; ch++) {
         if (!this.channelEnabled[ch]) continue;
-        const m = channelResults[ch]?.max ?? 0;
-        if (m > maxAcrossChannels) maxAcrossChannels = m;
+        const result = channelResults[ch];
+        // A shown channel that failed to load says nothing about emptiness.
+        if (!result) {
+          unknown = true;
+          continue;
+        }
+        judged.push(ch);
+        if (result.max > maxAcrossChannels) maxAcrossChannels = result.max;
       }
-      if (maxAcrossChannels < threshold) {
-        this.emptyBricks.add(key);
-        this.resources.indirection.setEmpty(bx, by, bz, lod);
+      if (!unknown && maxAcrossChannels < threshold) {
+        this.markEmpty(key, lod, bx, by, bz, judged);
         // Same as above: may overwrite a coarse parent fallback already on screen.
         this.scheduleAccumulationReset();
         return;

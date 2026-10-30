@@ -187,13 +187,17 @@ export interface DataProvider {
    */
   setBrickStaleListener?(listener: BrickStaleListener | null): void;
 
-  /** Check if a brick is empty (below threshold). */
+  /**
+   * Check if a brick is empty (below threshold) in every one of `channels`
+   * (slots; default: the provider's choice). Not empty when unknown.
+   */
   isBrickEmpty(
     lod: number,
     bx: number,
     by: number,
     bz: number,
     maxThreshold?: number,
+    channels?: readonly number[],
   ): Promise<boolean>;
 
   /**
