@@ -10,7 +10,7 @@ import {
   isAABBInFrustum,
 } from "../core/camera.js";
 import type { DatasetConfig } from "../core/config.js";
-import { clipToWorld } from "../core/config.js";
+import { clipToWorld, LOGICAL_BRICK_SIZE } from "../core/config.js";
 import type { VolumeResources } from "../core/volume-resources.js";
 import type {
   BrickLoadResult,
@@ -1857,6 +1857,13 @@ export class StreamingManager {
 
   // Helper functions
 
+  /**
+   * A brick's box as the renderer places it: a level-`lod` brick spans
+   * 64·2^lod finest-level voxels per axis from its index, the last one cut
+   * off at the volume's edge, so a parent's box holds its children's.
+   * (Dividing the volume evenly among a level's bricks drifts on grids that
+   * don't halve exactly, and culled visible bricks' parents.)
+   */
   private getBrickAABB(
     bx: number,
     by: number,
@@ -1867,24 +1874,18 @@ export class StreamingManager {
     if (!level) return { min: [0, 0, 0], max: [0, 0, 0] };
 
     const normalizedSize = this.config.normalizedSize;
-    const [gridX, gridY, gridZ] = level.brickGrid;
-    const brickSize: [number, number, number] = [
-      normalizedSize[0] / gridX,
-      normalizedSize[1] / gridY,
-      normalizedSize[2] / gridZ,
-    ];
-
-    const min: [number, number, number] = [
-      -normalizedSize[0] * 0.5 + bx * brickSize[0],
-      -normalizedSize[1] * 0.5 + by * brickSize[1],
-      -normalizedSize[2] * 0.5 + bz * brickSize[2],
-    ];
-    const max: [number, number, number] = [
-      min[0] + brickSize[0],
-      min[1] + brickSize[1],
-      min[2] + brickSize[2],
-    ];
-
+    const dims = this.metadata.dimensions;
+    const span = LOGICAL_BRICK_SIZE * (1 << lod);
+    const index = [bx, by, bz];
+    const min: [number, number, number] = [0, 0, 0];
+    const max: [number, number, number] = [0, 0, 0];
+    for (let a = 0; a < 3; a++) {
+      const half = normalizedSize[a]! * 0.5;
+      const perVoxel = normalizedSize[a]! / dims[a]!;
+      const lo = -half + index[a]! * span * perVoxel;
+      min[a] = lo;
+      max[a] = Math.min(half, lo + span * perVoxel);
+    }
     return { min, max };
   }
 
