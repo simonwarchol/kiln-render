@@ -18,7 +18,7 @@ Unlike OME-TIFF (XY-only overviews), Imaris stores a **true 3D pyramid**: each `
 
 Kiln reads `.ims` files with its own small, fully asynchronous HDF5 reader (`src/data/hdf5/`):
 
-1. **Metadata** — the file head (where Imaris writes groups and attributes) is fetched in one request, then object headers, dense link/attribute heaps and chunk B-trees are read through a page cache. `initialize()` reads only metadata and the coarsest level's chunk index; with the first brick, the remaining indexes load in the background, coarse to fine, and the workers and chunk fetcher start. Chunk indexes are kept as flat arrays over the chunk grid (~12 bytes per chunk).
+1. **Metadata** — the file head (where Imaris writes groups and attributes) is fetched in one request, then object headers, dense link/attribute heaps and chunk B-trees are read through a page cache. `initialize()` reads only metadata and the coarsest level's chunk index (with a [saved index](#saved-chunk-index) that describes the volume, neither: the file is first read for the first brick); with the first brick, the remaining indexes load in the background, coarse to fine, and the workers and chunk fetcher start. Chunk indexes are kept as flat arrays over the chunk grid (~12 bytes per chunk).
 2. **Chunk bytes** — a single fetcher on the main thread de-duplicates requests (neighbouring bricks share chunks through their ghost borders), coalesces nearby byte ranges into one `Range` read, keeps a compressed LRU in memory and a persistent copy in the **Origin Private File System** (one file per chunk, read through a small queue because OPFS slows down sharply under concurrent reads), so a reload — or splat generation re-reading full resolution — does not touch the network again.
 3. **Bricks** — each chunk has one *owner* Web Worker (by address hash) that inflates it once (native `DecompressionStream`), keeps it normalised as float16 in an LRU, and hands out only the sub-region a brick needs. Kiln bricks carry a 1-voxel ghost border, so most bricks touch neighbouring chunks for a sliver only; owning chunks avoids decoding the same 1 MB chunk once per neighbouring brick. The least busy worker then box-resamples the pieces into the 66³ brick.
 
@@ -80,6 +80,8 @@ npx tsx scripts/build-ims-index.ts https://my-bucket.s3.amazonaws.com/scan.ims
 ```
 
 and host the output, `scan.ims.index`, next to the file: `ImarisDataProvider` looks for `<url>.index` there. To keep it elsewhere, pass its URL as `chunkIndex` (or build it in the browser with `provider.buildChunkIndex()`). A saved table is used only while the dataset's chunk index is still where it was when the index was written, so a stale file falls back to the B-trees.
+
+The index also describes the volume: its levels, voxel type, spacing, and every channel's name, colour and ranges. `initialize()` then reads nothing from the file (whose attributes are a few scattered reads per channel), so a viewer that shows something else first, such as splats, doesn't touch the file until it needs voxels. Indexes written before this carry no description and are still used for their tables; rebuild one to add it. A described index whose tables no longer match the file fails its brick loads with a request to rebuild it, rather than showing the file with another file's dimensions.
 
 ## Out of scope
 

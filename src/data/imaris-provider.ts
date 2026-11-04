@@ -34,7 +34,6 @@ import {
   blobRangeSource,
   type CachedRangeSource,
   cachedRangeSource,
-  type Hdf5AttrValue,
   Hdf5Dataset,
   Hdf5File,
   Hdf5Group,
@@ -72,7 +71,16 @@ import {
   type VirtualLevel,
   WORKER_CHUNK_BUDGET,
 } from "./imaris/ims-layout.js";
+import {
+  attrNumber,
+  type ImsChannelInfo,
+  type ImsVolumeInfo,
+  imsVolumeProblems,
+  readImsVolumeInfo,
+} from "./imaris/volume-info.js";
 import { NetworkTracker, RollingAvg } from "./network-tracker.js";
+
+export type { ImsChannelInfo } from "./imaris/volume-info.js";
 
 const MAX_STATS_ENTRIES = 200_000;
 /**
@@ -101,18 +109,6 @@ const META_READS_IN_BACKGROUND = 6;
 const MAX_CLAMPED = 65_536;
 /** Stale-brick reports are batched over this long. */
 const STALE_NOTIFY_MS = 100;
-
-/** One channel as described by the file (all channels, not just active ones). */
-export interface ImsChannelInfo {
-  index: number;
-  name: string;
-  /** Display colour, linear 0–1 */
-  color: [number, number, number];
-  /** Normalisation range used for this channel (raw units) */
-  range: [number, number];
-  /** Imaris display range (raw units) */
-  displayRange: [number, number] | null;
-}
 
 /** A channel's histogram as the file stores it (full resolution). */
 export interface ImsChannelHistogram {
@@ -154,30 +150,6 @@ function createWorker(): Worker {
     );
   }
   return new ImsBrickWorkerInline();
-}
-
-function attrString(v: Hdf5AttrValue | undefined): string | undefined {
-  if (v === undefined) return undefined;
-  if (typeof v === "string") return v.replace(/\0+$/, "").trim();
-  if (Array.isArray(v)) return v.map(String).join("").trim();
-  return String(v);
-}
-
-function attrNumber(v: Hdf5AttrValue | undefined): number | undefined {
-  const s = attrString(v);
-  if (s === undefined || s === "") return undefined;
-  const n = Number(s);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-function attrNumbers(v: Hdf5AttrValue | undefined): number[] | undefined {
-  const s = attrString(v);
-  if (!s) return undefined;
-  const parts = s
-    .split(/[\s,]+/)
-    .filter(Boolean)
-    .map(Number);
-  return parts.length > 0 && parts.every(Number.isFinite) ? parts : undefined;
 }
 
 /**
@@ -278,6 +250,12 @@ export class ImarisDataProvider implements DataProvider {
   private staleListener: BrickStaleListener | null = null;
   /** The saved chunk index, once looked for (null: none). */
   private savedIndex: Promise<ChunkIndexFile | null> = Promise.resolve(null);
+  /** The file, once opened: on first use when the saved index describes it. */
+  private opening: Promise<Hdf5File> | null = null;
+  /** What `initialize` knew of the volume. */
+  private info: ImsVolumeInfo | null = null;
+  /** `info` came from the saved index rather than the file. */
+  private describedByIndex = false;
 
   /** Every channel in the file (names, colours, ranges). */
   allChannels: ImsChannelInfo[] = [];
@@ -423,10 +401,10 @@ export class ImarisDataProvider implements DataProvider {
     channels?: readonly number[],
     onProgress?: (done: number, total: number) => void,
   ): Promise<Uint8Array> {
-    if (!this.file) throw new Error("ImarisDataProvider: not initialized");
-    return buildImsChunkIndex(this.file, {
+    return buildImsChunkIndex(await this.openFile(), {
       timepoint: this.timepoint,
       channels,
+      ...(this.info ? { volume: this.info } : {}),
       onProgress,
     });
   }
@@ -434,135 +412,26 @@ export class ImarisDataProvider implements DataProvider {
   async initialize(): Promise<VolumeMetadata> {
     if (this.metadata) return this.metadata;
     const raw = this.rangeSource();
-    const meta = cachedRangeSource(this.yieldingToChunks(raw), {
+    this.raw = raw;
+    this.meta = cachedRangeSource(this.yieldingToChunks(raw), {
       pageSize: 16 * 1024,
       maxPages: META_PAGES,
     });
-    this.raw = raw;
-    this.meta = meta;
+    // A saved index that describes the volume spares reading the file's
+    // attributes: the file is then first read for voxels.
     this.savedIndex = this.openSavedIndex();
-    // Imaris writes its group/attribute metadata at the head of the file:
-    // one up-front read turns ~30 serial round trips into one.
-    await meta.read(0, 1024 * 1024).catch(() => undefined);
-    const file = await Hdf5File.open(raw, { meta });
-    this.file = file;
-
-    const reasons: string[] = [];
-    const dataSet = await file.get("/DataSet");
-    if (!(dataSet instanceof Hdf5Group)) {
-      throw new UnsupportedDatasetError([
-        "Not an Imaris 5.5 file (missing /DataSet group)",
-      ]);
-    }
-    const levelNames = (await dataSet.keys())
-      .map((k) => ({ k, m: /^Resolution ?Level (\d+)$/.exec(k) }))
-      .filter((e) => e.m)
-      .sort((a, b) => Number(a.m![1]) - Number(b.m![1]));
-    const tp = `TimePoint ${this.timepoint}`;
-
-    // Source levels (ImageSize attrs of channel 0)
-    const sources: SourceLevel[] = [];
-    const ch0Attrs: Array<Record<string, Hdf5AttrValue>> = [];
-    const levelAttrs = await Promise.all(
-      levelNames.map(async ({ k }) => {
-        const g = await file.get(`/DataSet/${k}/${tp}/Channel 0`);
-        return g instanceof Hdf5Group ? g.attrs() : null;
-      }),
-    );
-    for (let i = 0; i < levelNames.length; i++) {
-      const a = levelAttrs[i];
-      if (!a) break;
-      const x = attrNumber(a.ImageSizeX);
-      const y = attrNumber(a.ImageSizeY);
-      const z = attrNumber(a.ImageSizeZ);
-      if (!x || !y || !z) break;
-      sources.push({ index: Number(levelNames[i]!.m![1]), dims: [x, y, z] });
-      ch0Attrs.push(a);
-    }
-    if (sources.length === 0) {
-      throw new UnsupportedDatasetError([
-        `IMS file has no ResolutionLevel / ${tp} / Channel 0 data`,
-      ]);
-    }
-    this.sourceLevels = sources;
-    if (sources[0]!.dims[2] < 2) {
-      reasons.push("IMS volume is not 3D (ImageSizeZ must be greater than 1)");
-    }
-
-    const tpGroup = await file.get(`/DataSet/${levelNames[0]!.k}/${tp}`);
-    const channelCount =
-      tpGroup instanceof Hdf5Group
-        ? (await tpGroup.keys()).filter((k) => /^Channel \d+$/.test(k)).length
-        : 1;
-
-    // Header only: the chunk index is read lazily, per level, on first use.
-    const probe = await file.get(
-      `/DataSet/ResolutionLevel ${sources[0]!.index}/TimePoint ${this.timepoint}/Channel 0/Data`,
-    );
-    if (!(probe instanceof Hdf5Dataset)) {
-      throw new Error("IMS dataset missing for the finest level");
-    }
-    const dt = probe.dtype;
-    if (
-      !(
-        (dt.class === "uint" && (dt.size === 1 || dt.size === 2)) ||
-        (dt.class === "int" && dt.size === 2) ||
-        (dt.class === "float" && dt.size === 4)
-      ) ||
-      !dt.littleEndian
-    ) {
-      reasons.push(
-        `Data type ${dt.class}${dt.size * 8}${dt.littleEndian ? "" : " (big-endian)"} is not supported`,
-      );
-    }
+    const saved = await this.savedIndex;
+    const described = saved?.timepoint === this.timepoint ? saved.volume : null;
+    const info =
+      described ??
+      (await readImsVolumeInfo(await this.openFile(), this.timepoint));
+    const reasons = imsVolumeProblems(info);
     if (reasons.length > 0) throw new UnsupportedDatasetError(reasons);
-
-    // Channel descriptions
-    const info = await file.get("/DataSetInfo");
-    const infoGroup = info instanceof Hdf5Group ? info : null;
-    const typeMax = dt.class === "float" ? 1 : 2 ** (dt.size * 8) - 1;
-    this.allChannels = await Promise.all(
-      Array.from({ length: channelCount }, async (_, c) => {
-        const levelAttrs: Record<string, Hdf5AttrValue> =
-          c === 0
-            ? ch0Attrs[0]!
-            : await (async () => {
-                const g = await file.get(
-                  `/DataSet/${levelNames[0]!.k}/${tp}/Channel ${c}`,
-                );
-                return g instanceof Hdf5Group ? g.attrs() : {};
-              })();
-        const infoCh = infoGroup ? await infoGroup.get(`Channel ${c}`) : null;
-        const ia = infoCh instanceof Hdf5Group ? await infoCh.attrs() : {};
-        const hMin = attrNumber(levelAttrs.HistogramMin);
-        const hMax = attrNumber(levelAttrs.HistogramMax);
-        let lo = hMin ?? 0;
-        let hi = hMax ?? typeMax;
-        if (dt.class !== "float") lo = Math.max(0, lo);
-        if (!(hi > lo)) hi = lo + 1;
-        const rgb = attrNumbers(ia.Color);
-        const color: [number, number, number] =
-          rgb && rgb.length >= 3
-            ? [
-                Math.min(1, Math.max(0, rgb[0]!)),
-                Math.min(1, Math.max(0, rgb[1]!)),
-                Math.min(1, Math.max(0, rgb[2]!)),
-              ]
-            : [1, 1, 1];
-        const cr = attrNumbers(ia.ColorRange);
-        const name = attrString(ia.Name);
-        return {
-          index: c,
-          name: name && name !== "(name not specified)" ? name : `Channel ${c}`,
-          color,
-          range: [lo, hi] as [number, number],
-          displayRange:
-            cr && cr.length >= 2
-              ? ([cr[0]!, cr[1]!] as [number, number])
-              : null,
-        };
-      }),
-    );
+    this.info = info;
+    this.describedByIndex = described !== null;
+    this.sourceLevels = info.levels;
+    this.allChannels = info.channels;
+    const channelCount = info.channels.length;
 
     const requested = (this.options.channels ?? [])
       .filter((c) => Number.isInteger(c) && c >= 0 && c < channelCount)
@@ -578,41 +447,21 @@ export class ImarisDataProvider implements DataProvider {
       );
     }
 
-    // Geometry
-    let voxelSpacing: [number, number, number] | undefined;
-    let name = "ims";
-    const image = infoGroup ? await infoGroup.get("Image") : null;
-    if (image instanceof Hdf5Group) {
-      const a = await image.attrs();
-      const [sx, sy, sz] = sources[0]!.dims;
-      const ext = (i: number) => {
-        const lo = attrNumber(a[`ExtMin${i}`]);
-        const hi = attrNumber(a[`ExtMax${i}`]);
-        return lo !== undefined && hi !== undefined
-          ? Math.abs(hi - lo)
-          : undefined;
-      };
-      const dx = ext(0);
-      const dy = ext(1);
-      const dz = ext(2);
-      if (dx && dy && dz) voxelSpacing = [dx / sx, dy / sy, dz / sz];
-      const n = attrString(a.Name);
-      if (n && n !== "(name not specified)") name = n;
-    }
+    let name = info.name ?? "ims";
     if (name === "ims" && typeof this.source === "string") {
       name = decodeURIComponent(this.source.split("/").pop() ?? "ims");
     } else if (name === "ims" && typeof this.source !== "string") {
       name = this.source.name;
     }
 
-    this.pyramid = planVirtualPyramid(sources);
+    this.pyramid = planVirtualPyramid(info.levels);
     const active = this.activeChannels.map((c) => this.allChannels[c]!);
     const windowFor = channelWindow;
 
     this.metadata = {
       name,
-      dimensions: sources[0]!.dims,
-      voxelSpacing,
+      dimensions: info.levels[0]!.dims,
+      voxelSpacing: info.voxelSpacing,
       brickSize: LOGICAL_BRICK_SIZE,
       physicalBrickSize: PHYSICAL_BRICK_SIZE,
       maxLod: this.pyramid.length - 1,
@@ -629,19 +478,46 @@ export class ImarisDataProvider implements DataProvider {
       channelColors: active.map((c) => c.color),
       numChannels: Math.max(1, active.length),
       isFloat: false,
-      compression: probe.filters.map((f) => f.name).join("+") || "none",
-      sourceDataType: `${dt.class}${dt.size * 8}`,
+      compression: info.compression,
+      sourceDataType: `${info.dtype.class}${info.dtype.size * 8}`,
     };
 
-    // The coarsest level's chunk index now: the base layer needs it first,
-    // and an unreadable index fails here rather than on every brick.
-    // Workers and the chunk fetcher wait for the first brick (start()), and
-    // other levels' indexes for their first brick, so opening stays cheap.
-    const coarse = this.pyramid[this.pyramid.length - 1]!.source;
-    await Promise.all(
-      this.activeChannels.map((c) => this.openDataset(coarse, c)),
-    );
+    // With the file open anyway, the coarsest level's chunk index now: the
+    // base layer needs it first, and an unreadable index fails here rather
+    // than on every brick. Workers and the chunk fetcher wait for the first
+    // brick (start()), and other levels' indexes for their first brick, so
+    // opening stays cheap.
+    if (!this.describedByIndex) {
+      const coarse = this.pyramid[this.pyramid.length - 1]!.source;
+      await Promise.all(
+        this.activeChannels.map((c) => this.openDataset(coarse, c)),
+      );
+    }
     return this.metadata;
+  }
+
+  /** The HDF5 file, opened on first use (after `initialize` set up reads). */
+  private openFile(): Promise<Hdf5File> {
+    if (!this.opening) {
+      const raw = this.raw;
+      const meta = this.meta;
+      if (!raw || !meta) {
+        return Promise.reject(new Error("ImarisDataProvider: not initialized"));
+      }
+      const opening = (async () => {
+        // Imaris writes its group/attribute metadata at the head of the
+        // file: one up-front read turns ~30 serial round trips into one.
+        await meta.read(0, 1024 * 1024).catch(() => undefined);
+        const file = await Hdf5File.open(raw, { meta });
+        if (this.raw === raw) this.file = file; // not disposed meanwhile
+        return file;
+      })();
+      opening.catch(() => {
+        if (this.opening === opening) this.opening = null;
+      });
+      this.opening = opening;
+    }
+    return this.opening;
   }
 
   /** Workers and the chunk fetcher, on the first brick load. */
@@ -780,7 +656,7 @@ export class ImarisDataProvider implements DataProvider {
       // indexes load.
       if (this.indexReads++ === 0) this.meta?.setMaxPages(META_PAGES);
       p = (async () => {
-        const file = this.file!;
+        const file = await this.openFile();
         const ds = await file.get(
           `/DataSet/ResolutionLevel ${level}/TimePoint ${this.timepoint}/Channel ${channel}/Data`,
         );
@@ -789,8 +665,14 @@ export class ImarisDataProvider implements DataProvider {
             `IMS dataset missing for level ${level} channel ${channel}`,
           );
         }
-        // The saved table, if it matches the dataset; else its B-tree.
         const saved = await this.savedIndex;
+        // Its levels and channels came from the index: they must be this file's.
+        if (this.describedByIndex && saved?.changed(level, channel, ds)) {
+          throw new Error(
+            `${this.chunkIndexUrl} was built for another version of the volume: rebuild it`,
+          );
+        }
+        // The saved table, if it matches the dataset; else its B-tree.
         const table =
           (await saved
             ?.table(level, channel, this.timepoint, ds)
@@ -1098,9 +980,9 @@ export class ImarisDataProvider implements DataProvider {
    * call after `initialize`.
    */
   async channelHistogram(channel: number): Promise<ImsChannelHistogram | null> {
-    const file = this.file;
     const level = this.sourceLevels[0]?.index;
-    if (!file || level === undefined) return null;
+    if (level === undefined) return null;
+    const file = await this.openFile();
     const path = `/DataSet/ResolutionLevel ${level}/TimePoint ${this.timepoint}/Channel ${channel}`;
     const group = await file.get(path);
     if (!(group instanceof Hdf5Group)) return null;
@@ -1184,7 +1066,9 @@ export class ImarisDataProvider implements DataProvider {
     this.staleTimer = null;
     this.staleListener = null;
     this.metadata = null;
+    this.info = null;
     this.file = null;
+    this.opening = null;
     this.raw = null;
     this.meta = null;
   }

@@ -1,8 +1,10 @@
 /**
  * Save an Imaris file's chunk indexes ("<file>.ims.index"), so kiln skips
  * reading the file's chunk B-trees: hundreds of small scattered reads per
- * channel and resolution level in a large file. Host the output next to the
- * .ims under the same name plus ".index"; kiln looks for it there.
+ * channel and resolution level in a large file. The index also describes the
+ * volume, so kiln opens it without reading the file's attributes. Host the
+ * output next to the .ims under the same name plus ".index"; kiln looks for
+ * it there.
  *
  * Usage: npx tsx scripts/build-ims-index.ts <file.ims | URL> [output] [--channels 0,1,2]
  *   output: default "<file>.ims.index" beside a local file, or the URL's

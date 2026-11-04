@@ -9,6 +9,8 @@
  * chunk grid, x fastest. Little-endian, as typed arrays are on every
  * platform this runs on. The header lists each dataset's chunk-index file
  * address: a table is used only for a dataset whose index is still there.
+ * It also describes the volume (levels, voxel type, channels) when written
+ * by a kiln that knows how, so a viewer can open the file without reading it.
  */
 
 import {
@@ -17,6 +19,11 @@ import {
   Hdf5Group,
   type RangeSource,
 } from "../hdf5/index.js";
+import {
+  type ImsVolumeInfo,
+  parseImsVolumeInfo,
+  readImsVolumeInfo,
+} from "./volume-info.js";
 
 type Vec3 = [number, number, number];
 
@@ -36,8 +43,8 @@ export interface ChunkTable {
 
 const MAGIC = "KILN-IDX";
 const VERSION = 1;
-/** Enough for the header of a file with hundreds of datasets. */
-const HEAD_READ = 64 * 1024;
+/** Enough for the header of a file with hundreds of datasets and channels. */
+const HEAD_READ = 128 * 1024;
 
 interface Entry {
   level: number;
@@ -52,6 +59,8 @@ interface Entry {
 
 interface Header {
   timepoint: number;
+  /** The volume at `timepoint` (absent from older indexes) */
+  volume?: ImsVolumeInfo;
   datasets: Entry[];
 }
 
@@ -104,7 +113,13 @@ export class ChunkIndexFile {
     private readonly src: RangeSource,
     private readonly header: Header,
     private readonly entries: Map<string, Entry>,
+    /** The volume, if the index describes it */
+    readonly volume: ImsVolumeInfo | null,
   ) {}
+
+  get timepoint(): number {
+    return this.header.timepoint;
+  }
 
   /** The index file behind `src`; null if it isn't one (or can't be read). */
   static async open(src: RangeSource): Promise<ChunkIndexFile | null> {
@@ -122,10 +137,24 @@ export class ChunkIndexFile {
       const entries = new Map(
         header.datasets.map((e) => [`${e.level}:${e.channel}`, e]),
       );
-      return new ChunkIndexFile(src, header, entries);
+      return new ChunkIndexFile(
+        src,
+        header,
+        entries,
+        parseImsVolumeInfo(header.volume),
+      );
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The dataset's chunk index moved since this index was saved: the file
+   * isn't the one indexed (false for a dataset the index doesn't cover).
+   */
+  changed(level: number, channel: number, ds: Hdf5Dataset): boolean {
+    const e = this.entries.get(`${level}:${channel}`);
+    return !!e && e.indexAddress !== ds.chunkIndexAddress;
   }
 
   /**
@@ -163,7 +192,7 @@ export class ChunkIndexFile {
   }
 }
 
-/** Encode chunk tables as an index file. */
+/** Encode chunk tables (and the volume they're of) as an index file. */
 export function encodeChunkIndex(
   timepoint: number,
   tables: Array<{
@@ -172,6 +201,7 @@ export function encodeChunkIndex(
     indexAddress: number;
     table: ChunkTable;
   }>,
+  volume?: ImsVolumeInfo,
 ): Uint8Array {
   const datasets: Entry[] = tables.map(
     ({ level, channel, indexAddress, table }) => ({
@@ -186,7 +216,9 @@ export function encodeChunkIndex(
   );
   const enc = new TextEncoder();
   const headerBytes = () =>
-    enc.encode(JSON.stringify({ timepoint, datasets } satisfies Header));
+    enc.encode(
+      JSON.stringify({ timepoint, volume, datasets } satisfies Header),
+    );
   // The tables follow the header, whose length depends on their offsets:
   // place them until the header no longer grows past its 8-byte slot.
   let header = headerBytes();
@@ -229,17 +261,21 @@ async function numbered(group: Hdf5Group, prefix: RegExp): Promise<number[]> {
 
 /**
  * An index file for every resolution level of `channels` (default: all) in
- * an open Imaris file. Reads each dataset's chunk B-tree once.
+ * an open Imaris file, describing the volume. Reads each dataset's chunk
+ * B-tree once.
  */
 export async function buildImsChunkIndex(
   file: Hdf5File,
   opts: {
     timepoint?: number;
     channels?: readonly number[];
+    /** The volume at `timepoint`, if already read */
+    volume?: ImsVolumeInfo;
     onProgress?: (done: number, total: number) => void;
   } = {},
 ): Promise<Uint8Array> {
   const timepoint = opts.timepoint ?? 0;
+  const volume = opts.volume ?? (await readImsVolumeInfo(file, timepoint));
   const dataSet = await file.get("/DataSet");
   if (!(dataSet instanceof Hdf5Group)) {
     throw new Error("Not an Imaris file (missing /DataSet)");
@@ -272,5 +308,5 @@ export async function buildImsChunkIndex(
     );
     for (const t of got) if (t) tables.push(t);
   }
-  return encodeChunkIndex(timepoint, tables);
+  return encodeChunkIndex(timepoint, tables, volume);
 }
