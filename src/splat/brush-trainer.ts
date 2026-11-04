@@ -26,6 +26,10 @@
 import type { BrushApp, Training } from "brush-js";
 import { mat4 } from "wgpu-matrix";
 import {
+  freeChunkCacheFor,
+  isQuotaError,
+} from "../data/imaris/opfs-chunk-store.js";
+import {
   cloudFromParams,
   type GaussianCloud,
   SH_C0,
@@ -481,6 +485,43 @@ async function readSplats(
   return kilnParamsFromBrush(transforms!, sh!, opacity!, n, nCoeffs, gain);
 }
 
+/**
+ * `writeDataset`, after making room for it in OPFS by dropping cached volume
+ * chunks; out of room even so, the whole chunk cache goes before a retry.
+ */
+async function writeDatasetWithRoom(
+  device: GPUDevice,
+  dir: FileSystemDirectoryHandle,
+  init: GaussianCloud,
+  views: CapturedViews,
+  opts: BrushTrainOptions,
+): Promise<number> {
+  // At most raw RGBA views and a generous PLY record per splat.
+  const bytes =
+    views.cameras.length * views.width * views.height * 4 + init.count * 128;
+  await freeChunkCacheFor(bytes);
+  try {
+    return await writeDataset(device, dir, init, views, opts);
+  } catch (e) {
+    if (!isQuotaError(e)) throw e;
+  }
+  await freeChunkCacheFor(Number.POSITIVE_INFINITY);
+  try {
+    return await writeDataset(device, dir, init, views, opts);
+  } catch (e) {
+    if (!isQuotaError(e)) throw e;
+    const { usage = 0, quota = 0 } = await navigator.storage
+      .estimate()
+      .catch(() => ({ usage: 0, quota: 0 }));
+    const mb = (b: number) => `${Math.round(b / 2 ** 20).toLocaleString()} MB`;
+    throw new Error(
+      `Not enough browser storage for Brush's ${views.cameras.length} training views ` +
+        `(up to ${mb(bytes)}; the site uses ${mb(usage)} of its ${mb(quota)} quota). ` +
+        "Free disk space, or export from a regular (not Incognito or Guest) window.",
+    );
+  }
+}
+
 /** Delete training folders a crashed or closed tab left behind. */
 async function removeStaleRuns(root: FileSystemDirectoryHandle): Promise<void> {
   const listing = root as unknown as { keys(): AsyncIterable<string> };
@@ -526,7 +567,7 @@ export async function trainWithBrush(
   let training: Training | null = null;
   let removeListener = () => {};
   try {
-    const gain = await writeDataset(device, dir, init, views, opts);
+    const gain = await writeDatasetWithRoom(device, dir, init, views, opts);
     const iterations = Math.max(1, Math.round(opts.iterations));
     training = app.startTrainingFromDirectory(
       dir,
